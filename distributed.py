@@ -2319,6 +2319,68 @@ class AnyType(str):
 
 any_type = AnyType("*")
 
+class DistributedModelName:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"default": ""}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
+
+    RETURN_TYPES = (any_type,)
+    RETURN_NAMES = ("output",)
+    FUNCTION = "log_input"
+    OUTPUT_NODE = True
+    CATEGORY = "utils"
+
+    def _stringify(self, value):
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        try:
+            return json.dumps(value, indent=4)
+        except Exception:
+            return str(value)
+
+    def _update_workflow(self, extra_pnginfo, unique_id, values):
+        if not extra_pnginfo:
+            return
+        info = extra_pnginfo[0] if isinstance(extra_pnginfo, list) else extra_pnginfo
+        if not isinstance(info, dict) or "workflow" not in info:
+            return
+        node_id = None
+        if isinstance(unique_id, list) and unique_id:
+            node_id = str(unique_id[0])
+        elif unique_id is not None:
+            node_id = str(unique_id)
+        if not node_id:
+            return
+        workflow = info["workflow"]
+        node = next((x for x in workflow["nodes"] if str(x.get("id")) == node_id), None)
+        if node:
+            node["widgets_values"] = [values]
+
+    def log_input(self, text, unique_id=None, extra_pnginfo=None):
+        values = []
+        if isinstance(text, list):
+            for val in text:
+                values.append(self._stringify(val))
+        else:
+            values.append(self._stringify(text))
+
+        # Keep widget display in workflow metadata if available.
+        self._update_workflow(extra_pnginfo, unique_id, values)
+
+        if isinstance(values, list) and len(values) == 1:
+            return {"ui": {"text": values}, "result": (values[0],)}
+        return {"ui": {"text": values}, "result": (values,)}
+
 class ByPassTypeTuple(tuple):
     def __getitem__(self, index):
         if index > 0:
@@ -2414,12 +2476,14 @@ class DistributedEmptyImage:
 NODE_CLASS_MAPPINGS = { 
     "DistributedCollector": DistributedCollectorNode,
     "DistributedSeed": DistributedSeed,
+    "DistributedModelName": DistributedModelName,
     "ImageBatchDivider": ImageBatchDivider,
     "DistributedEmptyImage": DistributedEmptyImage,
 }
 NODE_DISPLAY_NAME_MAPPINGS = { 
     "DistributedCollector": "Distributed Collector",
     "DistributedSeed": "Distributed Seed",
+    "DistributedModelName": "DistributedModelName",
     "ImageBatchDivider": "Image Batch Divider",
     "DistributedEmptyImage": "Distributed Empty Image",
 }
