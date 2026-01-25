@@ -2640,6 +2640,75 @@ class ImageBatchDivider:
         return tuple(outputs)
 
 
+class AudioBatchDivider:
+    """Divides an audio waveform into multiple parts along the time/samples dimension."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "divide_by": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 10,
+                    "step": 1,
+                    "display": "number",
+                    "tooltip": "Number of parts to divide the audio into"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ByPassTypeTuple(("AUDIO",))  # Flexible for variable outputs
+    RETURN_NAMES = ByPassTypeTuple(tuple([f"audio_{i+1}" for i in range(10)]))
+    FUNCTION = "divide_audio"
+    OUTPUT_NODE = True
+    CATEGORY = "audio"
+
+    def divide_audio(self, audio, divide_by):
+        import torch
+
+        waveform = audio.get("waveform")
+        sample_rate = audio.get("sample_rate", 44100)
+
+        if waveform is None or waveform.numel() == 0:
+            # Return empty audio for all outputs
+            empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": sample_rate}
+            return tuple([empty_audio] * 10)
+
+        total_splits = min(divide_by, 10)  # Cap to max 10
+
+        # Waveform shape: [batch, channels, samples]
+        total_samples = waveform.shape[-1]
+        samples_per_split = total_samples // total_splits
+        remainder = total_samples % total_splits
+
+        outputs = []
+        start_idx = 0
+
+        for i in range(total_splits):
+            current_samples = samples_per_split + (1 if i < remainder else 0)
+            end_idx = start_idx + current_samples
+            split_waveform = waveform[..., start_idx:end_idx]
+            outputs.append({
+                "waveform": split_waveform,
+                "sample_rate": sample_rate
+            })
+            start_idx = end_idx
+
+        # Pad with empty audio up to max (10) to match RETURN_TYPES length
+        empty_audio = {
+            "waveform": torch.zeros(waveform.shape[0], waveform.shape[1], 1,
+                                    dtype=waveform.dtype, device=waveform.device),
+            "sample_rate": sample_rate
+        }
+
+        while len(outputs) < 10:
+            outputs.append(empty_audio)
+
+        return tuple(outputs)
+
+
 class DistributedEmptyImage:
     """Produces an empty IMAGE batch used when the master delegates all work."""
 
@@ -2817,6 +2886,7 @@ NODE_CLASS_MAPPINGS = {
     "DistributedSeed": DistributedSeed,
     "DistributedModelName": DistributedModelName,
     "ImageBatchDivider": ImageBatchDivider,
+    "AudioBatchDivider": AudioBatchDivider,
     "DistributedEmptyImage": DistributedEmptyImage,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2825,5 +2895,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DistributedSeed": "Distributed Seed",
     "DistributedModelName": "Distributed Model Name",
     "ImageBatchDivider": "Image Batch Divider",
+    "AudioBatchDivider": "Audio Batch Divider",
     "DistributedEmptyImage": "Distributed Empty Image",
 }
