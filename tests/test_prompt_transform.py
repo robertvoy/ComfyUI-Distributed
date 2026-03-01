@@ -81,13 +81,36 @@ def _delegate_prompt():
     }
 
 
+def _list_splitter_prompt():
+    """1(List source) → 2(DistributedListSplitter) → 3(DistributedListCollector) → 4(SaveImage)."""
+    return {
+        "1": {"class_type": "ImageListSource", "inputs": {}},
+        "2": {"class_type": "DistributedListSplitter", "inputs": {"images": ["1", 0]}},
+        "3": {"class_type": "DistributedListCollector", "inputs": {"images": ["2", 0]}},
+        "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0]}},
+    }
+
+
+def _branch_prompt():
+    """1 → 2(DistributedBranch) -> slot0:3->4, slot1:5->6."""
+    return {
+        "1": {"class_type": "KSampler", "inputs": {}},
+        "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
+        "3": {"class_type": "Blur", "inputs": {"image": ["2", 0]}},
+        "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0]}},
+        "5": {"class_type": "Sharpen", "inputs": {"image": ["2", 1]}},
+        "6": {"class_type": "SaveImage", "inputs": {"images": ["5", 0]}},
+    }
+
+
 def _apply(prompt, participant_id, enabled_worker_ids=None, delegate_master=False):
     if enabled_worker_ids is None:
         enabled_worker_ids = ["worker-a", "worker-b"]
-    idx = pt.PromptIndex(prompt)
+    prompt_copy = json.loads(json.dumps(prompt))
+    idx = pt.PromptIndex(prompt_copy)
     job_id_map = pt.generate_job_id_map(idx, "run")
     return pt.apply_participant_overrides(
-        prompt,
+        prompt_copy,
         participant_id=participant_id,
         enabled_worker_ids=enabled_worker_ids,
         job_id_map=job_id_map,
@@ -250,6 +273,23 @@ class PrunePromptForWorkerTests(unittest.TestCase):
         self.assertIn("2", result)
         self.assertNotIn("3", result)
 
+    def test_list_collector_is_treated_as_distributed_anchor(self):
+        prompt = _list_splitter_prompt()
+        result = pt.prune_prompt_for_worker(prompt)
+        self.assertIn("1", result)
+        self.assertIn("2", result)
+        self.assertIn("3", result)
+        self.assertNotIn("4", result)
+
+    def test_branch_anchor_keeps_downstream_for_later_branch_pruning(self):
+        prompt = _branch_prompt()
+        result = pt.prune_prompt_for_worker(prompt)
+        self.assertIn("2", result)
+        self.assertIn("3", result)
+        self.assertIn("4", result)
+        self.assertIn("5", result)
+        self.assertIn("6", result)
+
 
 # ---------------------------------------------------------------------------
 # prepare_delegate_master_prompt
@@ -326,6 +366,22 @@ class GenerateJobIdMapTests(unittest.TestCase):
         idx = pt.PromptIndex(prompt)
         job_map = pt.generate_job_id_map(idx, "run")
         self.assertEqual(job_map["5"], "run_5")
+
+    def test_maps_list_collector_nodes(self):
+        prompt = {
+            "8": {"class_type": "DistributedListCollector", "inputs": {}},
+        }
+        idx = pt.PromptIndex(prompt)
+        job_map = pt.generate_job_id_map(idx, "run")
+        self.assertEqual(job_map["8"], "run_8")
+
+    def test_maps_branch_nodes(self):
+        prompt = {
+            "9": {"class_type": "DistributedBranch", "inputs": {"num_branches": 2}},
+        }
+        idx = pt.PromptIndex(prompt)
+        job_map = pt.generate_job_id_map(idx, "run")
+        self.assertEqual(job_map["9"], "run_9")
 
     def test_empty_prompt_returns_empty_map(self):
         idx = pt.PromptIndex({})
@@ -488,6 +544,109 @@ class ApplyOverridesValueTests(unittest.TestCase):
         result = _apply(self._value_prompt(), "master")
         self.assertEqual(result["1"]["inputs"]["worker_id"], "")
 
+
+class ApplyOverridesListSplitterTests(unittest.TestCase):
+    def _splitter_prompt(self):
+        return {"1": {"class_type": "DistributedListSplitter", "inputs": {}}}
+
+    def test_master_gets_participant_index_zero(self):
+        result = _apply(self._splitter_prompt(), "master", enabled_worker_ids=["worker-a", "worker-b"])
+        self.assertEqual(result["1"]["inputs"]["participant_index"], 0)
+        self.assertEqual(result["1"]["inputs"]["total_participants"], 3)
+
+    def test_worker_gets_incremented_participant_index(self):
+        result = _apply(self._splitter_prompt(), "worker-a", enabled_worker_ids=["worker-a", "worker-b"])
+        self.assertEqual(result["1"]["inputs"]["participant_index"], 1)
+        self.assertEqual(result["1"]["inputs"]["total_participants"], 3)
+
+    def test_delegate_mode_shifts_worker_to_index_zero(self):
+        result = _apply(
+            self._splitter_prompt(),
+            "worker-a",
+            enabled_worker_ids=["worker-a", "worker-b"],
+            delegate_master=True,
+        )
+        self.assertEqual(result["1"]["inputs"]["participant_index"], 0)
+        self.assertEqual(result["1"]["inputs"]["total_participants"], 2)
+
+
+class ApplyOverridesListCollectorTests(unittest.TestCase):
+    def _collector_prompt(self):
+        return {"1": {"class_type": "DistributedListCollector", "inputs": {}}}
+
+    def test_worker_sets_master_url_and_worker_id(self):
+        result = _apply(self._collector_prompt(), "worker-a", enabled_worker_ids=["worker-a"])
+        self.assertTrue(result["1"]["inputs"]["is_worker"])
+        self.assertEqual(result["1"]["inputs"]["master_url"], "http://master.example.com")
+        self.assertEqual(result["1"]["inputs"]["worker_id"], "worker-a")
+
+    def test_master_sets_delegate_only_and_clears_worker_fields(self):
+        prompt = {
+            "1": {
+                "class_type": "DistributedListCollector",
+                "inputs": {"master_url": "stale", "worker_id": "stale"},
+            }
+        }
+        result = _apply(prompt, "master", enabled_worker_ids=["worker-a"], delegate_master=True)
+        self.assertFalse(result["1"]["inputs"]["is_worker"])
+        self.assertTrue(result["1"]["inputs"]["delegate_only"])
+        self.assertNotIn("master_url", result["1"]["inputs"])
+        self.assertNotIn("worker_id", result["1"]["inputs"])
+
+
+class ApplyOverridesBranchTests(unittest.TestCase):
+    def test_master_gets_branch_zero_worker_gets_branch_one(self):
+        prompt = _branch_prompt()
+        master_result = _apply(prompt, "master", enabled_worker_ids=["worker-a"])
+        worker_result = _apply(prompt, "worker-a", enabled_worker_ids=["worker-a"])
+
+        self.assertEqual(master_result["2"]["inputs"]["assigned_branch"], 0)
+        self.assertEqual(worker_result["2"]["inputs"]["assigned_branch"], 1)
+        self.assertIn("3", master_result)
+        self.assertIn("4", master_result)
+        self.assertNotIn("5", master_result)
+        self.assertNotIn("6", master_result)
+        self.assertIn("5", worker_result)
+        self.assertIn("6", worker_result)
+        self.assertNotIn("3", worker_result)
+        self.assertNotIn("4", worker_result)
+
+    def test_delegate_mode_assigns_worker_a_to_branch_zero(self):
+        prompt = _branch_prompt()
+        worker_result = _apply(
+            prompt,
+            "worker-a",
+            enabled_worker_ids=["worker-a", "worker-b"],
+            delegate_master=True,
+        )
+        self.assertEqual(worker_result["2"]["inputs"]["assigned_branch"], 0)
+
+    def test_pruning_keeps_shared_nodes_between_branches(self):
+        prompt = {
+            "1": {"class_type": "KSampler", "inputs": {}},
+            "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
+            "3": {"class_type": "NodeA", "inputs": {"image": ["2", 0]}},
+            "4": {"class_type": "NodeB", "inputs": {"image": ["2", 1]}},
+            "5": {"class_type": "SaveImage", "inputs": {"images": ["3", 0], "aux": ["4", 0]}},
+        }
+        worker_result = _apply(prompt, "master", enabled_worker_ids=["worker-a"])
+        self.assertIn("3", worker_result)
+        self.assertNotIn("4", worker_result)
+        self.assertIn("5", worker_result)
+        self.assertNotIn("aux", worker_result["5"]["inputs"])
+
+    def test_more_participants_than_branches_sets_unassigned_to_minus_one(self):
+        prompt = _branch_prompt()
+        worker_b_result = _apply(
+            prompt,
+            "worker-b",
+            enabled_worker_ids=["worker-a", "worker-b", "worker-c"],
+        )
+        self.assertEqual(worker_b_result["2"]["inputs"]["assigned_branch"], -1)
+        self.assertNotIn("3", worker_b_result)
+        self.assertNotIn("4", worker_b_result)
+        self.assertNotIn("5", worker_b_result)
+        self.assertNotIn("6", worker_b_result)
 
 if __name__ == "__main__":
     unittest.main()

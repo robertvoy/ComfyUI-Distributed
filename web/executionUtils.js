@@ -7,9 +7,12 @@ export function setupInterceptor(extension) {
     api.queuePrompt = async (number, prompt) => {
         if (extension.isEnabled) {
             const hasCollector = findNodesByClass(prompt.output, NODE_CLASSES.DISTRIBUTED_COLLECTOR).length > 0;
+            const hasListSplitter = findNodesByClass(prompt.output, NODE_CLASSES.DISTRIBUTED_LIST_SPLITTER).length > 0;
+            const hasListCollector = findNodesByClass(prompt.output, NODE_CLASSES.DISTRIBUTED_LIST_COLLECTOR).length > 0;
+            const hasBranch = findNodesByClass(prompt.output, NODE_CLASSES.DISTRIBUTED_BRANCH).length > 0;
             const hasDistUpscale = findNodesByClass(prompt.output, NODE_CLASSES.UPSCALE_DISTRIBUTED).length > 0;
 
-            if (hasCollector || hasDistUpscale) {
+            if (hasCollector || hasListSplitter || hasListCollector || hasBranch || hasDistUpscale) {
                 const result = await executeParallelDistributed(extension, prompt);
                 // Immediate status check for instant feedback
                 checkAllWorkerStatuses(extension);

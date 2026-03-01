@@ -88,6 +88,35 @@ def _find_downstream_nodes(prompt_obj, start_ids):
     return connected
 
 
+def _find_downstream_of_output_slot(prompt_obj, node_id, slot_index):
+    """Return all nodes reachable from a specific output slot on one node."""
+    source_id = str(node_id)
+    try:
+        slot = int(slot_index)
+    except (TypeError, ValueError):
+        return set()
+
+    direct_consumers = set()
+    for candidate_id, candidate_node in _iter_prompt_nodes(prompt_obj):
+        inputs = candidate_node.get("inputs", {})
+        for value in inputs.values():
+            if not (isinstance(value, list) and len(value) == 2):
+                continue
+            if str(value[0]) != source_id:
+                continue
+            try:
+                input_slot = int(value[1])
+            except (TypeError, ValueError):
+                continue
+            if input_slot == slot:
+                direct_consumers.add(str(candidate_id))
+                break
+
+    if not direct_consumers:
+        return set()
+    return _find_downstream_nodes(prompt_obj, list(direct_consumers))
+
+
 def _create_numeric_id_generator(prompt_obj):
     """Return a closure that yields new numeric string IDs."""
     max_id = 0
@@ -125,15 +154,90 @@ def _find_upstream_nodes(prompt_obj, start_ids):
     return connected
 
 
+def _resolve_participants(enabled_worker_ids, delegate_master):
+    worker_ids = [str(worker_id) for worker_id in (enabled_worker_ids or [])]
+    if delegate_master:
+        return worker_ids
+    return ["master"] + worker_ids
+
+
+def _remove_dangling_input_refs(prompt_obj):
+    """Drop input links that point to nodes no longer present in prompt_obj."""
+    existing_ids = set(prompt_obj.keys())
+    for _node_id, node in _iter_prompt_nodes(prompt_obj):
+        inputs = node.get("inputs", {})
+        for input_name, input_value in list(inputs.items()):
+            if isinstance(input_value, list) and len(input_value) == 2:
+                source_id = str(input_value[0])
+                if source_id not in existing_ids:
+                    inputs.pop(input_name, None)
+
+
+def prune_prompt_for_branch_worker(prompt_obj, branch_node_id, assigned_branch, num_branches):
+    """Prune non-assigned branch paths while keeping shared downstream nodes."""
+    branch_id = str(branch_node_id)
+
+    assigned_slots = set()
+    if isinstance(assigned_branch, (list, tuple, set)):
+        for value in assigned_branch:
+            try:
+                idx = int(value)
+            except (TypeError, ValueError):
+                continue
+            if idx >= 0:
+                assigned_slots.add(idx)
+    else:
+        try:
+            idx = int(assigned_branch)
+        except (TypeError, ValueError):
+            idx = -1
+        if idx >= 0:
+            assigned_slots.add(idx)
+
+    try:
+        total_slots = int(num_branches)
+    except (TypeError, ValueError):
+        total_slots = 2
+    total_slots = max(2, min(total_slots, 10))
+
+    downstream_by_slot = {}
+    for slot_idx in range(total_slots):
+        downstream = _find_downstream_of_output_slot(prompt_obj, branch_id, slot_idx)
+        downstream.discard(branch_id)
+        downstream_by_slot[slot_idx] = downstream
+
+    keep = {branch_id}
+    for slot_idx in assigned_slots:
+        keep.update(downstream_by_slot.get(slot_idx, set()))
+
+    remove = set()
+    for slot_idx in range(total_slots):
+        if slot_idx in assigned_slots:
+            continue
+        remove.update(downstream_by_slot.get(slot_idx, set()))
+
+    remove -= keep
+    for node_id in remove:
+        prompt_obj.pop(node_id, None)
+
+    _remove_dangling_input_refs(prompt_obj)
+    return prompt_obj
+
+
 def prune_prompt_for_worker(prompt_obj):
     """Prune worker prompt to distributed nodes and their upstream dependencies."""
     collector_ids = find_nodes_by_class(prompt_obj, "DistributedCollector")
+    list_collector_ids = find_nodes_by_class(prompt_obj, "DistributedListCollector")
     upscale_ids = find_nodes_by_class(prompt_obj, "UltimateSDUpscaleDistributed")
-    distributed_ids = collector_ids + upscale_ids
+    branch_ids = find_nodes_by_class(prompt_obj, "DistributedBranch")
+    distributed_ids = collector_ids + list_collector_ids + upscale_ids + branch_ids
     if not distributed_ids:
         return prompt_obj
 
     connected = _find_upstream_nodes(prompt_obj, distributed_ids)
+    if branch_ids:
+        connected.update(_find_downstream_nodes(prompt_obj, branch_ids))
+
     pruned_prompt = {}
     for node_id in connected:
         node = prompt_obj.get(node_id)
@@ -146,7 +250,7 @@ def prune_prompt_for_worker(prompt_obj):
         if dist_id not in pruned_prompt:
             continue
         downstream = _find_downstream_nodes(prompt_obj, [dist_id])
-        has_removed_downstream = any(node_id != dist_id for node_id in downstream)
+        has_removed_downstream = any(node_id != dist_id and node_id not in connected for node_id in downstream)
         if has_removed_downstream:
             preview_id = next_id()
             pruned_prompt[preview_id] = {
@@ -217,8 +321,11 @@ def prepare_delegate_master_prompt(prompt_obj, collector_ids):
 def generate_job_id_map(prompt_index, prefix):
     """Create stable per-node job IDs for distributed nodes."""
     job_map = {}
-    distributed_nodes = prompt_index.nodes_for_class("DistributedCollector") + prompt_index.nodes_for_class(
-        "UltimateSDUpscaleDistributed"
+    distributed_nodes = (
+        prompt_index.nodes_for_class("DistributedCollector")
+        + prompt_index.nodes_for_class("DistributedListCollector")
+        + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
+        + prompt_index.nodes_for_class("DistributedBranch")
     )
     for node_id in distributed_nodes:
         job_map[node_id] = f"{prefix}_{node_id}"
@@ -313,6 +420,110 @@ def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, 
             inputs["worker_id"] = f"worker_{worker_index_map.get(participant_id, 0)}"
 
 
+def _override_list_splitter_nodes(prompt_copy, prompt_index, participant_id, enabled_worker_ids, delegate_master):
+    """Configure participant chunk mapping for DistributedListSplitter nodes."""
+    participants = _resolve_participants(enabled_worker_ids, delegate_master)
+    total_participants = max(1, len(participants))
+    participant_id = str(participant_id)
+
+    if participant_id in participants:
+        participant_index = participants.index(participant_id)
+    else:
+        participant_index = 0
+
+    for node_id in prompt_index.nodes_for_class("DistributedListSplitter"):
+        node = prompt_copy.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        inputs = node.setdefault("inputs", {})
+        inputs["participant_index"] = participant_index
+        inputs["total_participants"] = total_participants
+
+
+def _override_list_collector_nodes(
+    prompt_copy,
+    prompt_index,
+    is_master,
+    participant_id,
+    job_id_map,
+    master_url,
+    enabled_json,
+    delegate_master,
+):
+    """Configure DistributedListCollector nodes for master/worker role."""
+    for node_id in prompt_index.nodes_for_class("DistributedListCollector"):
+        node = prompt_copy.get(node_id)
+        if not isinstance(node, dict):
+            continue
+
+        inputs = node.setdefault("inputs", {})
+        inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
+        inputs["is_worker"] = not is_master
+        inputs["enabled_worker_ids"] = enabled_json
+        if is_master:
+            inputs["delegate_only"] = bool(delegate_master)
+            inputs.pop("master_url", None)
+            inputs.pop("worker_id", None)
+        else:
+            inputs["master_url"] = master_url
+            inputs["worker_id"] = str(participant_id)
+            inputs["delegate_only"] = False
+
+
+def _override_branch_nodes(
+    prompt_copy,
+    prompt_index,
+    is_master,
+    participant_id,
+    enabled_worker_ids,
+    job_id_map,
+    delegate_master,
+):
+    """Assign branch slots per participant and prune non-assigned branch paths."""
+    participants = _resolve_participants(enabled_worker_ids, delegate_master)
+    participant_id = str(participant_id)
+    participant_count = len(participants)
+    participant_pos = participants.index(participant_id) if participant_id in participants else None
+
+    for node_id in prompt_index.nodes_for_class("DistributedBranch"):
+        node = prompt_copy.get(node_id)
+        if not isinstance(node, dict):
+            continue
+
+        inputs = node.setdefault("inputs", {})
+        try:
+            num_branches = int(inputs.get("num_branches", 2))
+        except (TypeError, ValueError):
+            num_branches = 2
+        num_branches = max(2, min(num_branches, 10))
+
+        assigned_slots = []
+        if participant_pos is not None and participant_count > 0:
+            assigned_slots = [slot for slot in range(num_branches) if slot % participant_count == participant_pos]
+
+        if len(assigned_slots) == 1:
+            assigned_branch = assigned_slots[0]
+        else:
+            assigned_branch = -1
+
+        inputs["is_worker"] = not is_master
+        inputs["worker_id"] = "" if is_master else participant_id
+        inputs["assigned_branch"] = assigned_branch
+        inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
+
+        if is_master and delegate_master:
+            continue
+
+        prompt_copy = prune_prompt_for_branch_worker(
+            prompt_copy,
+            node_id,
+            assigned_slots,
+            num_branches,
+        )
+
+    return prompt_copy
+
+
 def apply_participant_overrides(
     prompt_copy,
     participant_id,
@@ -329,7 +540,24 @@ def apply_participant_overrides(
 
     _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map)
     _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map)
+    _override_list_splitter_nodes(
+        prompt_copy,
+        prompt_index,
+        participant_id,
+        enabled_worker_ids,
+        delegate_master,
+    )
     _override_collector_nodes(
+        prompt_copy,
+        prompt_index,
+        is_master,
+        participant_id,
+        job_id_map,
+        master_url,
+        enabled_json,
+        delegate_master,
+    )
+    _override_list_collector_nodes(
         prompt_copy,
         prompt_index,
         is_master,
@@ -347,6 +575,15 @@ def apply_participant_overrides(
         job_id_map,
         master_url,
         enabled_json,
+    )
+    prompt_copy = _override_branch_nodes(
+        prompt_copy,
+        prompt_index,
+        is_master,
+        participant_id,
+        enabled_worker_ids,
+        job_id_map,
+        delegate_master,
     )
 
     return prompt_copy

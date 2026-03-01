@@ -314,8 +314,15 @@ async def orchestrate_distributed_execution(
         prompt_id = await queue_prompt_payload(prompt_obj, workflow_meta, client_id)
         return prompt_id, 0
 
-    for job_id in job_id_map.values():
-        await _ensure_distributed_queue(job_id)
+    queue_node_ids = (
+        prompt_index.nodes_for_class("DistributedCollector")
+        + prompt_index.nodes_for_class("DistributedListCollector")
+        + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
+    )
+    for node_id in queue_node_ids:
+        job_id = job_id_map.get(node_id)
+        if job_id:
+            await _ensure_distributed_queue(job_id)
 
     master_prompt = prompt_index.copy_prompt()
     master_prompt = apply_participant_overrides(
@@ -329,7 +336,9 @@ async def orchestrate_distributed_execution(
     )
 
     if delegate_master:
-        collector_ids = find_nodes_by_class(master_prompt, "DistributedCollector")
+        collector_ids = find_nodes_by_class(master_prompt, "DistributedCollector") + find_nodes_by_class(
+            master_prompt, "DistributedListCollector"
+        )
         upscale_nodes = find_nodes_by_class(master_prompt, "UltimateSDUpscaleDistributed")
         if upscale_nodes:
             debug_log(
