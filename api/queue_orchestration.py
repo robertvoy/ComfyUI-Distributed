@@ -18,6 +18,7 @@ from ..utils.trace_logger import trace_debug
 from .schemas import parse_positive_float, parse_positive_int
 from .orchestration.dispatch import (
     dispatch_worker_prompt,
+    rank_workers_by_load,
     select_active_workers,
     select_least_busy_worker,
 )
@@ -220,6 +221,7 @@ async def orchestrate_distributed_execution(
     workers = _resolve_enabled_workers(config, requested_ids)
     prompt_index = PromptIndex(prompt_obj)
     load_balance_requested = _prompt_requests_load_balance(prompt_index)
+    has_branch_nodes = bool(prompt_index.nodes_for_class("DistributedBranch"))
     trace_debug(
         execution_trace_id,
         (
@@ -230,7 +232,7 @@ async def orchestrate_distributed_execution(
             f"prep_concurrency={worker_prep_concurrency}, "
             f"media_sync_concurrency={media_sync_concurrency}, "
             f"media_sync_timeout={media_sync_timeout_seconds:.1f}s, "
-            f"load_balance={load_balance_requested}"
+            f"load_balance={load_balance_requested}, has_branch_nodes={has_branch_nodes}"
         ),
     )
 
@@ -303,6 +305,13 @@ async def orchestrate_distributed_execution(
             )
             active_workers = []
             delegate_master = False
+
+    if has_branch_nodes and len(active_workers) > 1:
+        active_workers = await rank_workers_by_load(
+            active_workers,
+            trace_execution_id=execution_trace_id,
+            probe_concurrency=worker_probe_concurrency,
+        )
 
     enabled_ids = [worker["id"] for worker in active_workers]
 

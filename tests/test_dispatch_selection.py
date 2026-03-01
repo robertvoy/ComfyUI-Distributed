@@ -249,6 +249,50 @@ class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(selected)
 
+    async def test_rank_workers_by_load_returns_sorted_by_queue_depth(self):
+        workers = [
+            {"id": "w1", "name": "Worker 1"},
+            {"id": "w2", "name": "Worker 2"},
+            {"id": "w3", "name": "Worker 3"},
+        ]
+        queue_map = {"w1": 4, "w2": 0, "w3": 2}
+
+        async def fake_probe(worker_url, timeout=3.0):
+            worker_id = worker_url.rsplit("/", 1)[-1]
+            return {"exec_info": {"queue_remaining": queue_map[worker_id]}}
+
+        with patch.object(dispatch, "build_worker_url", side_effect=lambda worker: f"http://host/{worker['id']}"), patch.object(
+            dispatch,
+            "probe_worker",
+            side_effect=fake_probe,
+        ):
+            ranked = await dispatch.rank_workers_by_load(workers, probe_concurrency=3)
+
+        self.assertEqual([worker["id"] for worker in ranked], ["w2", "w3", "w1"])
+
+    async def test_rank_workers_by_load_handles_unreachable_workers(self):
+        workers = [
+            {"id": "w1", "name": "Worker 1"},
+            {"id": "w2", "name": "Worker 2"},
+            {"id": "w3", "name": "Worker 3"},
+        ]
+
+        async def fake_probe(worker_url, timeout=3.0):
+            worker_id = worker_url.rsplit("/", 1)[-1]
+            if worker_id == "w2":
+                return None
+            queue_map = {"w1": 1, "w3": 0}
+            return {"exec_info": {"queue_remaining": queue_map[worker_id]}}
+
+        with patch.object(dispatch, "build_worker_url", side_effect=lambda worker: f"http://host/{worker['id']}"), patch.object(
+            dispatch,
+            "probe_worker",
+            side_effect=fake_probe,
+        ):
+            ranked = await dispatch.rank_workers_by_load(workers, probe_concurrency=3)
+
+        self.assertEqual([worker["id"] for worker in ranked], ["w3", "w1", "w2"])
+
 
 if __name__ == "__main__":
     unittest.main()

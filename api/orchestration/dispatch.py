@@ -266,3 +266,50 @@ async def select_least_busy_worker(
             f"Least-busy worker selected: {worker.get('name')} ({worker.get('id')}), queue_remaining={queue_remaining}"
         )
     return worker
+
+
+async def rank_workers_by_load(
+    workers,
+    trace_execution_id=None,
+    probe_concurrency=8,
+    probe_timeout=3.0,
+):
+    """Return all workers sorted by queue depth (ascending), preserving unreachable workers at the end."""
+    if not workers:
+        return []
+
+    probe_limit = parse_positive_int(probe_concurrency, 8)
+    probe_semaphore = asyncio.Semaphore(probe_limit)
+    statuses = await asyncio.gather(
+        *[
+            _probe_worker_queue(worker, probe_semaphore, probe_timeout)
+            for worker in workers
+        ]
+    )
+
+    ranked_statuses = []
+    unreachable_workers = []
+    for worker, status in zip(workers, statuses):
+        if status is None:
+            unreachable_workers.append(worker)
+            continue
+        ranked_statuses.append(status)
+
+    ranked_statuses.sort(key=lambda status: status["queue_remaining"])
+    ranked_workers = [status["worker"] for status in ranked_statuses] + unreachable_workers
+
+    if trace_execution_id:
+        trace_debug(
+            trace_execution_id,
+            "Ranked workers by load: "
+            + ", ".join(
+                f"{status['worker'].get('id')}={status['queue_remaining']}"
+                for status in ranked_statuses
+            )
+            + (
+                f"; unreachable={','.join(worker.get('id', '') for worker in unreachable_workers)}"
+                if unreachable_workers
+                else ""
+            ),
+        )
+    return ranked_workers
