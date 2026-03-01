@@ -1,4 +1,4 @@
-from .utilities import ByPassTypeTuple, any_type
+from .utilities import any_type
 
 
 class DistributedBranch:
@@ -17,8 +17,8 @@ class DistributedBranch:
             },
         }
 
-    RETURN_TYPES = ByPassTypeTuple((any_type,))
-    RETURN_NAMES = ByPassTypeTuple(tuple([f"branch_{idx + 1}" for idx in range(10)]))
+    RETURN_TYPES = tuple([any_type] * 10)
+    RETURN_NAMES = tuple([f"branch_{idx + 1}" for idx in range(10)])
     FUNCTION = "branch"
     CATEGORY = "utils"
 

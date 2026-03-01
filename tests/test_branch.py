@@ -52,6 +52,10 @@ branch_module = _load_branch_module()
 
 
 class DistributedBranchTests(unittest.TestCase):
+    def test_node_declares_ten_output_slots(self):
+        self.assertEqual(len(branch_module.DistributedBranch.RETURN_TYPES), 10)
+        self.assertEqual(len(branch_module.DistributedBranch.RETURN_NAMES), 10)
+
     def test_no_distribution_outputs_all_branches(self):
         node = branch_module.DistributedBranch()
         token = {"k": "v"}
