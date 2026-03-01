@@ -7,7 +7,7 @@ from PIL import Image
 import server
 
 from ..upscale.job_models import BaseJobState, ImageJobState, TileJobState
-from ..upscale.job_store import MAX_PAYLOAD_SIZE, ensure_tile_jobs_initialized
+from ..upscale.job_store import MAX_PAYLOAD_SIZE, ensure_tile_jobs_initialized, init_dynamic_job
 from ..upscale.payload_parsers import _parse_tiles_from_form
 from ..utils.logging import debug_log
 from ..utils.network import handle_api_error
@@ -211,6 +211,80 @@ async def request_image_endpoint(request):
                         return web.json_response({"image_idx": None})
                     return web.json_response({"tile_idx": None})
             return await handle_api_error(request, "Job not found", 404)
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
+
+
+@server.PromptServer.instance.routes.post("/distributed/init_list_queue")
+async def init_list_queue_endpoint(request):
+    """Initialize a shared queue of list indices for dynamic DistributedListSplitter mode."""
+    try:
+        data = await request.json()
+        multi_job_id = data.get("multi_job_id")
+        list_size = data.get("list_size", 0)
+        enabled_workers = data.get("enabled_workers", [])
+
+        if not multi_job_id:
+            return await handle_api_error(request, "Missing multi_job_id", 400)
+
+        try:
+            list_size = max(0, int(list_size))
+        except (TypeError, ValueError):
+            return await handle_api_error(request, "list_size must be an integer", 400)
+
+        worker_ids = [str(worker_id) for worker_id in (enabled_workers or []) if str(worker_id).strip()]
+        await init_dynamic_job(
+            multi_job_id=str(multi_job_id),
+            batch_size=list_size,
+            enabled_workers=worker_ids,
+            all_indices=list(range(list_size)),
+        )
+
+        prompt_server = ensure_tile_jobs_initialized()
+        async with prompt_server.distributed_tile_jobs_lock:
+            job_data = prompt_server.distributed_pending_tile_jobs.get(str(multi_job_id))
+            remaining = (
+                job_data.pending_images.qsize()
+                if isinstance(job_data, ImageJobState)
+                else 0
+            )
+
+        return web.json_response({"status": "success", "remaining": remaining})
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
+
+
+@server.PromptServer.instance.routes.post("/distributed/request_list_item")
+async def request_list_item_endpoint(request):
+    """Allow workers to pull one list item index for dynamic list distribution."""
+    try:
+        data = await request.json()
+        worker_id = data.get("worker_id")
+        multi_job_id = data.get("multi_job_id")
+
+        if not worker_id or not multi_job_id:
+            return await handle_api_error(request, "Missing worker_id or multi_job_id", 400)
+
+        prompt_server = ensure_tile_jobs_initialized()
+        async with prompt_server.distributed_tile_jobs_lock:
+            job_data = prompt_server.distributed_pending_tile_jobs.get(str(multi_job_id))
+            if not isinstance(job_data, BaseJobState):
+                return await handle_api_error(request, "Job not found", 404)
+
+            pending_queue = getattr(job_data, "pending_images", None) or getattr(job_data, "pending_tasks", None)
+            if pending_queue is None:
+                return await handle_api_error(request, "Job not configured for list item requests", 400)
+
+            try:
+                item_idx = await asyncio.wait_for(pending_queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                return web.json_response({"item_idx": None})
+
+            worker_id = str(worker_id)
+            job_data.assigned_to_workers.setdefault(worker_id, []).append(item_idx)
+            job_data.worker_status[worker_id] = time.time()
+            remaining = pending_queue.qsize()
+            return web.json_response({"item_idx": int(item_idx), "estimated_remaining": remaining})
     except Exception as e:
         return await handle_api_error(request, e, 500)
 

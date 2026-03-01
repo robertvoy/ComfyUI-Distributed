@@ -103,6 +103,21 @@ def _load_usdu_routes_module():
     job_store_module = types.ModuleType(f"{package_name}.upscale.job_store")
     job_store_module.MAX_PAYLOAD_SIZE = 1024
     job_store_module.ensure_tile_jobs_initialized = lambda: prompt_server_holder["value"]
+
+    async def _init_dynamic_job(multi_job_id, batch_size, enabled_workers, all_indices=None):
+        prompt_server = prompt_server_holder["value"]
+        async with prompt_server.distributed_tile_jobs_lock:
+            if multi_job_id in prompt_server.distributed_pending_tile_jobs:
+                return
+            job_data = ImageJobState(multi_job_id=multi_job_id)
+            job_data.worker_status = {str(worker_id): 0 for worker_id in (enabled_workers or [])}
+            job_data.assigned_to_workers = {str(worker_id): [] for worker_id in (enabled_workers or [])}
+            indices = all_indices if all_indices is not None else list(range(int(batch_size or 0)))
+            for idx in indices:
+                await job_data.pending_images.put(int(idx))
+            prompt_server.distributed_pending_tile_jobs[multi_job_id] = job_data
+
+    job_store_module.init_dynamic_job = _init_dynamic_job
     sys.modules[f"{package_name}.upscale.job_store"] = job_store_module
 
     job_models_module = types.ModuleType(f"{package_name}.upscale.job_models")
@@ -241,6 +256,34 @@ class USDURoutesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.payload.get("tile_idx"), 4)
         self.assertTrue(response.payload.get("batched_static"))
         self.assertEqual(job_data.assigned_to_workers["worker-a"], [4])
+
+    async def test_init_list_queue_initializes_pending_items(self):
+        request = _FakeRequest(
+            json_payload={
+                "multi_job_id": "list-job-1",
+                "list_size": 3,
+                "enabled_workers": ["worker-a", "worker-b"],
+            }
+        )
+        response = await usdu_routes.init_list_queue_endpoint(request)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload.get("status"), "success")
+        self.assertEqual(response.payload.get("remaining"), 3)
+
+    async def test_request_list_item_assigns_next_index(self):
+        prompt_server = usdu_routes._prompt_server_holder["value"]
+        job_data = usdu_routes._ImageJobState("list-job-2")
+        await job_data.pending_images.put(11)
+        prompt_server.distributed_pending_tile_jobs["list-job-2"] = job_data
+
+        request = _FakeRequest(json_payload={"worker_id": "worker-a", "multi_job_id": "list-job-2"})
+        response = await usdu_routes.request_list_item_endpoint(request)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload.get("item_idx"), 11)
+        self.assertEqual(response.payload.get("estimated_remaining"), 0)
+        self.assertEqual(job_data.assigned_to_workers["worker-a"], [11])
 
     async def test_submit_tiles_completion_signal_enqueues_last_marker(self):
         prompt_server = usdu_routes._prompt_server_holder["value"]

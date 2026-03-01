@@ -228,15 +228,18 @@ def prune_prompt_for_worker(prompt_obj):
     """Prune worker prompt to distributed nodes and their upstream dependencies."""
     collector_ids = find_nodes_by_class(prompt_obj, "DistributedCollector")
     list_collector_ids = find_nodes_by_class(prompt_obj, "DistributedListCollector")
+    join_ids = find_nodes_by_class(prompt_obj, "DistributedJoin")
     upscale_ids = find_nodes_by_class(prompt_obj, "UltimateSDUpscaleDistributed")
     branch_ids = find_nodes_by_class(prompt_obj, "DistributedBranch")
-    distributed_ids = collector_ids + list_collector_ids + upscale_ids + branch_ids
+    distributed_ids = collector_ids + list_collector_ids + join_ids + upscale_ids + branch_ids
     if not distributed_ids:
         return prompt_obj
 
     connected = _find_upstream_nodes(prompt_obj, distributed_ids)
     if branch_ids:
         connected.update(_find_downstream_nodes(prompt_obj, branch_ids))
+    if join_ids:
+        connected.update(_find_downstream_nodes(prompt_obj, join_ids))
 
     pruned_prompt = {}
     for node_id in connected:
@@ -310,7 +313,10 @@ def prepare_delegate_master_prompt(prompt_obj, collector_ids):
                 "title": "Distributed Empty Image (auto-added)",
             },
         }
-        collector_entry.setdefault("inputs", {})["images"] = [placeholder_id, 0]
+        input_name = "images"
+        if collector_entry.get("class_type") == "DistributedJoin":
+            input_name = "input"
+        collector_entry.setdefault("inputs", {})[input_name] = [placeholder_id, 0]
         debug_log(
             f"Inserted placeholder node {placeholder_id} for collector {collector_id} in delegate-only master prompt."
         )
@@ -323,7 +329,9 @@ def generate_job_id_map(prompt_index, prefix):
     job_map = {}
     distributed_nodes = (
         prompt_index.nodes_for_class("DistributedCollector")
+        + prompt_index.nodes_for_class("DistributedListSplitter")
         + prompt_index.nodes_for_class("DistributedListCollector")
+        + prompt_index.nodes_for_class("DistributedJoin")
         + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
         + prompt_index.nodes_for_class("DistributedBranch")
     )
@@ -420,7 +428,16 @@ def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, 
             inputs["worker_id"] = f"worker_{worker_index_map.get(participant_id, 0)}"
 
 
-def _override_list_splitter_nodes(prompt_copy, prompt_index, participant_id, enabled_worker_ids, delegate_master):
+def _override_list_splitter_nodes(
+    prompt_copy,
+    prompt_index,
+    is_master,
+    participant_id,
+    enabled_worker_ids,
+    job_id_map,
+    master_url,
+    delegate_master,
+):
     """Configure participant chunk mapping for DistributedListSplitter nodes."""
     participants = _resolve_participants(enabled_worker_ids, delegate_master)
     total_participants = max(1, len(participants))
@@ -438,6 +455,14 @@ def _override_list_splitter_nodes(prompt_copy, prompt_index, participant_id, ena
         inputs = node.setdefault("inputs", {})
         inputs["participant_index"] = participant_index
         inputs["total_participants"] = total_participants
+        inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
+        inputs["is_worker"] = not is_master
+        if is_master:
+            inputs.pop("master_url", None)
+            inputs["worker_id"] = "master"
+        else:
+            inputs["master_url"] = master_url
+            inputs["worker_id"] = participant_id
 
 
 def _override_list_collector_nodes(
@@ -524,6 +549,74 @@ def _override_branch_nodes(
     return prompt_copy
 
 
+def _find_upstream_branch_node(prompt_copy, start_node_id):
+    """Locate the nearest upstream DistributedBranch node for the provided node."""
+    visited = set()
+    stack = [str(start_node_id)]
+    while stack:
+        node_id = stack.pop()
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+        node = prompt_copy.get(node_id)
+        if not isinstance(node, dict):
+            continue
+
+        inputs = node.get("inputs", {})
+        for input_value in inputs.values():
+            if not (isinstance(input_value, list) and len(input_value) == 2):
+                continue
+            source_id = str(input_value[0])
+            source_node = prompt_copy.get(source_id)
+            if not isinstance(source_node, dict):
+                continue
+            if source_node.get("class_type") == "DistributedBranch":
+                return source_id
+            stack.append(source_id)
+    return None
+
+
+def _override_join_nodes(
+    prompt_copy,
+    prompt_index,
+    is_master,
+    participant_id,
+    job_id_map,
+    master_url,
+    enabled_json,
+    delegate_master,
+):
+    """Configure DistributedJoin nodes for branch convergence."""
+    for node_id in prompt_index.nodes_for_class("DistributedJoin"):
+        node = prompt_copy.get(node_id)
+        if not isinstance(node, dict):
+            continue
+
+        upstream_branch_id = _find_upstream_branch_node(prompt_copy, node_id)
+        assigned_branch = -1
+        if upstream_branch_id is not None:
+            branch_node = prompt_copy.get(upstream_branch_id, {})
+            branch_inputs = branch_node.get("inputs", {}) if isinstance(branch_node, dict) else {}
+            try:
+                assigned_branch = int(branch_inputs.get("assigned_branch", -1))
+            except (TypeError, ValueError):
+                assigned_branch = -1
+
+        inputs = node.setdefault("inputs", {})
+        inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
+        inputs["is_worker"] = not is_master
+        inputs["enabled_worker_ids"] = enabled_json
+        inputs["assigned_branch"] = assigned_branch
+        if is_master:
+            inputs["delegate_only"] = bool(delegate_master)
+            inputs.pop("master_url", None)
+            inputs.pop("worker_id", None)
+        else:
+            inputs["master_url"] = master_url
+            inputs["worker_id"] = str(participant_id)
+            inputs["delegate_only"] = False
+
+
 def apply_participant_overrides(
     prompt_copy,
     participant_id,
@@ -543,8 +636,11 @@ def apply_participant_overrides(
     _override_list_splitter_nodes(
         prompt_copy,
         prompt_index,
+        is_master,
         participant_id,
         enabled_worker_ids,
+        job_id_map,
+        master_url,
         delegate_master,
     )
     _override_collector_nodes(
@@ -583,6 +679,16 @@ def apply_participant_overrides(
         participant_id,
         enabled_worker_ids,
         job_id_map,
+        delegate_master,
+    )
+    _override_join_nodes(
+        prompt_copy,
+        prompt_index,
+        is_master,
+        participant_id,
+        job_id_map,
+        master_url,
+        enabled_json,
         delegate_master,
     )
 

@@ -103,6 +103,18 @@ def _branch_prompt():
     }
 
 
+def _join_prompt():
+    """1 → 2(DistributedBranch) -> 3(branch0) and 4(branch1) -> 5(DistributedJoin) -> 6(SaveImage)."""
+    return {
+        "1": {"class_type": "KSampler", "inputs": {}},
+        "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
+        "3": {"class_type": "Blur", "inputs": {"image": ["2", 0]}},
+        "4": {"class_type": "Sharpen", "inputs": {"image": ["2", 1]}},
+        "5": {"class_type": "DistributedJoin", "inputs": {"input": ["3", 0], "num_branches": 2}},
+        "6": {"class_type": "SaveImage", "inputs": {"images": ["5", 0]}},
+    }
+
+
 def _apply(prompt, participant_id, enabled_worker_ids=None, delegate_master=False):
     if enabled_worker_ids is None:
         enabled_worker_ids = ["worker-a", "worker-b"]
@@ -290,6 +302,12 @@ class PrunePromptForWorkerTests(unittest.TestCase):
         self.assertIn("5", result)
         self.assertIn("6", result)
 
+    def test_join_anchor_keeps_join_and_downstream(self):
+        prompt = _join_prompt()
+        result = pt.prune_prompt_for_worker(prompt)
+        self.assertIn("5", result)
+        self.assertIn("6", result)
+
 
 # ---------------------------------------------------------------------------
 # prepare_delegate_master_prompt
@@ -374,6 +392,22 @@ class GenerateJobIdMapTests(unittest.TestCase):
         idx = pt.PromptIndex(prompt)
         job_map = pt.generate_job_id_map(idx, "run")
         self.assertEqual(job_map["8"], "run_8")
+
+    def test_maps_list_splitter_nodes(self):
+        prompt = {
+            "7": {"class_type": "DistributedListSplitter", "inputs": {}},
+        }
+        idx = pt.PromptIndex(prompt)
+        job_map = pt.generate_job_id_map(idx, "run")
+        self.assertEqual(job_map["7"], "run_7")
+
+    def test_maps_join_nodes(self):
+        prompt = {
+            "10": {"class_type": "DistributedJoin", "inputs": {}},
+        }
+        idx = pt.PromptIndex(prompt)
+        job_map = pt.generate_job_id_map(idx, "run")
+        self.assertEqual(job_map["10"], "run_10")
 
     def test_maps_branch_nodes(self):
         prompt = {
@@ -553,11 +587,18 @@ class ApplyOverridesListSplitterTests(unittest.TestCase):
         result = _apply(self._splitter_prompt(), "master", enabled_worker_ids=["worker-a", "worker-b"])
         self.assertEqual(result["1"]["inputs"]["participant_index"], 0)
         self.assertEqual(result["1"]["inputs"]["total_participants"], 3)
+        self.assertFalse(result["1"]["inputs"]["is_worker"])
+        self.assertNotIn("master_url", result["1"]["inputs"])
+        self.assertEqual(result["1"]["inputs"]["worker_id"], "master")
+        self.assertEqual(result["1"]["inputs"]["multi_job_id"], "run_1")
 
     def test_worker_gets_incremented_participant_index(self):
         result = _apply(self._splitter_prompt(), "worker-a", enabled_worker_ids=["worker-a", "worker-b"])
         self.assertEqual(result["1"]["inputs"]["participant_index"], 1)
         self.assertEqual(result["1"]["inputs"]["total_participants"], 3)
+        self.assertTrue(result["1"]["inputs"]["is_worker"])
+        self.assertEqual(result["1"]["inputs"]["worker_id"], "worker-a")
+        self.assertEqual(result["1"]["inputs"]["master_url"], "http://master.example.com")
 
     def test_delegate_mode_shifts_worker_to_index_zero(self):
         result = _apply(
@@ -647,6 +688,34 @@ class ApplyOverridesBranchTests(unittest.TestCase):
         self.assertNotIn("4", worker_b_result)
         self.assertNotIn("5", worker_b_result)
         self.assertNotIn("6", worker_b_result)
+
+
+class ApplyOverridesJoinTests(unittest.TestCase):
+    def test_join_inherits_assigned_branch_from_upstream_branch_node(self):
+        master_prompt = {
+            "1": {"class_type": "KSampler", "inputs": {}},
+            "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
+            "3": {"class_type": "DistributedJoin", "inputs": {"input": ["2", 0], "num_branches": 2}},
+        }
+        worker_prompt = {
+            "1": {"class_type": "KSampler", "inputs": {}},
+            "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
+            "3": {"class_type": "DistributedJoin", "inputs": {"input": ["2", 1], "num_branches": 2}},
+        }
+
+        master_result = _apply(master_prompt, "master", enabled_worker_ids=["worker-a"])
+        worker_result = _apply(worker_prompt, "worker-a", enabled_worker_ids=["worker-a"])
+
+        self.assertEqual(master_result["3"]["inputs"]["assigned_branch"], 0)
+        self.assertEqual(worker_result["3"]["inputs"]["assigned_branch"], 1)
+
+    def test_join_sets_multi_job_id(self):
+        prompt = {
+            "1": {"class_type": "DistributedJoin", "inputs": {"input": ["2", 0]}},
+            "2": {"class_type": "KSampler", "inputs": {}},
+        }
+        result = _apply(prompt, "master", enabled_worker_ids=["worker-a"])
+        self.assertEqual(result["1"]["inputs"]["multi_job_id"], "run_1")
 
 if __name__ == "__main__":
     unittest.main()

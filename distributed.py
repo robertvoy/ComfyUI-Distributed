@@ -26,6 +26,7 @@ from .nodes import (
     DistributedListSplitter,
     DistributedListCollector,
     DistributedBranch,
+    DistributedJoin,
     AnyType,
     ByPassTypeTuple,
     any_type,
