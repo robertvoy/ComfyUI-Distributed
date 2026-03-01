@@ -1,6 +1,6 @@
 import { app } from "/scripts/app.js";
 
-const NODE_CLASS = "DistributedBranch";
+const NODE_CLASSES = new Set(["DistributedBranch", "DistributedJoin"]);
 const MIN_BRANCHES = 2;
 const MAX_BRANCHES = 10;
 
@@ -13,7 +13,7 @@ function clampBranchCount(value) {
 app.registerExtension({
     name: "Distributed.BranchOutputs",
     async nodeCreated(node) {
-        if (node.comfyClass !== NODE_CLASS) return;
+        if (!NODE_CLASSES.has(node.comfyClass)) return;
 
         const updateOutputs = () => {
             if (!node.widgets) return;
@@ -77,7 +77,7 @@ app.registerExtension({
     },
 
     nodeBeforeRemove(node) {
-        if (node.comfyClass === NODE_CLASS && node._branchOutputsCleanup) {
+        if (NODE_CLASSES.has(node.comfyClass) && node._branchOutputsCleanup) {
             node._branchOutputsCleanup();
         }
     },
