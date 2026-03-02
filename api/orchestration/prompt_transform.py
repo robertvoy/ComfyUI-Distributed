@@ -173,6 +173,84 @@ def _remove_dangling_input_refs(prompt_obj):
                     inputs.pop(input_name, None)
 
 
+def _has_terminal_output_nodes(prompt_obj):
+    """Return True when the prompt already has at least one terminal output node."""
+    for _node_id, node in _iter_prompt_nodes(prompt_obj):
+        if node.get("class_type") in {"PreviewImage", "SaveImage"}:
+            return True
+    return False
+
+
+def _add_preview_node(prompt_obj, next_id_fn, source_node_id, slot_index, title_suffix):
+    """Attach a PreviewImage output node to the given source output slot."""
+    preview_id = next_id_fn()
+    prompt_obj[preview_id] = {
+        "inputs": {
+            "images": [str(source_node_id), int(slot_index)],
+        },
+        "class_type": "PreviewImage",
+        "_meta": {
+            "title": f"Preview Image ({title_suffix})",
+        },
+    }
+    return preview_id
+
+
+def _ensure_worker_output_node(prompt_obj):
+    """Guarantee worker prompts retain at least one output node after pruning.
+
+    Branch pruning can remove all explicit output nodes for worker prompts, which
+    causes ComfyUI validation to reject the prompt (`prompt_no_outputs`).
+    """
+    if _has_terminal_output_nodes(prompt_obj):
+        return prompt_obj
+
+    next_id = _create_numeric_id_generator(prompt_obj)
+
+    # Prefer a DistributedJoin output tied to the assigned branch for this worker.
+    for node_id, node in _iter_prompt_nodes(prompt_obj):
+        if node.get("class_type") != "DistributedJoin":
+            continue
+        inputs = node.get("inputs", {})
+        try:
+            assigned_branch = int(inputs.get("assigned_branch", -1))
+        except (TypeError, ValueError):
+            assigned_branch = -1
+        if assigned_branch >= 0:
+            _add_preview_node(prompt_obj, next_id, node_id, assigned_branch, "auto-added worker output")
+            return prompt_obj
+
+    # Otherwise, anchor to the assigned DistributedBranch slot if available.
+    for node_id, node in _iter_prompt_nodes(prompt_obj):
+        if node.get("class_type") != "DistributedBranch":
+            continue
+        inputs = node.get("inputs", {})
+        try:
+            assigned_branch = int(inputs.get("assigned_branch", -1))
+        except (TypeError, ValueError):
+            assigned_branch = -1
+        if assigned_branch >= 0:
+            _add_preview_node(prompt_obj, next_id, node_id, assigned_branch, "auto-added worker output")
+            return prompt_obj
+
+    # Idle participants (assigned_branch=-1) still need a terminal node to pass
+    # validation; keep this cheap by emitting a tiny synthetic image preview.
+    empty_id = next_id()
+    prompt_obj[empty_id] = {
+        "class_type": "DistributedEmptyImage",
+        "inputs": {
+            "height": 64,
+            "width": 64,
+            "channels": 3,
+        },
+        "_meta": {
+            "title": "Distributed Empty Image (auto-added worker output)",
+        },
+    }
+    _add_preview_node(prompt_obj, next_id, empty_id, 0, "auto-added worker output")
+    return prompt_obj
+
+
 def prune_prompt_for_branch_worker(prompt_obj, branch_node_id, assigned_branch, num_branches):
     """Prune non-assigned branch paths while keeping shared downstream nodes."""
     branch_id = str(branch_node_id)
@@ -694,5 +772,8 @@ def apply_participant_overrides(
         enabled_json,
         delegate_master,
     )
+
+    if not is_master:
+        prompt_copy = _ensure_worker_output_node(prompt_copy)
 
     return prompt_copy

@@ -602,6 +602,12 @@ export class DistributedUI {
                 logBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl;
                 logBtn.classList.add("btn--log");
                 logBtn.title = "View remote worker log";
+                // Keep disabled workers from showing a log button before state sync.
+                if (!data.enabled) {
+                    logBtn.classList.add("is-hidden");
+                    logBtn.style.display = "none";
+                    logBtn.disabled = true;
+                }
                 controlsWrapper.appendChild(logBtn);
             } else {
                 const controls = this.createWorkerControls(data.id, {

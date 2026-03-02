@@ -684,10 +684,37 @@ class ApplyOverridesBranchTests(unittest.TestCase):
             enabled_worker_ids=["worker-a", "worker-b", "worker-c"],
         )
         self.assertEqual(worker_b_result["2"]["inputs"]["assigned_branch"], -1)
-        self.assertNotIn("3", worker_b_result)
-        self.assertNotIn("4", worker_b_result)
-        self.assertNotIn("5", worker_b_result)
-        self.assertNotIn("6", worker_b_result)
+        class_types = {node.get("class_type") for node in worker_b_result.values()}
+        self.assertNotIn("Blur", class_types)
+        self.assertNotIn("Sharpen", class_types)
+
+    def test_worker_with_pruned_outputs_gets_auto_preview_for_assigned_branch(self):
+        prompt = {
+            "1": {"class_type": "KSampler", "inputs": {}},
+            "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 3}},
+            "3": {"class_type": "Blur", "inputs": {"image": ["2", 0]}},
+            "4": {"class_type": "PreviewImage", "inputs": {"images": ["3", 0]}},
+        }
+
+        worker_result = _apply(prompt, "worker-a", enabled_worker_ids=["worker-a", "worker-b"])
+        preview_nodes = [node for node in worker_result.values() if node.get("class_type") == "PreviewImage"]
+
+        self.assertTrue(preview_nodes)
+        self.assertIn(["2", 1], [node.get("inputs", {}).get("images") for node in preview_nodes])
+
+    def test_unassigned_worker_gets_idle_fallback_output(self):
+        prompt = _branch_prompt()
+        worker_result = _apply(
+            prompt,
+            "worker-c",
+            enabled_worker_ids=["worker-a", "worker-b", "worker-c"],
+        )
+
+        preview_nodes = [node for node in worker_result.values() if node.get("class_type") == "PreviewImage"]
+        empty_nodes = [node for node in worker_result.values() if node.get("class_type") == "DistributedEmptyImage"]
+
+        self.assertTrue(preview_nodes)
+        self.assertTrue(empty_nodes)
 
 
 class ApplyOverridesJoinTests(unittest.TestCase):
