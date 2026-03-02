@@ -326,7 +326,7 @@ async def orchestrate_distributed_execution(
     queue_node_ids = (
         prompt_index.nodes_for_class("DistributedCollector")
         + prompt_index.nodes_for_class("DistributedListCollector")
-        + prompt_index.nodes_for_class("DistributedJoin")
+        + prompt_index.nodes_for_class("DistributedBranchCollector")
         + prompt_index.nodes_for_class("DistributedBranch")
         + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
     )
@@ -350,7 +350,7 @@ async def orchestrate_distributed_execution(
         collector_ids = (
             find_nodes_by_class(master_prompt, "DistributedCollector")
             + find_nodes_by_class(master_prompt, "DistributedListCollector")
-            + find_nodes_by_class(master_prompt, "DistributedJoin")
+            + find_nodes_by_class(master_prompt, "DistributedBranchCollector")
         )
         upscale_nodes = find_nodes_by_class(master_prompt, "UltimateSDUpscaleDistributed")
         if upscale_nodes:
@@ -359,7 +359,7 @@ async def orchestrate_distributed_execution(
             )
         elif not collector_ids:
             debug_log(
-                "Delegate-only master mode requested but no collector/join nodes found in master prompt. Running full prompt on master."
+                "Delegate-only master mode requested but no collector/branch-collector nodes found in master prompt. Running full prompt on master."
             )
         else:
             master_prompt = prepare_delegate_master_prompt(master_prompt, collector_ids)

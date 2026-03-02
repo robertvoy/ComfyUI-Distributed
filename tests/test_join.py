@@ -81,14 +81,14 @@ def _load_module(package_name, module_rel_path, module_name):
     return module
 
 
-def _load_join_module():
+def _load_branch_collector_module():
     package_name = "dist_join_testpkg"
     _bootstrap_package(package_name)
     _load_module(package_name, "nodes/utilities.py", "nodes.utilities")
-    return _load_module(package_name, "nodes/join.py", "nodes.join")
+    return _load_module(package_name, "nodes/branch_collector.py", "nodes.branch_collector")
 
 
-join_module = _load_join_module()
+branch_collector_module = _load_branch_collector_module()
 
 
 class _FakeResponseCtx:
@@ -122,9 +122,9 @@ class _FakePromptServer:
         self.distributed_jobs_lock = asyncio.Lock()
 
 
-class DistributedJoinTests(unittest.IsolatedAsyncioTestCase):
+class DistributedBranchCollectorTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.node = join_module.DistributedJoin()
+        self.node = branch_collector_module.DistributedBranchCollector()
 
     async def test_worker_mode_sends_result_with_assigned_branch_index(self):
         fake_session = _FakeSession()
@@ -132,11 +132,11 @@ class DistributedJoinTests(unittest.IsolatedAsyncioTestCase):
         async def _get_session():
             return fake_session
 
-        join_module.get_client_session = _get_session
+        branch_collector_module.get_client_session = _get_session
 
         tensor = torch.ones((1, 4, 4, 3), dtype=torch.float32)
         outputs = await self.node.execute(
-            tensor,
+            [None, tensor, None, None, None, None, None, None, None, None],
             num_branches=2,
             multi_job_id="join-job",
             is_worker=True,
@@ -154,7 +154,7 @@ class DistributedJoinTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_master_mode_collects_worker_results_into_branch_slots(self):
         fake_server = _FakePromptServer()
-        join_module._get_prompt_server_instance = lambda: fake_server
+        branch_collector_module._get_prompt_server_instance = lambda: fake_server
 
         queue = asyncio.Queue()
         worker_1 = torch.full((1, 4, 4, 3), 0.5, dtype=torch.float32)
@@ -165,7 +165,7 @@ class DistributedJoinTests(unittest.IsolatedAsyncioTestCase):
 
         master_tensor = torch.zeros((1, 4, 4, 3), dtype=torch.float32)
         outputs = await self.node.execute(
-            master_tensor,
+            [master_tensor, None, None, None, None, None, None, None, None, None],
             num_branches=3,
             multi_job_id="join-job",
             is_worker=False,
@@ -179,7 +179,7 @@ class DistributedJoinTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unassigned_slots_remain_none(self):
         fake_server = _FakePromptServer()
-        join_module._get_prompt_server_instance = lambda: fake_server
+        branch_collector_module._get_prompt_server_instance = lambda: fake_server
 
         queue = asyncio.Queue()
         worker_1 = torch.full((1, 4, 4, 3), 0.5, dtype=torch.float32)
@@ -188,7 +188,7 @@ class DistributedJoinTests(unittest.IsolatedAsyncioTestCase):
 
         master_tensor = torch.zeros((1, 4, 4, 3), dtype=torch.float32)
         outputs = await self.node.execute(
-            master_tensor,
+            [master_tensor, None, None, None, None, None, None, None, None, None],
             num_branches=2,
             multi_job_id="join-job",
             is_worker=False,
@@ -201,7 +201,7 @@ class DistributedJoinTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_worker_results_use_safe_fallback_for_expected_slots(self):
         fake_server = _FakePromptServer()
-        join_module._get_prompt_server_instance = lambda: fake_server
+        branch_collector_module._get_prompt_server_instance = lambda: fake_server
 
         queue = asyncio.Queue()
         # No worker payloads enqueued; master should timeout and fill expected worker slots.
@@ -209,7 +209,7 @@ class DistributedJoinTests(unittest.IsolatedAsyncioTestCase):
 
         master_tensor = torch.full((1, 4, 4, 3), 0.7, dtype=torch.float32)
         outputs = await self.node.execute(
-            master_tensor,
+            [master_tensor, None, None, None, None, None, None, None, None, None],
             num_branches=3,
             multi_job_id="join-job",
             is_worker=False,

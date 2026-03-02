@@ -207,9 +207,9 @@ def _ensure_worker_output_node(prompt_obj):
 
     next_id = _create_numeric_id_generator(prompt_obj)
 
-    # Prefer a DistributedJoin output tied to the assigned branch for this worker.
+    # Prefer a DistributedBranchCollector output tied to the assigned branch for this worker.
     for node_id, node in _iter_prompt_nodes(prompt_obj):
-        if node.get("class_type") != "DistributedJoin":
+        if node.get("class_type") != "DistributedBranchCollector":
             continue
         inputs = node.get("inputs", {})
         try:
@@ -306,18 +306,18 @@ def prune_prompt_for_worker(prompt_obj):
     """Prune worker prompt to distributed nodes and their upstream dependencies."""
     collector_ids = find_nodes_by_class(prompt_obj, "DistributedCollector")
     list_collector_ids = find_nodes_by_class(prompt_obj, "DistributedListCollector")
-    join_ids = find_nodes_by_class(prompt_obj, "DistributedJoin")
+    branch_collector_ids = find_nodes_by_class(prompt_obj, "DistributedBranchCollector")
     upscale_ids = find_nodes_by_class(prompt_obj, "UltimateSDUpscaleDistributed")
     branch_ids = find_nodes_by_class(prompt_obj, "DistributedBranch")
-    distributed_ids = collector_ids + list_collector_ids + join_ids + upscale_ids + branch_ids
+    distributed_ids = collector_ids + list_collector_ids + branch_collector_ids + upscale_ids + branch_ids
     if not distributed_ids:
         return prompt_obj
 
     connected = _find_upstream_nodes(prompt_obj, distributed_ids)
     if branch_ids:
         connected.update(_find_downstream_nodes(prompt_obj, branch_ids))
-    if join_ids:
-        connected.update(_find_downstream_nodes(prompt_obj, join_ids))
+    if branch_collector_ids:
+        connected.update(_find_downstream_nodes(prompt_obj, branch_collector_ids))
 
     pruned_prompt = {}
     for node_id in connected:
@@ -379,6 +379,10 @@ def prepare_delegate_master_prompt(prompt_obj, collector_ids):
         collector_entry = pruned_prompt.get(collector_id)
         if not collector_entry:
             continue
+        collector_class = collector_entry.get("class_type")
+        if collector_class == "DistributedBranchCollector":
+            # Branch collector does not require an image input in delegate-only mode.
+            continue
         placeholder_id = next_id()
         pruned_prompt[placeholder_id] = {
             "class_type": "DistributedEmptyImage",
@@ -391,10 +395,7 @@ def prepare_delegate_master_prompt(prompt_obj, collector_ids):
                 "title": "Distributed Empty Image (auto-added)",
             },
         }
-        input_name = "images"
-        if collector_entry.get("class_type") == "DistributedJoin":
-            input_name = "input"
-        collector_entry.setdefault("inputs", {})[input_name] = [placeholder_id, 0]
+        collector_entry.setdefault("inputs", {})["images"] = [placeholder_id, 0]
         debug_log(
             f"Inserted placeholder node {placeholder_id} for collector {collector_id} in delegate-only master prompt."
         )
@@ -409,7 +410,7 @@ def generate_job_id_map(prompt_index, prefix):
         prompt_index.nodes_for_class("DistributedCollector")
         + prompt_index.nodes_for_class("DistributedListSplitter")
         + prompt_index.nodes_for_class("DistributedListCollector")
-        + prompt_index.nodes_for_class("DistributedJoin")
+        + prompt_index.nodes_for_class("DistributedBranchCollector")
         + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
         + prompt_index.nodes_for_class("DistributedBranch")
     )
@@ -654,7 +655,7 @@ def _find_upstream_branch_node(prompt_copy, start_node_id):
     return None
 
 
-def _override_join_nodes(
+def _override_branch_collector_nodes(
     prompt_copy,
     prompt_index,
     is_master,
@@ -664,8 +665,8 @@ def _override_join_nodes(
     enabled_json,
     delegate_master,
 ):
-    """Configure DistributedJoin nodes for branch convergence."""
-    for node_id in prompt_index.nodes_for_class("DistributedJoin"):
+    """Configure DistributedBranchCollector nodes for branch convergence."""
+    for node_id in prompt_index.nodes_for_class("DistributedBranchCollector"):
         node = prompt_copy.get(node_id)
         if not isinstance(node, dict):
             continue
@@ -681,8 +682,7 @@ def _override_join_nodes(
                 assigned_branch = -1
 
         inputs = node.setdefault("inputs", {})
-        # Group all joins under the same DistributedBranch into one queue so
-        # worker-branch senders converge into the master's active join node.
+        # Group all branch collectors under the same DistributedBranch into one queue.
         job_source_id = upstream_branch_id or node_id
         inputs["multi_job_id"] = job_id_map.get(job_source_id, job_source_id)
         inputs["is_worker"] = not is_master
@@ -762,7 +762,7 @@ def apply_participant_overrides(
         job_id_map,
         delegate_master,
     )
-    _override_join_nodes(
+    _override_branch_collector_nodes(
         prompt_copy,
         prompt_index,
         is_master,

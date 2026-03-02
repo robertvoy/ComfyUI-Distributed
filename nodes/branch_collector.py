@@ -11,7 +11,7 @@ from ..utils.async_helpers import run_async_in_server_loop
 from ..utils.config import get_worker_timeout_seconds, is_master_delegate_only
 from ..utils.constants import HEARTBEAT_INTERVAL
 from ..utils.image import ensure_contiguous, tensor_to_pil
-from ..utils.logging import debug_log, log
+from ..utils.logging import log
 from ..utils.network import get_client_session
 from .utilities import any_type
 
@@ -34,21 +34,25 @@ def _throw_if_processing_interrupted():
         return
 
 
-class DistributedJoin:
+class DistributedBranchCollector:
     @classmethod
     def INPUT_TYPES(cls):
+        optional_inputs = {
+            f"branch_{idx + 1}": (any_type,)
+            for idx in range(MAX_BRANCH_OUTPUTS)
+        }
         return {
             "required": {
-                "input": (any_type,),
-                "num_branches": ("INT", {"default": 2, "min": 2, "max": 10, "step": 1}),
+                "num_branches": ("INT", {"default": 2, "min": 2, "max": MAX_BRANCH_OUTPUTS, "step": 1}),
             },
+            "optional": optional_inputs,
             "hidden": {
                 "multi_job_id": ("STRING", {"default": ""}),
                 "is_worker": ("BOOLEAN", {"default": False}),
                 "master_url": ("STRING", {"default": ""}),
                 "enabled_worker_ids": ("STRING", {"default": "[]"}),
                 "worker_id": ("STRING", {"default": ""}),
-                "assigned_branch": ("INT", {"default": -1, "min": -1, "max": 9}),
+                "assigned_branch": ("INT", {"default": -1, "min": -1, "max": MAX_BRANCH_OUTPUTS - 1}),
                 "delegate_only": ("BOOLEAN", {"default": False}),
             },
         }
@@ -58,9 +62,44 @@ class DistributedJoin:
     FUNCTION = "run"
     CATEGORY = "utils"
 
+    def _branch_values(self, **kwargs):
+        values = []
+        for idx in range(MAX_BRANCH_OUTPUTS):
+            values.append(kwargs.get(f"branch_{idx + 1}", None))
+        return values
+
+    def _resolve_local_branch_value(self, branch_values, assigned_branch):
+        try:
+            assigned_idx = int(assigned_branch)
+        except (TypeError, ValueError):
+            assigned_idx = -1
+
+        if 0 <= assigned_idx < MAX_BRANCH_OUTPUTS:
+            assigned_value = branch_values[assigned_idx]
+            if assigned_value is not None:
+                return assigned_value, assigned_idx
+
+        for idx, value in enumerate(branch_values):
+            if value is not None:
+                return value, idx
+        return None, assigned_idx
+
+    def _build_outputs(self, branch_values, num_branches):
+        outputs = [None] * MAX_BRANCH_OUTPUTS
+        try:
+            branch_count = int(num_branches)
+        except (TypeError, ValueError):
+            branch_count = 2
+        branch_count = max(2, min(branch_count, MAX_BRANCH_OUTPUTS))
+
+        for idx in range(branch_count):
+            value = branch_values[idx]
+            if value is not None:
+                outputs[idx] = value
+        return tuple(outputs)
+
     def run(
         self,
-        input,
         num_branches=2,
         multi_job_id="",
         is_worker=False,
@@ -69,13 +108,36 @@ class DistributedJoin:
         worker_id="",
         assigned_branch=-1,
         delegate_only=False,
+        branch_1=None,
+        branch_2=None,
+        branch_3=None,
+        branch_4=None,
+        branch_5=None,
+        branch_6=None,
+        branch_7=None,
+        branch_8=None,
+        branch_9=None,
+        branch_10=None,
     ):
+        branch_values = [
+            branch_1,
+            branch_2,
+            branch_3,
+            branch_4,
+            branch_5,
+            branch_6,
+            branch_7,
+            branch_8,
+            branch_9,
+            branch_10,
+        ]
+
         if not multi_job_id:
-            return self._build_outputs(input, assigned_branch)
+            return self._build_outputs(branch_values, num_branches)
 
         return run_async_in_server_loop(
             self.execute(
-                input,
+                branch_values,
                 num_branches=num_branches,
                 multi_job_id=multi_job_id,
                 is_worker=is_worker,
@@ -86,17 +148,6 @@ class DistributedJoin:
                 delegate_only=delegate_only,
             )
         )
-
-    def _build_outputs(self, value, assigned_branch):
-        outputs = [None] * MAX_BRANCH_OUTPUTS
-        try:
-            branch_idx = int(assigned_branch)
-        except (TypeError, ValueError):
-            branch_idx = -1
-
-        if 0 <= branch_idx < MAX_BRANCH_OUTPUTS:
-            outputs[branch_idx] = value
-        return tuple(outputs)
 
     def _parse_enabled_workers(self, enabled_worker_ids):
         try:
@@ -114,15 +165,6 @@ class DistributedJoin:
             workers.append(worker_id_str)
         return workers
 
-    def _expected_worker_ids_for_branches(self, enabled_workers, delegate_mode, num_branches):
-        slots_by_participant = self._participant_branch_slots(enabled_workers, delegate_mode, num_branches)
-        expected = []
-        for participant_id, slots in slots_by_participant.items():
-            if participant_id == "master" or not slots:
-                continue
-            expected.append(str(participant_id))
-        return expected
-
     def _participant_branch_slots(self, enabled_workers, delegate_mode, num_branches):
         participants = list(enabled_workers) if delegate_mode else ["master"] + list(enabled_workers)
         participant_count = len(participants)
@@ -135,9 +177,18 @@ class DistributedJoin:
             slots_by_participant.setdefault(participant_id, []).append(branch_slot)
         return slots_by_participant
 
-    def _fallback_for_missing_branch(self, input_value):
-        if isinstance(input_value, torch.Tensor):
-            tensor = input_value
+    def _expected_worker_ids_for_branches(self, enabled_workers, delegate_mode, num_branches):
+        slots_by_participant = self._participant_branch_slots(enabled_workers, delegate_mode, num_branches)
+        expected = []
+        for participant_id, slots in slots_by_participant.items():
+            if participant_id == "master" or not slots:
+                continue
+            expected.append(str(participant_id))
+        return expected
+
+    def _fallback_for_missing_branch(self, source_value):
+        if isinstance(source_value, torch.Tensor):
+            tensor = source_value
             if tensor.ndim == 3:
                 tensor = tensor.unsqueeze(0)
             if tensor.ndim == 4:
@@ -145,17 +196,19 @@ class DistributedJoin:
                 if fallback.is_cuda:
                     fallback = fallback.cpu()
                 return ensure_contiguous(fallback)
-        return input_value
+        return torch.zeros((1, 64, 64, 3), dtype=torch.float32)
 
     async def _send_branch_result_to_master(self, value, branch_idx, multi_job_id, master_url, worker_id):
         if not isinstance(value, torch.Tensor):
-            raise ValueError("DistributedJoin currently supports torch.Tensor results for worker transfer.")
+            raise ValueError("DistributedBranchCollector currently supports torch.Tensor results for worker transfer.")
 
         image_batch = value
         if image_batch.ndim == 3:
             image_batch = image_batch.unsqueeze(0)
         if image_batch.ndim != 4 or image_batch.shape[0] <= 0:
-            raise ValueError("DistributedJoin tensor result must be IMAGE-like with shape [B,H,W,C] or [H,W,C].")
+            raise ValueError(
+                "DistributedBranchCollector tensor result must be IMAGE-like with shape [B,H,W,C] or [H,W,C]."
+            )
 
         img = tensor_to_pil(image_batch, 0)
         byte_io = io.BytesIO()
@@ -181,7 +234,7 @@ class DistributedJoin:
 
     async def execute(
         self,
-        input,
+        branch_values,
         num_branches=2,
         multi_job_id="",
         is_worker=False,
@@ -192,41 +245,38 @@ class DistributedJoin:
         delegate_only=False,
     ):
         try:
-            branch_idx = int(assigned_branch)
-        except (TypeError, ValueError):
-            branch_idx = -1
-
-        outputs = [None] * MAX_BRANCH_OUTPUTS
-
-        if is_worker:
-            if 0 <= branch_idx < MAX_BRANCH_OUTPUTS:
-                try:
-                    await self._send_branch_result_to_master(
-                        input,
-                        branch_idx,
-                        multi_job_id,
-                        master_url,
-                        worker_id,
-                    )
-                    outputs[branch_idx] = input
-                except Exception as exc:
-                    log(f"Worker - DistributedJoin failed to send branch result: {exc}")
-            return tuple(outputs)
-
-        delegate_mode = bool(delegate_only or is_master_delegate_only())
-        try:
             branch_count = int(num_branches)
         except (TypeError, ValueError):
             branch_count = 2
         branch_count = max(2, min(branch_count, MAX_BRANCH_OUTPUTS))
 
+        outputs = [None] * MAX_BRANCH_OUTPUTS
+        for idx in range(branch_count):
+            if branch_values[idx] is not None:
+                outputs[idx] = branch_values[idx]
+
+        local_value, local_branch_idx = self._resolve_local_branch_value(branch_values, assigned_branch)
+
+        if is_worker:
+            if 0 <= local_branch_idx < MAX_BRANCH_OUTPUTS and local_value is not None:
+                try:
+                    await self._send_branch_result_to_master(
+                        local_value,
+                        local_branch_idx,
+                        multi_job_id,
+                        master_url,
+                        worker_id,
+                    )
+                    outputs[local_branch_idx] = local_value
+                except Exception as exc:
+                    log(f"Worker - DistributedBranchCollector failed to send branch result: {exc}")
+            return tuple(outputs)
+
+        delegate_mode = bool(delegate_only or is_master_delegate_only())
         enabled_workers = self._parse_enabled_workers(enabled_worker_ids)
         slots_by_participant = self._participant_branch_slots(enabled_workers, delegate_mode, branch_count)
         expected_worker_ids = self._expected_worker_ids_for_branches(enabled_workers, delegate_mode, branch_count)
         expected_workers = set(expected_worker_ids)
-
-        if not delegate_mode and 0 <= branch_idx < MAX_BRANCH_OUTPUTS:
-            outputs[branch_idx] = input
 
         if not expected_workers:
             return tuple(outputs)
@@ -253,7 +303,7 @@ class DistributedJoin:
                         continue
                     missing_workers = sorted(expected_workers - workers_done)
                     log(
-                        "Master - DistributedJoin heartbeat timeout. "
+                        "Master - DistributedBranchCollector heartbeat timeout. "
                         f"Still waiting for workers: {missing_workers}"
                     )
                     break
@@ -286,7 +336,7 @@ class DistributedJoin:
 
         missing_workers = sorted(expected_workers - workers_done)
         if missing_workers:
-            fallback = self._fallback_for_missing_branch(input)
+            fallback = self._fallback_for_missing_branch(local_value)
             for missing_worker_id in missing_workers:
                 for slot_idx in slots_by_participant.get(str(missing_worker_id), []):
                     if 0 <= slot_idx < MAX_BRANCH_OUTPUTS and outputs[slot_idx] is None:

@@ -103,14 +103,14 @@ def _branch_prompt():
     }
 
 
-def _join_prompt():
-    """1 → 2(DistributedBranch) -> 3(branch0) and 4(branch1) -> 5(DistributedJoin) -> 6(SaveImage)."""
+def _branch_collector_prompt():
+    """1 → 2(DistributedBranch) -> 3(branch0) and 4(branch1) -> 5(DistributedBranchCollector) -> 6(SaveImage)."""
     return {
         "1": {"class_type": "KSampler", "inputs": {}},
         "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
         "3": {"class_type": "Blur", "inputs": {"image": ["2", 0]}},
         "4": {"class_type": "Sharpen", "inputs": {"image": ["2", 1]}},
-        "5": {"class_type": "DistributedJoin", "inputs": {"input": ["3", 0], "num_branches": 2}},
+        "5": {"class_type": "DistributedBranchCollector", "inputs": {"input": ["3", 0], "num_branches": 2}},
         "6": {"class_type": "SaveImage", "inputs": {"images": ["5", 0]}},
     }
 
@@ -302,8 +302,8 @@ class PrunePromptForWorkerTests(unittest.TestCase):
         self.assertIn("5", result)
         self.assertIn("6", result)
 
-    def test_join_anchor_keeps_join_and_downstream(self):
-        prompt = _join_prompt()
+    def test_branch_collector_anchor_keeps_collector_and_downstream(self):
+        prompt = _branch_collector_prompt()
         result = pt.prune_prompt_for_worker(prompt)
         self.assertIn("5", result)
         self.assertIn("6", result)
@@ -401,9 +401,9 @@ class GenerateJobIdMapTests(unittest.TestCase):
         job_map = pt.generate_job_id_map(idx, "run")
         self.assertEqual(job_map["7"], "run_7")
 
-    def test_maps_join_nodes(self):
+    def test_maps_branch_collector_nodes(self):
         prompt = {
-            "10": {"class_type": "DistributedJoin", "inputs": {}},
+            "10": {"class_type": "DistributedBranchCollector", "inputs": {}},
         }
         idx = pt.PromptIndex(prompt)
         job_map = pt.generate_job_id_map(idx, "run")
@@ -717,17 +717,17 @@ class ApplyOverridesBranchTests(unittest.TestCase):
         self.assertTrue(empty_nodes)
 
 
-class ApplyOverridesJoinTests(unittest.TestCase):
-    def test_join_inherits_assigned_branch_from_upstream_branch_node(self):
+class ApplyOverridesBranchCollectorTests(unittest.TestCase):
+    def test_branch_collector_inherits_assigned_branch_from_upstream_branch_node(self):
         master_prompt = {
             "1": {"class_type": "KSampler", "inputs": {}},
             "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
-            "3": {"class_type": "DistributedJoin", "inputs": {"input": ["2", 0], "num_branches": 2}},
+            "3": {"class_type": "DistributedBranchCollector", "inputs": {"input": ["2", 0], "num_branches": 2}},
         }
         worker_prompt = {
             "1": {"class_type": "KSampler", "inputs": {}},
             "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
-            "3": {"class_type": "DistributedJoin", "inputs": {"input": ["2", 1], "num_branches": 2}},
+            "3": {"class_type": "DistributedBranchCollector", "inputs": {"input": ["2", 1], "num_branches": 2}},
         }
 
         master_result = _apply(master_prompt, "master", enabled_worker_ids=["worker-a"])
@@ -736,24 +736,24 @@ class ApplyOverridesJoinTests(unittest.TestCase):
         self.assertEqual(master_result["3"]["inputs"]["assigned_branch"], 0)
         self.assertEqual(worker_result["3"]["inputs"]["assigned_branch"], 1)
 
-    def test_join_sets_multi_job_id(self):
+    def test_branch_collector_sets_multi_job_id(self):
         prompt = {
-            "1": {"class_type": "DistributedJoin", "inputs": {"input": ["2", 0]}},
+            "1": {"class_type": "DistributedBranchCollector", "inputs": {"input": ["2", 0]}},
             "2": {"class_type": "KSampler", "inputs": {}},
         }
         result = _apply(prompt, "master", enabled_worker_ids=["worker-a"])
         self.assertEqual(result["1"]["inputs"]["multi_job_id"], "run_1")
 
-    def test_join_uses_upstream_branch_job_id_for_grouped_convergence(self):
+    def test_branch_collector_uses_upstream_branch_job_id_for_grouped_convergence(self):
         master_prompt = {
             "1": {"class_type": "KSampler", "inputs": {}},
             "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
-            "3": {"class_type": "DistributedJoin", "inputs": {"input": ["2", 0], "num_branches": 2}},
+            "3": {"class_type": "DistributedBranchCollector", "inputs": {"input": ["2", 0], "num_branches": 2}},
         }
         worker_prompt = {
             "1": {"class_type": "KSampler", "inputs": {}},
             "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
-            "3": {"class_type": "DistributedJoin", "inputs": {"input": ["2", 1], "num_branches": 2}},
+            "3": {"class_type": "DistributedBranchCollector", "inputs": {"input": ["2", 1], "num_branches": 2}},
         }
 
         master_result = _apply(master_prompt, "master", enabled_worker_ids=["worker-a"])

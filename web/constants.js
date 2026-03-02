@@ -228,7 +228,7 @@ export const NODE_CLASSES = {
     DISTRIBUTED_LIST_SPLITTER: 'DistributedListSplitter',
     DISTRIBUTED_LIST_COLLECTOR: 'DistributedListCollector',
     DISTRIBUTED_BRANCH: 'DistributedBranch',
-    DISTRIBUTED_JOIN: 'DistributedJoin',
+    DISTRIBUTED_BRANCH_COLLECTOR: 'DistributedBranchCollector',
     DISTRIBUTED_SEED: 'DistributedSeed',
     DISTRIBUTED_EMPTY_IMAGE: 'DistributedEmptyImage',
     UPSCALE_DISTRIBUTED: 'UltimateSDUpscaleDistributed',

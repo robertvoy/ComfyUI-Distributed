@@ -1,6 +1,8 @@
 import { app } from "/scripts/app.js";
 
-const NODE_CLASSES = new Set(["DistributedBranch", "DistributedJoin"]);
+const BRANCH_NODE_CLASS = "DistributedBranch";
+const BRANCH_COLLECTOR_NODE_CLASS = "DistributedBranchCollector";
+const NODE_CLASSES = new Set([BRANCH_NODE_CLASS, BRANCH_COLLECTOR_NODE_CLASS]);
 const MIN_BRANCHES = 2;
 const MAX_BRANCHES = 10;
 
@@ -15,20 +17,38 @@ app.registerExtension({
     async nodeCreated(node) {
         if (!NODE_CLASSES.has(node.comfyClass)) return;
 
-        const updateOutputs = () => {
+        const updateNodeIO = () => {
             if (!node.widgets) return;
             const branchWidget = node.widgets.find((widget) => widget.name === "num_branches");
             if (!branchWidget) return;
 
-            const totalOutputs = clampBranchCount(branchWidget.value);
+            const totalBranches = clampBranchCount(branchWidget.value);
+
+            if (node.comfyClass === BRANCH_COLLECTOR_NODE_CLASS) {
+                if (!node.inputs) node.inputs = [];
+
+                while (node.inputs.length > totalBranches) {
+                    node.removeInput(node.inputs.length - 1);
+                }
+
+                while (node.inputs.length < totalBranches) {
+                    const inputIndex = node.inputs.length + 1;
+                    node.addInput(`branch_${inputIndex}`, "*");
+                }
+
+                for (let idx = 0; idx < node.inputs.length; idx++) {
+                    node.inputs[idx].name = `branch_${idx + 1}`;
+                    node.inputs[idx].type = "*";
+                }
+            }
 
             if (!node.outputs) node.outputs = [];
 
-            while (node.outputs.length > totalOutputs) {
+            while (node.outputs.length > totalBranches) {
                 node.removeOutput(node.outputs.length - 1);
             }
 
-            while (node.outputs.length < totalOutputs) {
+            while (node.outputs.length < totalBranches) {
                 const outputIndex = node.outputs.length + 1;
                 node.addOutput(`branch_${outputIndex}`, "*");
             }
@@ -45,18 +65,18 @@ app.registerExtension({
             }
         };
 
-        setTimeout(updateOutputs, 200);
+        setTimeout(updateNodeIO, 200);
 
         const branchWidget = node.widgets?.find((widget) => widget.name === "num_branches");
         if (!branchWidget) return;
 
         const originalCallback = branchWidget.callback;
         branchWidget.callback = (value) => {
-            updateOutputs();
+            updateNodeIO();
             if (originalCallback) originalCallback.call(branchWidget, value);
         };
 
-        const onInput = () => updateOutputs();
+        const onInput = () => updateNodeIO();
         if (branchWidget.inputEl) {
             branchWidget.inputEl.addEventListener("input", onInput);
         }
@@ -64,7 +84,7 @@ app.registerExtension({
         const originalConfigure = node.configure;
         node.configure = function (data) {
             const result = originalConfigure ? originalConfigure.call(this, data) : undefined;
-            updateOutputs();
+            updateNodeIO();
             return result;
         };
 
