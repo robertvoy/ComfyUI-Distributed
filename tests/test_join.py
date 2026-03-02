@@ -223,6 +223,26 @@ class DistributedBranchCollectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(float(outputs[1].abs().sum().item()), 0.0)
         self.assertEqual(float(outputs[2].abs().sum().item()), 0.0)
 
+    async def test_assigned_slot_can_be_filled_from_single_mismatched_local_input(self):
+        fake_server = _FakePromptServer()
+        branch_collector_module._get_prompt_server_instance = lambda: fake_server
+
+        # No worker results expected for this check.
+        fake_server.distributed_pending_jobs["join-job"] = asyncio.Queue()
+
+        local_tensor = torch.full((1, 4, 4, 3), 0.33, dtype=torch.float32)
+        outputs = await self.node.execute(
+            # Local value arrives on slot 1 even though participant is assigned slot 0.
+            [None, local_tensor, None, None, None, None, None, None, None, None],
+            num_branches=3,
+            multi_job_id="join-job",
+            is_worker=False,
+            enabled_worker_ids=json.dumps([]),
+            assigned_branch=0,
+        )
+
+        self.assertTrue(torch.equal(outputs[0], local_tensor))
+
 
 if __name__ == "__main__":
     unittest.main()

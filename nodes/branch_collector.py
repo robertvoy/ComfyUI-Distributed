@@ -79,6 +79,14 @@ class DistributedBranchCollector:
             if assigned_value is not None:
                 return assigned_value, assigned_idx
 
+            # In participant-pruned prompts, each participant should typically have
+            # exactly one local branch input. If socket names drifted (e.g. branch_2
+            # connected for a participant assigned to slot 0), remap that sole value
+            # to the assigned slot so the participant still contributes correctly.
+            non_none_indices = [idx for idx, value in enumerate(branch_values) if value is not None]
+            if len(non_none_indices) == 1:
+                return branch_values[non_none_indices[0]], assigned_idx
+
         for idx, value in enumerate(branch_values):
             if value is not None:
                 return value, idx
@@ -256,6 +264,8 @@ class DistributedBranchCollector:
                 outputs[idx] = branch_values[idx]
 
         local_value, local_branch_idx = self._resolve_local_branch_value(branch_values, assigned_branch)
+        if 0 <= local_branch_idx < MAX_BRANCH_OUTPUTS and local_value is not None:
+            outputs[local_branch_idx] = local_value
 
         if is_worker:
             if 0 <= local_branch_idx < MAX_BRANCH_OUTPUTS and local_value is not None:
