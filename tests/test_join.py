@@ -199,6 +199,30 @@ class DistributedJoinTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(outputs[2])
         self.assertIsNone(outputs[9])
 
+    async def test_missing_worker_results_use_safe_fallback_for_expected_slots(self):
+        fake_server = _FakePromptServer()
+        join_module._get_prompt_server_instance = lambda: fake_server
+
+        queue = asyncio.Queue()
+        # No worker payloads enqueued; master should timeout and fill expected worker slots.
+        fake_server.distributed_pending_jobs["join-job"] = queue
+
+        master_tensor = torch.full((1, 4, 4, 3), 0.7, dtype=torch.float32)
+        outputs = await self.node.execute(
+            master_tensor,
+            num_branches=3,
+            multi_job_id="join-job",
+            is_worker=False,
+            enabled_worker_ids=json.dumps(["worker-a", "worker-b"]),
+            assigned_branch=0,
+        )
+
+        self.assertTrue(torch.equal(outputs[0], master_tensor))
+        self.assertIsInstance(outputs[1], torch.Tensor)
+        self.assertIsInstance(outputs[2], torch.Tensor)
+        self.assertEqual(float(outputs[1].abs().sum().item()), 0.0)
+        self.assertEqual(float(outputs[2].abs().sum().item()), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

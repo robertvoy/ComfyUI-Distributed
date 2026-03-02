@@ -115,20 +115,37 @@ class DistributedJoin:
         return workers
 
     def _expected_worker_ids_for_branches(self, enabled_workers, delegate_mode, num_branches):
-        participants = list(enabled_workers) if delegate_mode else ["master"] + list(enabled_workers)
-        participant_count = len(participants)
-        if participant_count <= 0:
-            return []
-
+        slots_by_participant = self._participant_branch_slots(enabled_workers, delegate_mode, num_branches)
         expected = []
-        for participant_index, participant_id in enumerate(participants):
-            # A participant receives at least one branch iff it appears in the first `num_branches` slots.
-            if participant_index >= num_branches:
-                continue
-            if participant_id == "master":
+        for participant_id, slots in slots_by_participant.items():
+            if participant_id == "master" or not slots:
                 continue
             expected.append(str(participant_id))
         return expected
+
+    def _participant_branch_slots(self, enabled_workers, delegate_mode, num_branches):
+        participants = list(enabled_workers) if delegate_mode else ["master"] + list(enabled_workers)
+        participant_count = len(participants)
+        if participant_count <= 0:
+            return {}
+
+        slots_by_participant = {}
+        for branch_slot in range(int(num_branches)):
+            participant_id = str(participants[branch_slot % participant_count])
+            slots_by_participant.setdefault(participant_id, []).append(branch_slot)
+        return slots_by_participant
+
+    def _fallback_for_missing_branch(self, input_value):
+        if isinstance(input_value, torch.Tensor):
+            tensor = input_value
+            if tensor.ndim == 3:
+                tensor = tensor.unsqueeze(0)
+            if tensor.ndim == 4:
+                fallback = torch.zeros_like(tensor)
+                if fallback.is_cuda:
+                    fallback = fallback.cpu()
+                return ensure_contiguous(fallback)
+        return input_value
 
     async def _send_branch_result_to_master(self, value, branch_idx, multi_job_id, master_url, worker_id):
         if not isinstance(value, torch.Tensor):
@@ -204,6 +221,7 @@ class DistributedJoin:
         branch_count = max(2, min(branch_count, MAX_BRANCH_OUTPUTS))
 
         enabled_workers = self._parse_enabled_workers(enabled_worker_ids)
+        slots_by_participant = self._participant_branch_slots(enabled_workers, delegate_mode, branch_count)
         expected_worker_ids = self._expected_worker_ids_for_branches(enabled_workers, delegate_mode, branch_count)
         expected_workers = set(expected_worker_ids)
 
@@ -265,5 +283,13 @@ class DistributedJoin:
         finally:
             async with prompt_server.distributed_jobs_lock:
                 prompt_server.distributed_pending_jobs.pop(multi_job_id, None)
+
+        missing_workers = sorted(expected_workers - workers_done)
+        if missing_workers:
+            fallback = self._fallback_for_missing_branch(input)
+            for missing_worker_id in missing_workers:
+                for slot_idx in slots_by_participant.get(str(missing_worker_id), []):
+                    if 0 <= slot_idx < MAX_BRANCH_OUTPUTS and outputs[slot_idx] is None:
+                        outputs[slot_idx] = fallback
 
         return tuple(outputs)
