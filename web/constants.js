@@ -175,6 +175,7 @@ export const TIMEOUTS = {
     LAUNCH: 90000, // ms for worker launch (longer for model loading)
     RETRY_DELAY: 1000, // initial delay for exponential backoff
     MAX_RETRIES: 3, // max retry attempts
+    REMOTE_LOG_AVAILABILITY_WINDOW: 30000, // show remote log button for this long after last online probe
     
     // UI feedback delays
     BUTTON_RESET: 3000, // button text/state reset after actions

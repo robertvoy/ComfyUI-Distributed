@@ -120,7 +120,7 @@ export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
         ui.addPlaceholderHover(card, leftColumn, entityType);
     }
 
-    if (isWorker && !isRemote) {
+    if (isWorker) {
         updateWorkerControls(extension, data.id);
     }
 

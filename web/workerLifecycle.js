@@ -41,6 +41,20 @@ function setButtonVisibility(button, visible) {
     button.style.display = visible ? "" : "none";
 }
 
+export function shouldShowRemoteLogButton(worker, status = {}, now = Date.now()) {
+    if (!worker?.enabled) {
+        return false;
+    }
+    if (status?.online) {
+        return true;
+    }
+    const lastSeenOnlineAt = Number(status?.lastSeenOnlineAt || 0);
+    if (!Number.isFinite(lastSeenOnlineAt) || lastSeenOnlineAt <= 0) {
+        return false;
+    }
+    return (now - lastSeenOnlineAt) <= TIMEOUTS.REMOTE_LOG_AVAILABILITY_WINDOW;
+}
+
 export async function checkAllWorkerStatuses(extension) {
     if (_statusCheckRunning || !extension.panelElement) {
         return;
@@ -142,6 +156,7 @@ export function getWorkerUrl(extension, worker, endpoint = "") {
 export async function checkWorkerStatus(extension, worker) {
     // Assume caller ensured enabled; proceed with check
     const workerUrl = getWorkerUrl(extension, worker);
+    const previousStatus = extension.state.getWorkerStatus(worker.id);
 
     try {
         const signal = extension.statusCheckAbortController?.signal || null;
@@ -162,6 +177,7 @@ export async function checkWorkerStatus(extension, worker) {
             online: true,
             processing: isProcessing,
             queueCount: queueRemaining,
+            lastSeenOnlineAt: Date.now(),
         });
 
         // Update status dot based on probe result
@@ -183,6 +199,7 @@ export async function checkWorkerStatus(extension, worker) {
             online: false,
             processing: false,
             queueCount: 0,
+            lastSeenOnlineAt: previousStatus?.lastSeenOnlineAt || 0,
         });
 
         // Check if worker is launching
@@ -385,13 +402,15 @@ export function updateWorkerControls(extension, workerId) {
     const launchBtn = document.getElementById(`launch-${workerId}`);
     const stopBtn = document.getElementById(`stop-${workerId}`);
     const logBtn = document.getElementById(`log-${workerId}`);
+    const status = extension.state.getWorkerStatus(workerId);
 
     if (isRemoteWorker(extension, worker)) {
         setButtonVisibility(launchBtn, false);
         setButtonVisibility(stopBtn, false);
         if (logBtn) {
-            setButtonVisibility(logBtn, true);
-            logBtn.disabled = false;
+            const showRemoteLog = shouldShowRemoteLogButton(worker, status);
+            setButtonVisibility(logBtn, showRemoteLog);
+            logBtn.disabled = !showRemoteLog;
             logBtn.textContent = "View Log";
             setButtonClass(logBtn, "btn--log");
         }
@@ -400,8 +419,6 @@ export function updateWorkerControls(extension, workerId) {
 
     // Ensure we check for string ID
     const managedInfo = extension.state.getWorker(workerId).managed;
-    const status = extension.state.getWorkerStatus(workerId);
-
     // Show log button immediately if we have log file info (even if worker is still starting)
     if (logBtn) {
         const showLog = Boolean(managedInfo?.log_file);

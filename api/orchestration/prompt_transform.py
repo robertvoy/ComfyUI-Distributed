@@ -603,7 +603,10 @@ def _override_join_nodes(
                 assigned_branch = -1
 
         inputs = node.setdefault("inputs", {})
-        inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
+        # Group all joins under the same DistributedBranch into one queue so
+        # worker-branch senders converge into the master's active join node.
+        job_source_id = upstream_branch_id or node_id
+        inputs["multi_job_id"] = job_id_map.get(job_source_id, job_source_id)
         inputs["is_worker"] = not is_master
         inputs["enabled_worker_ids"] = enabled_json
         inputs["assigned_branch"] = assigned_branch

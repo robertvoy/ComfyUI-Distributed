@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { getWorkerUrl } from "../workerLifecycle.js";
+import { TIMEOUTS } from "../constants.js";
+import { getWorkerUrl, shouldShowRemoteLogButton } from "../workerLifecycle.js";
 
 
 describe("workerLifecycle URL construction", () => {
@@ -48,5 +49,39 @@ describe("workerLifecycle URL construction", () => {
         };
         const worker = { id: "w4", port: 8189, type: "local" };
         expect(getWorkerUrl({}, worker, "/prompt")).toBe("https://podabc-8189.proxy.runpod.net/prompt");
+    });
+});
+
+describe("workerLifecycle remote log visibility", () => {
+    it("shows remote log when worker is online", () => {
+        const worker = { enabled: true };
+        const status = { online: true };
+        expect(shouldShowRemoteLogButton(worker, status, 100_000)).toBe(true);
+    });
+
+    it("shows remote log shortly after last online detection", () => {
+        const worker = { enabled: true };
+        const now = 100_000;
+        const status = {
+            online: false,
+            lastSeenOnlineAt: now - (TIMEOUTS.REMOTE_LOG_AVAILABILITY_WINDOW - 1),
+        };
+        expect(shouldShowRemoteLogButton(worker, status, now)).toBe(true);
+    });
+
+    it("hides remote log when worker has been unavailable past the freshness window", () => {
+        const worker = { enabled: true };
+        const now = 100_000;
+        const status = {
+            online: false,
+            lastSeenOnlineAt: now - (TIMEOUTS.REMOTE_LOG_AVAILABILITY_WINDOW + 1),
+        };
+        expect(shouldShowRemoteLogButton(worker, status, now)).toBe(false);
+    });
+
+    it("hides remote log when worker is disabled", () => {
+        const worker = { enabled: false };
+        const status = { online: true, lastSeenOnlineAt: 99_000 };
+        expect(shouldShowRemoteLogButton(worker, status, 100_000)).toBe(false);
     });
 });

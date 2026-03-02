@@ -717,5 +717,23 @@ class ApplyOverridesJoinTests(unittest.TestCase):
         result = _apply(prompt, "master", enabled_worker_ids=["worker-a"])
         self.assertEqual(result["1"]["inputs"]["multi_job_id"], "run_1")
 
+    def test_join_uses_upstream_branch_job_id_for_grouped_convergence(self):
+        master_prompt = {
+            "1": {"class_type": "KSampler", "inputs": {}},
+            "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
+            "3": {"class_type": "DistributedJoin", "inputs": {"input": ["2", 0], "num_branches": 2}},
+        }
+        worker_prompt = {
+            "1": {"class_type": "KSampler", "inputs": {}},
+            "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
+            "3": {"class_type": "DistributedJoin", "inputs": {"input": ["2", 1], "num_branches": 2}},
+        }
+
+        master_result = _apply(master_prompt, "master", enabled_worker_ids=["worker-a"])
+        worker_result = _apply(worker_prompt, "worker-a", enabled_worker_ids=["worker-a"])
+
+        self.assertEqual(master_result["3"]["inputs"]["multi_job_id"], "run_2")
+        self.assertEqual(worker_result["3"]["inputs"]["multi_job_id"], "run_2")
+
 if __name__ == "__main__":
     unittest.main()

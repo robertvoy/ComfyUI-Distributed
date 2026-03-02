@@ -327,6 +327,7 @@ async def orchestrate_distributed_execution(
         prompt_index.nodes_for_class("DistributedCollector")
         + prompt_index.nodes_for_class("DistributedListCollector")
         + prompt_index.nodes_for_class("DistributedJoin")
+        + prompt_index.nodes_for_class("DistributedBranch")
         + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
     )
     for node_id in queue_node_ids:
