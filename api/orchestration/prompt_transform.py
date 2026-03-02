@@ -251,6 +251,22 @@ def _ensure_worker_output_node(prompt_obj):
     return prompt_obj
 
 
+def _prune_worker_downstream_of_branch_collectors(prompt_obj):
+    """Drop worker-side nodes downstream of branch collectors."""
+    collector_ids = find_nodes_by_class(prompt_obj, "DistributedBranchCollector")
+    if not collector_ids:
+        return prompt_obj
+
+    downstream = _find_downstream_nodes(prompt_obj, collector_ids)
+    for node_id in downstream:
+        if node_id in collector_ids:
+            continue
+        prompt_obj.pop(node_id, None)
+
+    _remove_dangling_input_refs(prompt_obj)
+    return prompt_obj
+
+
 def prune_prompt_for_branch_worker(prompt_obj, branch_node_id, assigned_branch, num_branches):
     """Prune non-assigned branch paths while keeping shared downstream nodes."""
     branch_id = str(branch_node_id)
@@ -775,6 +791,7 @@ def apply_participant_overrides(
     )
 
     if not is_master:
+        prompt_copy = _prune_worker_downstream_of_branch_collectors(prompt_copy)
         prompt_copy = _ensure_worker_output_node(prompt_copy)
 
     return prompt_copy

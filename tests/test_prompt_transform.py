@@ -762,5 +762,24 @@ class ApplyOverridesBranchCollectorTests(unittest.TestCase):
         self.assertEqual(master_result["3"]["inputs"]["multi_job_id"], "run_2")
         self.assertEqual(worker_result["3"]["inputs"]["multi_job_id"], "run_2")
 
+    def test_worker_prunes_nodes_downstream_of_branch_collector(self):
+        prompt = {
+            "1": {"class_type": "KSampler", "inputs": {}},
+            "2": {"class_type": "DistributedBranch", "inputs": {"input": ["1", 0], "num_branches": 2}},
+            "3": {"class_type": "Blur", "inputs": {"image": ["2", 1]}},
+            "4": {
+                "class_type": "DistributedBranchCollector",
+                "inputs": {"branch_2": ["3", 0], "num_branches": 2},
+            },
+            "5": {"class_type": "SaveImage", "inputs": {"images": ["4", 0]}},
+        }
+
+        worker_result = _apply(prompt, "worker-a", enabled_worker_ids=["worker-a"])
+
+        class_types = {node.get("class_type") for node in worker_result.values()}
+        self.assertIn("DistributedBranchCollector", class_types)
+        self.assertNotIn("SaveImage", class_types)
+        self.assertIn("PreviewImage", class_types)
+
 if __name__ == "__main__":
     unittest.main()
