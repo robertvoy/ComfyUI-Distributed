@@ -3,6 +3,7 @@ Async helper utilities for ComfyUI-Distributed.
 """
 import asyncio
 import threading
+import time
 import uuid
 import execution
 import server
@@ -122,6 +123,8 @@ async def queue_prompt_payload(prompt_obj, workflow_meta=None, client_id=None):
         extra_data.setdefault("extra_pnginfo", {})["workflow"] = workflow_meta
     if client_id:
         extra_data["client_id"] = client_id
+    # Keep parity with ComfyUI /prompt endpoint so Jobs API metadata stays valid.
+    extra_data.setdefault("create_time", int(time.time() * 1000))
 
     sensitive = {}
     for key in getattr(execution, "SENSITIVE_EXTRA_DATA_KEYS", []):
