@@ -302,11 +302,11 @@ class PrunePromptForWorkerTests(unittest.TestCase):
         self.assertIn("5", result)
         self.assertIn("6", result)
 
-    def test_branch_collector_anchor_keeps_collector_and_downstream(self):
+    def test_branch_collector_anchor_keeps_collector_but_prunes_downstream(self):
         prompt = _branch_collector_prompt()
         result = pt.prune_prompt_for_worker(prompt)
         self.assertIn("5", result)
-        self.assertIn("6", result)
+        self.assertNotIn("6", result)
 
 
 # ---------------------------------------------------------------------------

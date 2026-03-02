@@ -317,7 +317,8 @@ def prune_prompt_for_worker(prompt_obj):
     if branch_ids:
         connected.update(_find_downstream_nodes(prompt_obj, branch_ids))
     if branch_collector_ids:
-        connected.update(_find_downstream_nodes(prompt_obj, branch_collector_ids))
+        downstream_of_collectors = _find_downstream_nodes(prompt_obj, branch_collector_ids)
+        connected -= (downstream_of_collectors - set(branch_collector_ids))
 
     pruned_prompt = {}
     for node_id in connected:
