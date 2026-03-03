@@ -4,16 +4,22 @@ import asyncio
 import os
 import shutil
 import signal
-import subprocess
 import time
+from typing import Any
 
-from ..constants import TUNNEL_START_TIMEOUT
+from ..constants import PROCESS_TERMINATION_TIMEOUT, TUNNEL_START_TIMEOUT
 from ..logging import debug_log
 from ..network import get_server_port, normalize_host
 from ..process import is_process_alive, terminate_process
 from .binary import ensure_binary
 from .process_reader import ProcessReader
-from .state import clear_tunnel_state, load_tunnel_state, persist_tunnel_state, resolve_restore_master_host
+from .state import (
+    TunnelStateUpdate,
+    clear_tunnel_state,
+    load_tunnel_state,
+    persist_tunnel_state,
+    resolve_restore_master_host,
+)
 
 
 class CloudflareTunnelManager:
@@ -36,6 +42,12 @@ class CloudflareTunnelManager:
     def base_dir(self):
         return os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
+    @staticmethod
+    def _build_local_tunnel_url(port: int) -> str:
+        scheme = (os.environ.get("CLOUDFLARE_LOCAL_BIND_SCHEME") or "http").strip() or "http"
+        host = (os.environ.get("CLOUDFLARE_LOCAL_BIND_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+        return f"{scheme}://{host}:{port}"
+
     def _restore_state(self):
         state = load_tunnel_state()
 
@@ -53,9 +65,47 @@ class CloudflareTunnelManager:
             self.status = "stopped"
             self.pid = None
 
-    async def start_tunnel(self):
+    @staticmethod
+    def _process_is_running(process):
+        poll = getattr(process, "poll", None)
+        if callable(poll):
+            return poll() is None
+        return getattr(process, "returncode", None) is None
+
+    @staticmethod
+    async def _launch_process_with_timeout(command, timeout_seconds, **create_kwargs):
+        """Launch subprocess with bounded startup wait."""
+        try:
+            return await asyncio.wait_for(
+                asyncio.create_subprocess_exec(*command, **create_kwargs),
+                timeout=float(timeout_seconds),
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Timed out launching cloudflared after {timeout_seconds} seconds"
+            ) from exc
+
+    @staticmethod
+    async def _terminate_process_with_timeout(process, timeout_seconds):
+        """Terminate process object with timeout for both sync and async process types."""
+        poll = getattr(process, "poll", None)
+        if callable(poll):
+            terminate_process(process, timeout=timeout_seconds)
+            return
+
+        if getattr(process, "returncode", None) is not None:
+            return
+
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=float(timeout_seconds))
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+
+    async def start_tunnel(self) -> dict[str, Any]:
         async with self._lock:
-            if self.process and self.process.poll() is None:
+            if self.process and self._process_is_running(self.process):
                 return {
                     "status": self.status,
                     "public_url": self.public_url,
@@ -90,17 +140,16 @@ class CloudflareTunnelManager:
                 "tunnel",
                 "--no-autoupdate",
                 "--url",
-                f"http://127.0.0.1:{port}",
+                self._build_local_tunnel_url(port),
             ]
 
             debug_log(f"Starting cloudflared: {' '.join(cmd)}")
             try:
-                self.process = subprocess.Popen(
+                self.process = await self._launch_process_with_timeout(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
+                    timeout_seconds=10.0,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
                 )
             except FileNotFoundError:
                 self.status = "error"
@@ -111,10 +160,12 @@ class CloudflareTunnelManager:
 
             self.pid = self.process.pid
             persist_tunnel_state(
-                status="starting",
-                pid=self.pid,
-                log_file=self.log_file,
-                previous_host=self.previous_master_host,
+                TunnelStateUpdate(
+                    status="starting",
+                    pid=self.pid,
+                    log_file=self.log_file,
+                    previous_host=self.previous_master_host,
+                )
             )
 
             loop = asyncio.get_running_loop()
@@ -139,12 +190,14 @@ class CloudflareTunnelManager:
             debug_log(f"Cloudflare tunnel ready at {self.public_url}")
 
             persist_tunnel_state(
-                status="running",
-                public_url=self.public_url,
-                pid=self.pid,
-                log_file=self.log_file,
-                previous_host=self.previous_master_host or "",
-                master_host=normalize_host(self.public_url),
+                TunnelStateUpdate(
+                    status="running",
+                    public_url=self.public_url,
+                    pid=self.pid,
+                    log_file=self.log_file,
+                    previous_host=self.previous_master_host or "",
+                    master_host=normalize_host(self.public_url),
+                )
             )
             return {
                 "status": self.status,
@@ -153,7 +206,7 @@ class CloudflareTunnelManager:
                 "log_file": self.log_file,
             }
 
-    async def stop_tunnel(self):
+    async def stop_tunnel(self) -> dict[str, Any]:
         async with self._lock:
             pid = self.process.pid if self.process else self.pid
             if not pid:
@@ -163,7 +216,10 @@ class CloudflareTunnelManager:
 
             debug_log(f"Stopping cloudflared (pid={pid})")
             if self.process:
-                terminate_process(self.process, timeout=5)
+                await self._terminate_process_with_timeout(
+                    self.process,
+                    timeout_seconds=PROCESS_TERMINATION_TIMEOUT,
+                )
             else:
                 try:
                     os.kill(pid, signal.SIGTERM)
@@ -187,7 +243,7 @@ class CloudflareTunnelManager:
             )
             return {"status": "stopped"}
 
-    def get_status(self):
+    def get_status(self) -> dict[str, Any]:
         alive = False
         pid = self.process.pid if self.process else self.pid
         if pid:

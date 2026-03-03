@@ -23,6 +23,8 @@ LOG_TAIL_BYTES = 65536  # 64KB
 
 # File paths
 WORKER_LOG_PATTERN = "distributed_worker_*.log"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+GPU_CONFIG_FILE = os.path.join(PROJECT_ROOT, "gpu_config.json")
 
 # Worker management
 WORKER_STARTUP_DELAY = 2.0

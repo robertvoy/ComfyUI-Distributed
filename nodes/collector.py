@@ -1,13 +1,15 @@
-import torch
-import io
-import json
 import asyncio
-import time
 import base64
+import io
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 import server as _server
 import comfy.model_management
+import torch
 from comfy.utils import ProgressBar
 
 from ..utils.logging import debug_log, log
@@ -15,17 +17,32 @@ from ..utils.config import get_worker_timeout_seconds, load_config, is_master_de
 from ..utils.constants import HEARTBEAT_INTERVAL
 from ..utils.image import tensor_to_pil, pil_to_tensor, ensure_contiguous
 from ..utils.network import build_worker_url, get_client_session, probe_worker
+from ..utils.worker_ids import parse_enabled_worker_ids
 from ..utils.audio_payload import encode_audio_payload
 from ..utils.async_helpers import run_async_in_server_loop
+from .context_kwargs import parse_distributed_hidden_context
+from .hidden_inputs import build_distributed_hidden_inputs
 
 prompt_server = _server.PromptServer.instance
+
+
+@dataclass(frozen=True)
+class CollectorRunContext:
+    multi_job_id: str = ""
+    is_worker: bool = False
+    master_url: str = ""
+    enabled_worker_ids: str = "[]"
+    worker_batch_size: int = 1
+    worker_id: str = ""
+    pass_through: bool = False
+    delegate_only: bool = False
 
 
 class DistributedCollectorNode:
     EMPTY_AUDIO = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
 
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls: type["DistributedCollectorNode"]) -> dict[str, Any]:
         return {
             "required": {
                 "images": ("IMAGE",),
@@ -38,50 +55,65 @@ class DistributedCollectorNode:
                 ),
             },
             "optional": { "audio": ("AUDIO",) },
-            "hidden": {
-                "multi_job_id": ("STRING", {"default": ""}),
-                "is_worker": ("BOOLEAN", {"default": False}),
-                "master_url": ("STRING", {"default": ""}),
-                "enabled_worker_ids": ("STRING", {"default": "[]"}),
-                "worker_batch_size": ("INT", {"default": 1, "min": 1, "max": 1024}),
-                "worker_id": ("STRING", {"default": ""}),
-                "pass_through": ("BOOLEAN", {"default": False}),
-                "delegate_only": ("BOOLEAN", {"default": False}),
-            },
+            "hidden": build_distributed_hidden_inputs(
+                include_worker_batch_size=True,
+                include_pass_through=True,
+            ),
         }
 
     RETURN_TYPES = ("IMAGE", "AUDIO")
     RETURN_NAMES = ("images", "audio")
     FUNCTION = "run"
     CATEGORY = "image"
-    
-    def run(self, images, load_balance=False, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+
+    def _build_run_context(self, **kwargs: Any) -> CollectorRunContext:
+        try:
+            worker_batch_size = int(kwargs.get("worker_batch_size", 1))
+        except (TypeError, ValueError):
+            worker_batch_size = 1
+
+        common_context = parse_distributed_hidden_context(kwargs)
+        return CollectorRunContext(
+            worker_batch_size=max(worker_batch_size, 1),
+            pass_through=bool(kwargs.get("pass_through", False)),
+            **common_context,
+        )
+
+    def run(
+        self,
+        images: torch.Tensor,
+        load_balance: bool = False,
+        audio: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        context = self._build_run_context(**kwargs)
         # Create empty audio if not provided
         empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
 
-        if not multi_job_id or pass_through:
-            if pass_through:
+        if not context.multi_job_id or context.pass_through:
+            if context.pass_through:
                 debug_log("Collector: pass-through mode enabled, returning images unchanged")
             return (images, audio if audio is not None else empty_audio)
 
         # Use async helper to run in server loop
         result = run_async_in_server_loop(
             self.execute(
-                images,
-                audio,
-                load_balance,
-                multi_job_id,
-                is_worker,
-                master_url,
-                enabled_worker_ids,
-                worker_batch_size,
-                worker_id,
-                delegate_only,
+                images=images,
+                audio=audio,
+                load_balance=load_balance,
+                context=context,
             )
         )
         return result
 
-    async def send_batch_to_master(self, image_batch, audio, multi_job_id, master_url, worker_id):
+    async def send_batch_to_master(
+        self,
+        image_batch: torch.Tensor,
+        audio: dict[str, Any] | None,
+        multi_job_id: str,
+        master_url: str,
+        worker_id: str,
+    ) -> None:
         """Send image batch to master via canonical JSON envelopes."""
         batch_size = image_batch.shape[0]
         if batch_size == 0:
@@ -235,235 +267,263 @@ class DistributedCollectorNode:
         else:
             raise ValueError("No image data collected from master or workers")
 
-    async def execute(self, images, audio, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
-        if is_worker:
-            # Worker mode: send images and audio to master in a single batch
-            debug_log(f"Worker - Job {multi_job_id} complete. Sending {images.shape[0]} image(s) to master")
-            await self.send_batch_to_master(images, audio, multi_job_id, master_url, worker_id)
-            return (images, audio if audio is not None else self.EMPTY_AUDIO)
-        else:
-            delegate_mode = delegate_only or is_master_delegate_only()
-            # Master mode: collect images and audio from workers
-            enabled_workers_raw = json.loads(enabled_worker_ids)
-            enabled_workers = []
-            seen_enabled = set()
-            for worker_id in enabled_workers_raw:
-                worker_id_str = str(worker_id)
-                if worker_id_str in seen_enabled:
-                    continue
-                seen_enabled.add(worker_id_str)
-                enabled_workers.append(worker_id_str)
-            expected_workers = set(enabled_workers)
-            num_workers = len(expected_workers)
-            if num_workers == 0:
-                return (images, audio if audio is not None else self.EMPTY_AUDIO)
-
-            # Create the queue before any expensive local work to avoid job_complete race.
-            async with prompt_server.distributed_jobs_lock:
-                if multi_job_id not in prompt_server.distributed_pending_jobs:
-                    prompt_server.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
-                    debug_log(f"Master - Initialized queue early for job {multi_job_id}")
-                else:
-                    existing_size = prompt_server.distributed_pending_jobs[multi_job_id].qsize()
-                    debug_log(f"Master - Using existing queue for job {multi_job_id} (current size: {existing_size})")
-
-            if delegate_mode:
-                master_batch_size = 0
-                images_on_cpu = None
-                master_audio = None
-                debug_log(f"Master - Job {multi_job_id}: Delegate-only mode enabled, collecting exclusively from {num_workers} workers")
+    async def _ensure_pending_queue(self, multi_job_id):
+        async with prompt_server.distributed_jobs_lock:
+            if multi_job_id not in prompt_server.distributed_pending_jobs:
+                prompt_server.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
+                debug_log(f"Master - Initialized queue early for job {multi_job_id}")
             else:
-                images_on_cpu = images.cpu()
-                master_batch_size = images.shape[0]
-                master_audio = audio  # Keep master's audio for later
-                debug_log(f"Master - Job {multi_job_id}: Master has {master_batch_size} images, collecting from {num_workers} workers...")
+                existing_size = prompt_server.distributed_pending_jobs[multi_job_id].qsize()
+                debug_log(f"Master - Using existing queue for job {multi_job_id} (current size: {existing_size})")
 
-                # Ensure master images are contiguous
-                images_on_cpu = ensure_contiguous(images_on_cpu)
+    async def _cleanup_pending_queue(self, multi_job_id):
+        async with prompt_server.distributed_jobs_lock:
+            if multi_job_id in prompt_server.distributed_pending_jobs:
+                del prompt_server.distributed_pending_jobs[multi_job_id]
 
+    def _build_master_inputs(self, images, audio, delegate_mode, multi_job_id, num_workers):
+        if delegate_mode:
+            debug_log(
+                f"Master - Job {multi_job_id}: Delegate-only mode enabled, collecting exclusively from {num_workers} workers"
+            )
+            return 0, None, None
 
-            # Initialize storage for collected images and audio
-            worker_images = {}  # Dict to store images by worker_id and index
-            worker_audio = {}   # Dict to store audio by worker_id
-            
-            # Collect images until all workers report they're done
-            collected_count = 0
-            workers_done = set()
-            
-            # Use unified worker timeout from config/UI with simple sliced waits
-            base_timeout = float(get_worker_timeout_seconds())
-            slice_timeout = min(max(0.1, HEARTBEAT_INTERVAL / 20.0), base_timeout)
-            last_activity = time.time()
-            
-            
-            # Get queue size before starting
-            async with prompt_server.distributed_jobs_lock:
-                q = prompt_server.distributed_pending_jobs[multi_job_id]
-                initial_size = q.qsize()
+        images_on_cpu = ensure_contiguous(images.cpu())
+        master_batch_size = images.shape[0]
+        debug_log(
+            f"Master - Job {multi_job_id}: Master has {master_batch_size} images, collecting from {num_workers} workers..."
+        )
+        return master_batch_size, images_on_cpu, audio
 
-            # NEW: Initialize progress bar for workers (total = num_workers)
-            p = ProgressBar(num_workers)
-
-            def mark_worker_done(done_worker_id):
-                done_worker_id = str(done_worker_id)
-                if done_worker_id not in expected_workers:
+    async def _probe_missing_workers_busy(self, missing_workers):
+        any_busy = False
+        try:
+            cfg = load_config()
+            cfg_workers = cfg.get('workers', [])
+            for wid in list(missing_workers):
+                wrec = next((w for w in cfg_workers if str(w.get('id')) == str(wid)), None)
+                if not wrec:
+                    debug_log(f"Collector probe: worker {wid} not found in config")
+                    continue
+                worker_url = build_worker_url(wrec)
+                try:
+                    payload = await probe_worker(worker_url, timeout=2.0)
+                    queue_remaining = None
+                    if payload is not None:
+                        queue_remaining = int(payload.get('exec_info', {}).get('queue_remaining', 0))
                     debug_log(
-                        f"Master - Ignoring completion from unexpected worker {done_worker_id} for job {multi_job_id}"
+                        "Collector probe: worker "
+                        f"{wid} online={payload is not None} queue_remaining={queue_remaining}"
                     )
-                    return
-                if done_worker_id in workers_done:
-                    debug_log(
-                        f"Master - Ignoring duplicate completion from worker {done_worker_id} for job {multi_job_id}"
-                    )
-                    return
-                workers_done.add(done_worker_id)
-                p.update(1)  # +1 per completed expected worker
-
-            try:
-                while len(workers_done) < num_workers:
-                    # Check for user interruption to abort collection promptly
-                    comfy.model_management.throw_exception_if_processing_interrupted()
-                    try:
-                        # Get the queue again each time to ensure we have the right reference
-                        async with prompt_server.distributed_jobs_lock:
-                            q = prompt_server.distributed_pending_jobs[multi_job_id]
-                            current_size = q.qsize()
-                        
-                        result = await asyncio.wait_for(q.get(), timeout=slice_timeout)
-                        worker_id = result['worker_id']
-                        is_last = result.get('is_last', False)
-                        count = self._store_worker_result(worker_images, result)
-                        collected_count += count
-                        debug_log(
-                            f"Master - Got canonical result from worker {worker_id}, "
-                            f"image {result.get('image_index', 0)}, is_last={is_last}"
-                        )
-
-                        # Collect audio data if present
-                        result_audio = result.get('audio')
-                        if result_audio is not None:
-                            worker_audio[worker_id] = result_audio
-                            debug_log(f"Master - Got audio from worker {worker_id}")
-
-                        # Record activity and refresh timeout baseline
-                        last_activity = time.time()
-                        base_timeout = float(get_worker_timeout_seconds())
-
-                        if is_last:
-                            mark_worker_done(worker_id)
-                        
-                    except asyncio.TimeoutError:
-                        # If we still have time, continue polling; otherwise handle timeout
-                        if (time.time() - last_activity) < base_timeout:
-                            comfy.model_management.throw_exception_if_processing_interrupted()
-                            continue
-                        # Re-check for user interruption after timeout expiry
-                        comfy.model_management.throw_exception_if_processing_interrupted()
-                        missing_workers = set(str(w) for w in enabled_workers) - workers_done
-                        elapsed = time.time() - last_activity
-                        for missing_worker_id in sorted(missing_workers):
-                            log(
-                                "Master - Heartbeat timeout: "
-                                f"worker={missing_worker_id}, elapsed={elapsed:.1f}s"
-                            )
+                    if payload is not None and queue_remaining and queue_remaining > 0:
+                        any_busy = True
                         log(
-                            f"Master - Heartbeat timeout. Still waiting for workers: {list(missing_workers)} "
-                            f"(elapsed={elapsed:.1f}s)"
+                            f"Master - Probe grace: worker {wid} appears busy "
+                            f"(queue_remaining={queue_remaining}). Continuing to wait."
                         )
-
-                        # Probe missing workers' /prompt endpoints to check if they are actively processing
-                        any_busy = False
-                        try:
-                            cfg = load_config()
-                            cfg_workers = cfg.get('workers', [])
-                            for wid in list(missing_workers):
-                                wrec = next((w for w in cfg_workers if str(w.get('id')) == str(wid)), None)
-                                if not wrec:
-                                    debug_log(f"Collector probe: worker {wid} not found in config")
-                                    continue
-                                worker_url = build_worker_url(wrec)
-                                try:
-                                    payload = await probe_worker(worker_url, timeout=2.0)
-                                    queue_remaining = None
-                                    if payload is not None:
-                                        queue_remaining = int(payload.get('exec_info', {}).get('queue_remaining', 0))
-                                    debug_log(
-                                        "Collector probe: worker "
-                                        f"{wid} online={payload is not None} queue_remaining={queue_remaining}"
-                                    )
-                                    if payload is not None and queue_remaining and queue_remaining > 0:
-                                        any_busy = True
-                                        log(
-                                            f"Master - Probe grace: worker {wid} appears busy "
-                                            f"(queue_remaining={queue_remaining}). Continuing to wait."
-                                        )
-                                        break
-                                except Exception as e:
-                                    debug_log(f"Collector probe failed for worker {wid}: {e}")
-                        except Exception as e:
-                            debug_log(f"Collector probe setup error: {e}")
-
-                        if any_busy:
-                            # Refresh last_activity and continue waiting
-                            last_activity = time.time()
-                            # Refresh base timeout in case the user changed it in UI
-                            base_timeout = float(get_worker_timeout_seconds())
-                            continue
-                        
-                        # Check queue size again with lock
-                        async with prompt_server.distributed_jobs_lock:
-                            if multi_job_id in prompt_server.distributed_pending_jobs:
-                                final_q = prompt_server.distributed_pending_jobs[multi_job_id]
-                                final_size = final_q.qsize()
-                                
-                                # Try to drain any remaining items
-                                remaining_items = []
-                                while not final_q.empty():
-                                    try:
-                                        item = final_q.get_nowait()
-                                        remaining_items.append(item)
-                                    except asyncio.QueueEmpty:
-                                        break
-                                
-                                if remaining_items:
-                                    # Process them
-                                    for item in remaining_items:
-                                        worker_id = item['worker_id']
-                                        is_last = item.get('is_last', False)
-
-                                        collected_count += self._store_worker_result(worker_images, item)
-                                        
-                                        if is_last:
-                                            mark_worker_done(worker_id)
-                            else:
-                                log(f"Master - Queue {multi_job_id} no longer exists!")
                         break
-            except comfy.model_management.InterruptProcessingException:
-                # Cleanup queue on interruption and re-raise to abort prompt cleanly
-                async with prompt_server.distributed_jobs_lock:
-                    if multi_job_id in prompt_server.distributed_pending_jobs:
-                        del prompt_server.distributed_pending_jobs[multi_job_id]
-                raise
-            
-            total_collected = sum(len(imgs) for imgs in worker_images.values())
-            
-            # Clean up job queue
-            async with prompt_server.distributed_jobs_lock:
-                if multi_job_id in prompt_server.distributed_pending_jobs:
-                    del prompt_server.distributed_pending_jobs[multi_job_id]
+                except Exception as e:
+                    debug_log(f"Collector probe failed for worker {wid}: {e}")
+        except Exception as e:
+            debug_log(f"Collector probe setup error: {e}")
+        return any_busy
 
-            try:
-                combined = self._reorder_and_combine_tensors(
-                    worker_images, enabled_workers, master_batch_size, images_on_cpu, delegate_mode, images
+    async def _drain_remaining_queue_items(
+        self,
+        multi_job_id: str,
+        worker_images: dict[str, dict[int, torch.Tensor]],
+        mark_worker_done: Callable[[str], None],
+    ) -> int:
+        collected_count = 0
+        async with prompt_server.distributed_jobs_lock:
+            if multi_job_id not in prompt_server.distributed_pending_jobs:
+                log(f"Master - Queue {multi_job_id} no longer exists!")
+                return collected_count
+
+            final_q = prompt_server.distributed_pending_jobs[multi_job_id]
+            remaining_items = []
+            while not final_q.empty():
+                try:
+                    remaining_items.append(final_q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+        for item in remaining_items:
+            worker_id = item['worker_id']
+            is_last = item.get('is_last', False)
+            collected_count += self._store_worker_result(worker_images, item)
+            if is_last:
+                mark_worker_done(worker_id)
+        return collected_count
+
+    async def _collect_worker_results(
+        self,
+        multi_job_id: str,
+        enabled_workers: list[str],
+        expected_workers: set[str],
+        worker_images: dict[str, dict[int, torch.Tensor]],
+        worker_audio: dict[str, dict[str, Any]],
+    ) -> int:
+        num_workers = len(expected_workers)
+        workers_done = set()
+        collected_count = 0
+        base_timeout = float(get_worker_timeout_seconds())
+        slice_timeout = min(max(0.1, HEARTBEAT_INTERVAL / 20.0), base_timeout)
+        last_activity = time.time()
+        progress = ProgressBar(num_workers)
+
+        def mark_worker_done(done_worker_id: str) -> None:
+            done_worker_id = str(done_worker_id)
+            if done_worker_id not in expected_workers:
+                debug_log(
+                    f"Master - Ignoring completion from unexpected worker {done_worker_id} for job {multi_job_id}"
                 )
-                debug_log(f"Master - Job {multi_job_id} complete. Combined {combined.shape[0]} images total "
-                          f"(master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})")
+                return
+            if done_worker_id in workers_done:
+                debug_log(
+                    f"Master - Ignoring duplicate completion from worker {done_worker_id} for job {multi_job_id}"
+                )
+                return
+            workers_done.add(done_worker_id)
+            progress.update(1)
 
-                # Combine audio from master and workers
-                combined_audio = self._combine_audio(master_audio, worker_audio, self.EMPTY_AUDIO, enabled_workers)
+        while len(workers_done) < num_workers:
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            try:
+                async with prompt_server.distributed_jobs_lock:
+                    q = prompt_server.distributed_pending_jobs[multi_job_id]
 
-                return (combined, combined_audio)
-            except Exception as e:
-                log(f"Master - Error combining images: {e}")
-                # Return just the master images as fallback
-                return (images, audio if audio is not None else self.EMPTY_AUDIO)
+                result = await asyncio.wait_for(q.get(), timeout=slice_timeout)
+                worker_id = result['worker_id']
+                is_last = result.get('is_last', False)
+                collected_count += self._store_worker_result(worker_images, result)
+                debug_log(
+                    f"Master - Got canonical result from worker {worker_id}, "
+                    f"image {result.get('image_index', 0)}, is_last={is_last}"
+                )
+
+                result_audio = result.get('audio')
+                if result_audio is not None:
+                    worker_audio[worker_id] = result_audio
+                    debug_log(f"Master - Got audio from worker {worker_id}")
+
+                last_activity = time.time()
+                base_timeout = float(get_worker_timeout_seconds())
+                if is_last:
+                    mark_worker_done(worker_id)
+            except asyncio.TimeoutError:
+                if (time.time() - last_activity) < base_timeout:
+                    comfy.model_management.throw_exception_if_processing_interrupted()
+                    continue
+
+                comfy.model_management.throw_exception_if_processing_interrupted()
+                missing_workers = set(str(w) for w in enabled_workers) - workers_done
+                elapsed = time.time() - last_activity
+                for missing_worker_id in sorted(missing_workers):
+                    log(
+                        "Master - Heartbeat timeout: "
+                        f"worker={missing_worker_id}, elapsed={elapsed:.1f}s"
+                    )
+                log(
+                    f"Master - Heartbeat timeout. Still waiting for workers: {list(missing_workers)} "
+                    f"(elapsed={elapsed:.1f}s)"
+                )
+
+                if await self._probe_missing_workers_busy(missing_workers):
+                    last_activity = time.time()
+                    base_timeout = float(get_worker_timeout_seconds())
+                    continue
+
+                collected_count += await self._drain_remaining_queue_items(
+                    multi_job_id,
+                    worker_images,
+                    mark_worker_done,
+                )
+                break
+
+        return collected_count
+
+    async def _execute_master(
+        self,
+        images,
+        audio,
+        multi_job_id,
+        enabled_worker_ids,
+        delegate_only,
+    ):
+        delegate_mode = delegate_only or is_master_delegate_only()
+        enabled_workers = parse_enabled_worker_ids(enabled_worker_ids)
+        expected_workers = set(enabled_workers)
+        num_workers = len(expected_workers)
+        if num_workers == 0:
+            return (images, audio if audio is not None else self.EMPTY_AUDIO)
+
+        await self._ensure_pending_queue(multi_job_id)
+        master_batch_size, images_on_cpu, master_audio = self._build_master_inputs(
+            images, audio, delegate_mode, multi_job_id, num_workers
+        )
+
+        worker_images = {}
+        worker_audio = {}
+        try:
+            await self._collect_worker_results(
+                multi_job_id=multi_job_id,
+                enabled_workers=enabled_workers,
+                expected_workers=expected_workers,
+                worker_images=worker_images,
+                worker_audio=worker_audio,
+            )
+        except comfy.model_management.InterruptProcessingException:
+            await self._cleanup_pending_queue(multi_job_id)
+            raise
+
+        await self._cleanup_pending_queue(multi_job_id)
+        try:
+            combined = self._reorder_and_combine_tensors(
+                worker_images, enabled_workers, master_batch_size, images_on_cpu, delegate_mode, images
+            )
+            debug_log(
+                f"Master - Job {multi_job_id} complete. Combined {combined.shape[0]} images total "
+                f"(master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})"
+            )
+            combined_audio = self._combine_audio(master_audio, worker_audio, self.EMPTY_AUDIO, enabled_workers)
+            return (combined, combined_audio)
+        except Exception as e:
+            log(f"Master - Error combining images: {e}")
+            return (images, audio if audio is not None else self.EMPTY_AUDIO)
+
+    async def execute(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compatibility wrapper with a uniform execute() signature across collectors."""
+        return await self._execute_collector(*args, **kwargs)
+
+    async def _execute_collector(
+        self,
+        images: torch.Tensor,
+        audio: dict[str, Any] | None,
+        load_balance: bool = False,
+        context: CollectorRunContext | None = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        run_context = context or CollectorRunContext()
+        _ = load_balance
+        _ = run_context.worker_batch_size
+        if run_context.is_worker:
+            debug_log(
+                "Worker - Job "
+                f"{run_context.multi_job_id} complete. Sending {images.shape[0]} image(s) to master"
+            )
+            await self.send_batch_to_master(
+                images,
+                audio,
+                run_context.multi_job_id,
+                run_context.master_url,
+                run_context.worker_id,
+            )
+            return (images, audio if audio is not None else self.EMPTY_AUDIO)
+
+        return await self._execute_master(
+            images=images,
+            audio=audio,
+            multi_job_id=run_context.multi_job_id,
+            enabled_worker_ids=run_context.enabled_worker_ids,
+            delegate_only=run_context.delegate_only,
+        )

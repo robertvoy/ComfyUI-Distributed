@@ -2,7 +2,7 @@ import asyncio
 
 from ..utils.logging import debug_log
 from .job_store import ensure_tile_jobs_initialized
-from .job_timeout import _check_and_requeue_timed_out_workers as _requeue_usdu
+from .job_timeout import check_and_requeue_timed_out_workers
 from .job_models import ImageJobState, TileJobState
 
 
@@ -132,4 +132,4 @@ class JobStateMixin:
 
     async def _check_and_requeue_timed_out_workers(self, multi_job_id, batch_size):
         """Check for timed out workers and requeue their assigned images."""
-        return await _requeue_usdu(multi_job_id, batch_size)
+        return await check_and_requeue_timed_out_workers(multi_job_id, batch_size)

@@ -1,13 +1,24 @@
 from contextlib import contextmanager
+from typing import Any, Iterator, TypeAlias
 
 import torch
 
 from .logging import debug_log
 from .usdu_utils import resize_region
 
+CropRegion: TypeAlias = tuple[int, int, int, int]
+CropRegions: TypeAlias = list[CropRegion] | CropRegion
+
 
 @contextmanager
-def crop_model_cond(model, crop_regions, init_size, canvas_size, tile_size, latent_crop=False):
+def crop_model_cond(
+    model: Any,
+    crop_regions: CropRegions,
+    init_size: tuple[int, int],
+    canvas_size: tuple[int, int],
+    tile_size: tuple[int, int],
+    latent_crop: bool = False,
+) -> Iterator[Any]:
     """Clone model and crop compatible model patches for tile-local sampling."""
     try:
         patched_model = model.clone()
@@ -71,7 +82,12 @@ class ModelPatchCropper:
         self.patch.encoded_image = self.original_state["encoded_image"]
         self.patch.encoded_image_size = self.original_state["encoded_image_size"]
 
-    def crop(self, crop_regions, canvas_size, latent_crop=True):
+    def crop(
+        self,
+        crop_regions: CropRegions,
+        canvas_size: tuple[int, int],
+        latent_crop: bool = True,
+    ) -> "ModelPatchCropper":
         patch = self.patch
 
         if not isinstance(crop_regions, list):

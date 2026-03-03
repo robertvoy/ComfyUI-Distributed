@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import importlib.util
+import io
 import json
 import sys
 import types
@@ -51,8 +53,16 @@ def _bootstrap_package(package_name):
         array = (tensor.numpy() * 255.0).astype("uint8")
         return Image.fromarray(array)
 
+    def encode_tensor_png_data_url(image_batch, batch_index=0):
+        image = tensor_to_pil(image_batch, batch_index)
+        byte_io = io.BytesIO()
+        image.save(byte_io, format="PNG", compress_level=0)
+        encoded = base64.b64encode(byte_io.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{encoded}"
+
     image_module.ensure_contiguous = ensure_contiguous
     image_module.tensor_to_pil = tensor_to_pil
+    image_module.encode_tensor_png_data_url = encode_tensor_png_data_url
     sys.modules[f"{package_name}.utils.image"] = image_module
 
     network_module = types.ModuleType(f"{package_name}.utils.network")
@@ -69,7 +79,7 @@ def _bootstrap_package(package_name):
 
 
 def _load_module(package_name, module_rel_path, module_name):
-    module_path = Path(__file__).resolve().parents[1] / module_rel_path
+    module_path = Path(__file__).resolve().parents[3] / module_rel_path
     spec = importlib.util.spec_from_file_location(
         f"{package_name}.{module_name}",
         module_path,
@@ -84,10 +94,27 @@ def _load_module(package_name, module_rel_path, module_name):
 def _load_list_collector_module():
     package_name = "dist_list_collector_testpkg"
     _bootstrap_package(package_name)
+    _load_module(package_name, "nodes/hidden_inputs.py", "nodes.hidden_inputs")
+    _load_module(package_name, "nodes/runtime_helpers.py", "nodes.runtime_helpers")
+    _load_module(package_name, "nodes/queue_wait.py", "nodes.queue_wait")
+    _load_module(package_name, "utils/worker_ids.py", "utils.worker_ids")
     return _load_module(package_name, "nodes/list_collector.py", "nodes.list_collector")
 
 
 collector_module = _load_list_collector_module()
+
+
+def _context(**overrides):
+    defaults = {
+        "multi_job_id": "",
+        "is_worker": False,
+        "master_url": "",
+        "enabled_worker_ids": "[]",
+        "worker_id": "",
+        "delegate_only": False,
+    }
+    defaults.update(overrides)
+    return collector_module.ListCollectorRunContext(**defaults)
 
 
 class _FakeResponseCtx:
@@ -140,10 +167,12 @@ class DistributedListCollectorTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.node.execute(
             images,
-            multi_job_id="job-list",
-            is_worker=True,
-            master_url="http://master.local:8188",
-            worker_id="worker-a",
+            context=_context(
+                multi_job_id="job-list",
+                is_worker=True,
+                master_url="http://master.local:8188",
+                worker_id="worker-a",
+            ),
         )
 
         self.assertEqual(len(result[0]), 2)
@@ -169,9 +198,10 @@ class DistributedListCollectorTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.node.execute(
             master_images,
-            multi_job_id="job-list",
-            is_worker=False,
-            enabled_worker_ids=json.dumps(["worker-a", "worker-b"]),
+            context=_context(
+                multi_job_id="job-list",
+                enabled_worker_ids=json.dumps(["worker-a", "worker-b"]),
+            ),
         )
 
         self.assertEqual(len(result[0]), 3)
@@ -192,10 +222,11 @@ class DistributedListCollectorTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.node.execute(
             master_images,
-            multi_job_id="job-list",
-            is_worker=False,
-            enabled_worker_ids=json.dumps(["worker-a"]),
-            delegate_only=True,
+            context=_context(
+                multi_job_id="job-list",
+                enabled_worker_ids=json.dumps(["worker-a"]),
+                delegate_only=True,
+            ),
         )
 
         self.assertEqual(len(result[0]), 1)

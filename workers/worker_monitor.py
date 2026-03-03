@@ -9,40 +9,56 @@ import time
 import subprocess
 import platform
 import signal
-
-# Add package root to path so this script works when launched by file path.
-NODE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if NODE_ROOT not in sys.path:
-    sys.path.insert(0, NODE_ROOT)
+from typing import Any
 
 try:
-    from utils.process import is_process_alive, terminate_process
+    from utils.process import is_process_alive, launch_process_with_timeout, terminate_process
     from utils.constants import WORKER_CHECK_INTERVAL, PROCESS_TERMINATION_TIMEOUT
 except ImportError:
     # Fallback if running from different context
-    def is_process_alive(pid):
-        """Check if a process with given PID is still alive."""
+    def is_process_alive(pid: int | str) -> bool:
+        """Best-effort fallback process liveness probe."""
         try:
-            if platform.system() == "Windows":
-                # Windows: use tasklist
-                result = subprocess.run(['tasklist', '/FI', f'PID eq {pid}'], 
-                                      capture_output=True, text=True)
-                return str(pid) in result.stdout
-            else:
-                # Unix: send signal 0
-                os.kill(pid, 0)
-                return True
-        except (OSError, subprocess.SubprocessError):
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+
+        if os.name == "nt":
+            try:
+                output = subprocess.check_output(
+                    ["tasklist", "/FI", f"PID eq {pid}"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=5.0,
+                )
+            except Exception:
+                return False
+            return str(pid) in output
+
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
             return False
     
+    def launch_process_with_timeout(
+        command: list[str],
+        timeout_seconds: float = 10.0,
+        **kwargs: Any,
+    ):
+        _ = kwargs
+        raise RuntimeError(
+            "launch_process_with_timeout unavailable: utils.process import failed"
+        )
+
     WORKER_CHECK_INTERVAL = 2.0
     PROCESS_TERMINATION_TIMEOUT = 5.0
 
-def monitor_and_run(master_pid, command):
-    """Run command and monitor master process."""
+def monitor_and_run(master_pid: int, command: list[str]) -> int:
+    """Run command and monitor master process; return process exit code."""
     # Start the actual worker process
     print(f"[Distributed] Launching worker command: {' '.join(command)}")
-    worker_process = subprocess.Popen(command)
+    worker_process = launch_process_with_timeout(command, timeout_seconds=10.0)
     
     print(f"[Distributed] Started worker PID: {worker_process.pid}")
     print(f"[Distributed] Monitoring master PID: {master_pid}")
@@ -56,11 +72,24 @@ def monitor_and_run(master_pid, command):
                 f.write(f"{monitor_pid},{worker_process.pid}")
             print(f"[Distributed] Wrote PID info to {pid_info_file}")
         except Exception as e:
-            print(f"[Distributed] Could not write PID file: {e}")
+            raise RuntimeError(f"Could not write PID file '{pid_info_file}': {e}") from e
     
     # Define cleanup function
-    def cleanup_worker(signum=None, frame=None):
+    should_stop = False
+    monitor_exit_code = 0
+
+    def cleanup_worker(
+        signum: int | None = None,
+        frame: Any | None = None,
+        exit_code: int = 0,
+    ) -> None:
         """Clean up worker process when monitor is terminated."""
+        nonlocal should_stop
+        nonlocal monitor_exit_code
+        _ = frame
+        should_stop = True
+        monitor_exit_code = int(exit_code)
+
         if signum:
             print(f"\n[Distributed] Received signal {signum}, terminating worker...")
         else:
@@ -80,53 +109,70 @@ def monitor_and_run(master_pid, command):
                     worker_process.wait()
         
         print("[Distributed] Worker terminated.")
-        sys.exit(0)
+
+    def _signal_handler(signum, frame):
+        cleanup_worker(signum=signum, frame=frame, exit_code=0)
     
     # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGTERM, cleanup_worker)
-    signal.signal(signal.SIGINT, cleanup_worker)
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
     if platform.system() != "Windows":
-        signal.signal(signal.SIGHUP, cleanup_worker)
+        signal.signal(signal.SIGHUP, _signal_handler)
     
     # Monitor loop
     check_interval = WORKER_CHECK_INTERVAL
     
     try:
         while True:
+            if should_stop:
+                break
+
             # Check if worker is still running
             if worker_process.poll() is not None:
                 print(f"[Distributed] Worker process exited with code: {worker_process.returncode}")
-                sys.exit(worker_process.returncode)
+                monitor_exit_code = int(worker_process.returncode or 0)
+                break
             
             # Check if master is still alive
             if not is_process_alive(master_pid):
                 print(f"[Distributed] Master process {master_pid} is no longer running. Terminating worker...")
-                cleanup_worker()
+                cleanup_worker(exit_code=0)
+                break
             
             time.sleep(check_interval)
             
     except KeyboardInterrupt:
-        cleanup_worker()
+        cleanup_worker(exit_code=0)
 
-if __name__ == "__main__":
+    return monitor_exit_code
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for worker monitor script."""
+    args = list(sys.argv[1:] if argv is None else argv)
+
     # Get master PID from environment
     master_pid = os.environ.get('COMFYUI_MASTER_PID')
     if not master_pid:
         print("[Distributed] Error: COMFYUI_MASTER_PID not set")
-        sys.exit(1)
+        return 1
     
     try:
         master_pid = int(master_pid)
     except ValueError:
         print(f"[Distributed] Error: Invalid master PID: {master_pid}")
-        sys.exit(1)
+        return 1
     
     # Get the actual command to run (all remaining arguments)
-    if len(sys.argv) < 2:
+    if not args:
         print("[Distributed] Error: No command specified")
-        sys.exit(1)
+        return 1
     
-    command = sys.argv[1:]
+    command = args
     
     # Start monitoring
-    monitor_and_run(master_pid, command)
+    return monitor_and_run(master_pid, command)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

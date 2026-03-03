@@ -29,7 +29,7 @@ def _bootstrap_package(package_name):
 
 
 def _load_module(package_name, module_rel_path, module_name):
-    module_path = Path(__file__).resolve().parents[1] / module_rel_path
+    module_path = Path(__file__).resolve().parents[3] / module_rel_path
     spec = importlib.util.spec_from_file_location(
         f"{package_name}.{module_name}",
         module_path,

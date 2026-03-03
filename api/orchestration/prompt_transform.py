@@ -1,5 +1,6 @@
 import json
 from collections import deque
+from typing import Any
 
 from ...utils.logging import debug_log
 
@@ -27,7 +28,7 @@ class PromptIndex:
     def nodes_for_class(self, class_name):
         return self.nodes_by_class.get(class_name, [])
 
-    def has_upstream(self, start_node_id, target_class):
+    def has_upstream(self, start_node_id: str, target_class: str) -> bool:
         cache_key = (str(start_node_id), target_class)
         if cache_key in self._upstream_cache:
             return self._upstream_cache[cache_key]
@@ -107,6 +108,9 @@ def _find_downstream_of_output_slot(prompt_obj, node_id, slot_index):
             try:
                 input_slot = int(value[1])
             except (TypeError, ValueError):
+                debug_log(
+                    f"Prompt transform: skipping malformed slot reference for node {candidate_id}: {value}"
+                )
                 continue
             if input_slot == slot:
                 direct_consumers.add(str(candidate_id))
@@ -124,6 +128,7 @@ def _create_numeric_id_generator(prompt_obj):
         try:
             numeric = int(node_id)
         except (TypeError, ValueError):
+            debug_log(f"Prompt transform: ignoring non-numeric node id while generating ids: {node_id}")
             continue
         max_id = max(max_id, numeric)
 
@@ -267,7 +272,12 @@ def _prune_worker_downstream_of_branch_collectors(prompt_obj):
     return prompt_obj
 
 
-def prune_prompt_for_branch_worker(prompt_obj, branch_node_id, assigned_branch, num_branches):
+def prune_prompt_for_branch_worker(
+    prompt_obj: dict[str, Any],
+    branch_node_id: str,
+    assigned_branch: int | list[int] | tuple[int, ...] | set[int],
+    num_branches: int,
+) -> dict[str, Any]:
     """Prune non-assigned branch paths while keeping shared downstream nodes."""
     branch_id = str(branch_node_id)
 
@@ -277,6 +287,7 @@ def prune_prompt_for_branch_worker(prompt_obj, branch_node_id, assigned_branch, 
             try:
                 idx = int(value)
             except (TypeError, ValueError):
+                debug_log(f"Prompt transform: invalid assigned branch slot ignored: {value}")
                 continue
             if idx >= 0:
                 assigned_slots.add(idx)
@@ -318,7 +329,7 @@ def prune_prompt_for_branch_worker(prompt_obj, branch_node_id, assigned_branch, 
     return prompt_obj
 
 
-def prune_prompt_for_worker(prompt_obj):
+def prune_prompt_for_worker(prompt_obj: dict[str, Any]) -> dict[str, Any]:
     """Prune worker prompt to distributed nodes and their upstream dependencies."""
     collector_ids = find_nodes_by_class(prompt_obj, "DistributedCollector")
     list_collector_ids = find_nodes_by_class(prompt_obj, "DistributedListCollector")
@@ -364,7 +375,10 @@ def prune_prompt_for_worker(prompt_obj):
     return pruned_prompt
 
 
-def prepare_delegate_master_prompt(prompt_obj, collector_ids):
+def prepare_delegate_master_prompt(
+    prompt_obj: dict[str, Any],
+    collector_ids: list[str],
+) -> dict[str, Any]:
     """Prune master prompt so it only executes post-collector nodes in delegate mode."""
     downstream = _find_downstream_nodes(prompt_obj, collector_ids)
     nodes_to_keep = set(collector_ids)
@@ -420,7 +434,7 @@ def prepare_delegate_master_prompt(prompt_obj, collector_ids):
     return pruned_prompt
 
 
-def generate_job_id_map(prompt_index, prefix):
+def generate_job_id_map(prompt_index: PromptIndex, prefix: str) -> dict[str, str]:
     """Create stable per-node job IDs for distributed nodes."""
     job_map = {}
     distributed_nodes = (
@@ -716,14 +730,14 @@ def _override_branch_collector_nodes(
 
 
 def apply_participant_overrides(
-    prompt_copy,
-    participant_id,
-    enabled_worker_ids,
-    job_id_map,
-    master_url,
-    delegate_master,
-    prompt_index,
-):
+    prompt_copy: dict[str, Any],
+    participant_id: str,
+    enabled_worker_ids: list[str],
+    job_id_map: dict[str, str],
+    master_url: str,
+    delegate_master: bool,
+    prompt_index: PromptIndex,
+) -> dict[str, Any]:
     """Return a prompt copy with hidden inputs configured for master/worker."""
     is_master = participant_id == "master"
     worker_index_map = {wid: idx for idx, wid in enumerate(enabled_worker_ids)}

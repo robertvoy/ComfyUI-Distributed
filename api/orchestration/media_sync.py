@@ -3,6 +3,7 @@ import hashlib
 import mimetypes
 import os
 import re
+from typing import Any
 
 import aiohttp
 
@@ -33,7 +34,7 @@ def _normalize_media_reference(value):
     return None
 
 
-def convert_paths_for_platform(obj, target_separator):
+def convert_paths_for_platform(obj: Any, target_separator: str) -> Any:
     """Recursively normalize likely file paths for the worker platform separator."""
     if target_separator not in ("/", "\\"):
         return obj
@@ -124,7 +125,10 @@ def _load_media_file_sync(filename):
     return file_bytes, file_hash, mime_type
 
 
-async def fetch_worker_path_separator(worker, trace_execution_id=None):
+async def fetch_worker_path_separator(
+    worker: dict[str, Any],
+    trace_execution_id: str | None = None,
+) -> str | None:
     """Best-effort fetch of a worker's path separator from /distributed/system_info."""
     url = build_worker_url(worker, "/distributed/system_info")
     session = await get_client_session()
@@ -193,7 +197,11 @@ async def _upload_media_to_worker(worker, filename, file_bytes, file_hash, mime_
     return True, worker_path
 
 
-async def sync_worker_media(worker, prompt_obj, trace_execution_id=None):
+async def sync_worker_media(
+    worker: dict[str, Any],
+    prompt_obj: dict[str, Any],
+    trace_execution_id: str | None = None,
+) -> None:
     """Sync referenced media files from master to a remote worker before dispatch."""
     media_refs = _find_media_references(prompt_obj)
     if not media_refs:

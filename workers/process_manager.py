@@ -1,4 +1,7 @@
-from .process import ComfyRootDiscovery, LaunchCommandBuilder, ProcessLifecycle, ProcessPersistence
+from .process.launch_builder import LaunchCommandBuilder
+from .process.lifecycle import ProcessLifecycle
+from .process.persistence import ProcessPersistence
+from .process.root_discovery import ComfyRootDiscovery
 
 
 class WorkerProcessManager:

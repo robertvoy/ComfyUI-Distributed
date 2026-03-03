@@ -61,7 +61,7 @@ def _bootstrap_package(package_name):
 def _load_async_helpers_module():
     package_name = "dist_async_helpers_testpkg"
     fake_prompt_server = _bootstrap_package(package_name)
-    module_path = Path(__file__).resolve().parents[1] / "utils/async_helpers.py"
+    module_path = Path(__file__).resolve().parents[3] / "utils/async_helpers.py"
     spec = importlib.util.spec_from_file_location(
         f"{package_name}.utils.async_helpers",
         module_path,

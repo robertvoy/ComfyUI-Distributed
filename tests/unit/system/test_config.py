@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 
 def _load_config_module():
-    module_path = Path(__file__).resolve().parents[1] / "utils" / "config.py"
+    module_path = Path(__file__).resolve().parents[3] / "utils" / "config.py"
     package_name = "dist_cfg_testpkg"
 
     for mod_name in list(sys.modules):
@@ -27,6 +27,7 @@ def _load_config_module():
     sys.modules[f"{package_name}.logging"] = logging_module
 
     constants_module = types.ModuleType(f"{package_name}.constants")
+    constants_module.GPU_CONFIG_FILE = "gpu_config.json"
     constants_module.HEARTBEAT_TIMEOUT = 30
     sys.modules[f"{package_name}.constants"] = constants_module
 
@@ -213,7 +214,7 @@ class SaveConfigTests(unittest.TestCase):
                 data = config.get_default_config()
                 config.save_config(data)
                 # Cache is now None; load_config should re-read
-                self.assertIsNone(config._config_cache)
+                self.assertIsNone(config._config_state().cache)
 
     def test_written_file_is_valid_json(self):
         data = config.get_default_config()

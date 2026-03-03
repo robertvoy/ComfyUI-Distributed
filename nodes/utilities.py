@@ -1,5 +1,6 @@
 import torch
 import json
+from typing import Any
 
 from ..utils.logging import debug_log, log
 
@@ -28,7 +29,7 @@ class DistributedSeed:
     """
     
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls: type["DistributedSeed"]) -> dict[str, Any]:
         return {
             "required": {
                 "seed": ("INT", {
@@ -49,7 +50,12 @@ class DistributedSeed:
     FUNCTION = "distribute"
     CATEGORY = "utils"
     
-    def distribute(self, seed, is_worker=False, worker_id=""):
+    def distribute(
+        self,
+        seed: int,
+        is_worker: bool = False,
+        worker_id: str = "",
+    ) -> tuple[int]:
         if not is_worker:
             # Master node: pass through original values
             debug_log(f"Distributor - Master: seed={seed}")
@@ -92,7 +98,7 @@ class DistributedValue:
     """
 
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls: type["DistributedValue"]) -> dict[str, Any]:
         return {
             "required": {
                 "default_value": ("STRING", {"default": ""}),
@@ -110,7 +116,7 @@ class DistributedValue:
     CATEGORY = "utils"
 
     @staticmethod
-    def _coerce(value, value_type):
+    def _coerce(value: Any, value_type: str) -> Any:
         """Convert a string value to the requested type."""
         if value_type == "INT":
             return int(float(value))
@@ -119,14 +125,31 @@ class DistributedValue:
         return value  # STRING and COMBO stay as strings
 
     @staticmethod
-    def _coerce_safe(value, value_type):
+    def _coerce_safe(value: Any, value_type: str) -> Any:
         """Best-effort coercion with graceful fallback to original value."""
         try:
             return DistributedValue._coerce(value, value_type)
         except (TypeError, ValueError):
             return value
 
-    def distribute(self, default_value, worker_values="{}", is_worker=False, worker_id=""):
+    @staticmethod
+    def _infer_value_type(value: Any) -> str:
+        """Infer coercion type from the provided default value."""
+        if isinstance(value, bool):
+            return "STRING"
+        if isinstance(value, int):
+            return "INT"
+        if isinstance(value, float):
+            return "FLOAT"
+        return "STRING"
+
+    def distribute(
+        self,
+        default_value: Any,
+        worker_values: str | dict[str, Any] = "{}",
+        is_worker: bool = False,
+        worker_id: str = "",
+    ) -> tuple[Any]:
         values = {}
         value_type = "STRING"
 
@@ -138,7 +161,11 @@ class DistributedValue:
             debug_log(f"DistributedValue - Error parsing worker_values: {e}")
             values = {}
 
-        value_type = values.get("_type", "STRING")
+        inferred_type = self._infer_value_type(default_value)
+        value_type = values.get("_type", inferred_type)
+        if value_type not in {"STRING", "COMBO", "INT", "FLOAT"}:
+            value_type = inferred_type
+        values["_type"] = value_type
         coerced_default = self._coerce_safe(default_value, value_type)
 
         if not is_worker:
@@ -163,7 +190,7 @@ class DistributedValue:
 
 class DistributedModelName:
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls: type["DistributedModelName"]) -> dict[str, Any]:
         return {
             "required": {
                 "text": ("STRING", {"default": ""}),
@@ -180,7 +207,7 @@ class DistributedModelName:
     OUTPUT_NODE = True
     CATEGORY = "utils"
 
-    def _stringify(self, value):
+    def _stringify(self, value: Any) -> str:
         if isinstance(value, str):
             return value
         if isinstance(value, (int, float, bool)):
@@ -190,7 +217,7 @@ class DistributedModelName:
         except Exception:
             return str(value)
 
-    def _update_workflow(self, extra_pnginfo, unique_id, values):
+    def _update_workflow(self, extra_pnginfo: Any, unique_id: Any, values: list[str]) -> None:
         if not extra_pnginfo:
             return
         info = extra_pnginfo[0] if isinstance(extra_pnginfo, list) else extra_pnginfo
@@ -208,7 +235,12 @@ class DistributedModelName:
         if node:
             node["widgets_values"] = [values]
 
-    def log_input(self, text, unique_id=None, extra_pnginfo=None):
+    def log_input(
+        self,
+        text: Any,
+        unique_id: Any = None,
+        extra_pnginfo: Any = None,
+    ) -> dict[str, Any]:
         values = []
         if isinstance(text, list):
             for val in text:
@@ -224,7 +256,7 @@ class DistributedModelName:
         return {"ui": {"text": values}, "result": (values,)}
 
 class ByPassTypeTuple(tuple):
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> Any:
         if index > 0:
             index = 0
         item = super().__getitem__(index)
@@ -234,7 +266,7 @@ class ByPassTypeTuple(tuple):
 
 class ImageBatchDivider:
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls: type["ImageBatchDivider"]) -> dict[str, Any]:
         return {
             "required": {
                 "images": ("IMAGE",),
@@ -255,7 +287,7 @@ class ImageBatchDivider:
     OUTPUT_NODE = True
     CATEGORY = "image"
     
-    def divide_batch(self, images, divide_by):
+    def divide_batch(self, images: torch.Tensor, divide_by: int) -> tuple[torch.Tensor, ...]:
         total_splits = max(1, min(int(divide_by), 10))
         total_frames = images.shape[0]
         empty_tensor = images[:0]
@@ -272,7 +304,7 @@ class AudioBatchDivider:
     """Divides an audio waveform into multiple parts along the time/samples dimension."""
 
     @classmethod
-    def INPUT_TYPES(s):
+    def INPUT_TYPES(cls: type["AudioBatchDivider"]) -> dict[str, Any]:
         return {
             "required": {
                 "audio": ("AUDIO",),
@@ -293,7 +325,7 @@ class AudioBatchDivider:
     OUTPUT_NODE = True
     CATEGORY = "audio"
 
-    def divide_audio(self, audio, divide_by):
+    def divide_audio(self, audio: dict[str, Any], divide_by: int) -> tuple[dict[str, Any], ...]:
         import torch
 
         waveform = audio.get("waveform")
@@ -333,7 +365,7 @@ class DistributedEmptyImage:
     """Produces an empty IMAGE batch used when the master delegates all work."""
 
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls: type["DistributedEmptyImage"]) -> dict[str, Any]:
         return {
             "required": {
                 "height": ("INT", {"default": 64, "min": 1, "max": 4096, "step": 1}),
@@ -346,7 +378,7 @@ class DistributedEmptyImage:
     FUNCTION = "create"
     CATEGORY = "image"
 
-    def create(self, height, width, channels):
+    def create(self, height: int, width: int, channels: int) -> tuple[torch.Tensor]:
         import torch
 
         shape = (0, height, width, channels)

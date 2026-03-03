@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 
 def _load_detection_module():
-    module_path = Path(__file__).resolve().parents[1] / "workers" / "detection.py"
+    module_path = Path(__file__).resolve().parents[3] / "workers" / "detection.py"
     package_name = "dist_det_testpkg"
 
     for mod_name in list(sys.modules):
@@ -32,6 +32,7 @@ def _load_detection_module():
 
     network_module = types.ModuleType(f"{package_name}.utils.network")
     network_module.normalize_host = lambda value: value
+    network_module.build_worker_url = lambda worker, endpoint="": f"http://{worker.get('host', 'localhost')}{endpoint}"
 
     async def _fake_session():
         raise RuntimeError("network calls not used in these tests")
@@ -156,7 +157,7 @@ class IsLocalWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
 
     async def test_true_for_0_0_0_0(self):
-        result = await detection.is_local_worker({"host": "0.0.0.0", "port": 8188})
+        result = await detection.is_local_worker({"host": "0.0.0.0", "port": 8188})  # nosec B104 - explicit wildcard host test case
         self.assertTrue(result)
 
     async def test_true_when_type_is_local(self):

@@ -1,42 +1,42 @@
 import asyncio
-import base64
-import io
-import json
-import time
+from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 import torch
 
 from ..utils.async_helpers import run_async_in_server_loop
-from ..utils.config import get_worker_timeout_seconds, is_master_delegate_only
-from ..utils.constants import HEARTBEAT_INTERVAL
-from ..utils.image import ensure_contiguous, tensor_to_pil
+from ..utils.config import is_master_delegate_only
+from ..utils.image import encode_tensor_png_data_url, ensure_contiguous
 from ..utils.logging import log
 from ..utils.network import get_client_session
+from ..utils.worker_ids import parse_enabled_worker_ids
+from .context_kwargs import parse_distributed_hidden_context
+from .hidden_inputs import build_distributed_hidden_inputs
+from .queue_wait import collect_worker_queue_results
+from .runtime_helpers import (
+    get_prompt_server_instance as _get_prompt_server_instance,
+    throw_if_processing_interrupted as _throw_if_processing_interrupted,
+)
 from .utilities import any_type
 
 
 MAX_BRANCH_OUTPUTS = 10
 
 
-def _get_prompt_server_instance():
-    import server as _server
-
-    return _server.PromptServer.instance
-
-
-def _throw_if_processing_interrupted():
-    try:
-        import comfy.model_management as model_management
-
-        model_management.throw_exception_if_processing_interrupted()
-    except Exception:
-        return
-
+@dataclass(frozen=True)
+class BranchRunContext:
+    multi_job_id: str = ""
+    is_worker: bool = False
+    master_url: str = ""
+    enabled_worker_ids: str = "[]"
+    worker_id: str = ""
+    assigned_branch: int = -1
+    delegate_only: bool = False
 
 class DistributedBranchCollector:
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls: type["DistributedBranchCollector"]) -> dict[str, Any]:
         optional_inputs = {
             f"branch_{idx + 1}": (any_type,)
             for idx in range(MAX_BRANCH_OUTPUTS)
@@ -46,15 +46,10 @@ class DistributedBranchCollector:
                 "num_branches": ("INT", {"default": 2, "min": 2, "max": MAX_BRANCH_OUTPUTS, "step": 1}),
             },
             "optional": optional_inputs,
-            "hidden": {
-                "multi_job_id": ("STRING", {"default": ""}),
-                "is_worker": ("BOOLEAN", {"default": False}),
-                "master_url": ("STRING", {"default": ""}),
-                "enabled_worker_ids": ("STRING", {"default": "[]"}),
-                "worker_id": ("STRING", {"default": ""}),
-                "assigned_branch": ("INT", {"default": -1, "min": -1, "max": MAX_BRANCH_OUTPUTS - 1}),
-                "delegate_only": ("BOOLEAN", {"default": False}),
-            },
+            "hidden": build_distributed_hidden_inputs(
+                include_assigned_branch=True,
+                assigned_branch_max=MAX_BRANCH_OUTPUTS - 1,
+            ),
         }
 
     RETURN_TYPES = tuple([any_type] * MAX_BRANCH_OUTPUTS)
@@ -67,6 +62,18 @@ class DistributedBranchCollector:
         for idx in range(MAX_BRANCH_OUTPUTS):
             values.append(kwargs.get(f"branch_{idx + 1}", None))
         return values
+
+    def _build_run_context(self, **kwargs: Any) -> BranchRunContext:
+        try:
+            assigned_branch = int(kwargs.get("assigned_branch", -1))
+        except (TypeError, ValueError):
+            assigned_branch = -1
+
+        common_context = parse_distributed_hidden_context(kwargs)
+        return BranchRunContext(
+            assigned_branch=assigned_branch,
+            **common_context,
+        )
 
     def _resolve_local_branch_value(self, branch_values, assigned_branch):
         try:
@@ -108,70 +115,22 @@ class DistributedBranchCollector:
 
     def run(
         self,
-        num_branches=2,
-        multi_job_id="",
-        is_worker=False,
-        master_url="",
-        enabled_worker_ids="[]",
-        worker_id="",
-        assigned_branch=-1,
-        delegate_only=False,
-        branch_1=None,
-        branch_2=None,
-        branch_3=None,
-        branch_4=None,
-        branch_5=None,
-        branch_6=None,
-        branch_7=None,
-        branch_8=None,
-        branch_9=None,
-        branch_10=None,
-    ):
-        branch_values = [
-            branch_1,
-            branch_2,
-            branch_3,
-            branch_4,
-            branch_5,
-            branch_6,
-            branch_7,
-            branch_8,
-            branch_9,
-            branch_10,
-        ]
+        num_branches: int = 2,
+        **kwargs: Any,
+    ) -> tuple[Any, ...]:
+        branch_values = self._branch_values(**kwargs)
+        context = self._build_run_context(**kwargs)
 
-        if not multi_job_id:
+        if not context.multi_job_id:
             return self._build_outputs(branch_values, num_branches)
 
         return run_async_in_server_loop(
             self.execute(
                 branch_values,
                 num_branches=num_branches,
-                multi_job_id=multi_job_id,
-                is_worker=is_worker,
-                master_url=master_url,
-                enabled_worker_ids=enabled_worker_ids,
-                worker_id=worker_id,
-                assigned_branch=assigned_branch,
-                delegate_only=delegate_only,
+                context=context,
             )
         )
-
-    def _parse_enabled_workers(self, enabled_worker_ids):
-        try:
-            raw = json.loads(enabled_worker_ids)
-        except Exception:
-            raw = []
-
-        workers = []
-        seen = set()
-        for worker_id in raw if isinstance(raw, list) else []:
-            worker_id_str = str(worker_id)
-            if worker_id_str in seen:
-                continue
-            seen.add(worker_id_str)
-            workers.append(worker_id_str)
-        return workers
 
     def _participant_branch_slots(self, enabled_workers, delegate_mode, num_branches):
         participants = list(enabled_workers) if delegate_mode else ["master"] + list(enabled_workers)
@@ -218,16 +177,11 @@ class DistributedBranchCollector:
                 "DistributedBranchCollector tensor result must be IMAGE-like with shape [B,H,W,C] or [H,W,C]."
             )
 
-        img = tensor_to_pil(image_batch, 0)
-        byte_io = io.BytesIO()
-        img.save(byte_io, format="PNG", compress_level=0)
-        encoded_image = base64.b64encode(byte_io.getvalue()).decode("utf-8")
-
         payload = {
             "job_id": str(multi_job_id),
             "worker_id": str(worker_id),
             "batch_idx": int(branch_idx),
-            "image": f"data:image/png;base64,{encoded_image}",
+            "image": encode_tensor_png_data_url(image_batch, 0),
             "is_last": True,
         }
 
@@ -240,18 +194,17 @@ class DistributedBranchCollector:
         ) as response:
             response.raise_for_status()
 
-    async def execute(
+    async def execute(self, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        """Compatibility wrapper with a uniform execute() signature across collectors."""
+        return await self._execute_branch(*args, **kwargs)
+
+    async def _execute_branch(
         self,
-        branch_values,
-        num_branches=2,
-        multi_job_id="",
-        is_worker=False,
-        master_url="",
-        enabled_worker_ids="[]",
-        worker_id="",
-        assigned_branch=-1,
-        delegate_only=False,
-    ):
+        branch_values: list[Any],
+        num_branches: int = 2,
+        context: BranchRunContext | None = None,
+    ) -> tuple[Any, ...]:
+        run_context = context or BranchRunContext()
         try:
             branch_count = int(num_branches)
         except (TypeError, ValueError):
@@ -263,27 +216,27 @@ class DistributedBranchCollector:
             if branch_values[idx] is not None:
                 outputs[idx] = branch_values[idx]
 
-        local_value, local_branch_idx = self._resolve_local_branch_value(branch_values, assigned_branch)
+        local_value, local_branch_idx = self._resolve_local_branch_value(branch_values, run_context.assigned_branch)
         if 0 <= local_branch_idx < MAX_BRANCH_OUTPUTS and local_value is not None:
             outputs[local_branch_idx] = local_value
 
-        if is_worker:
+        if run_context.is_worker:
             if 0 <= local_branch_idx < MAX_BRANCH_OUTPUTS and local_value is not None:
                 try:
                     await self._send_branch_result_to_master(
                         local_value,
                         local_branch_idx,
-                        multi_job_id,
-                        master_url,
-                        worker_id,
+                        run_context.multi_job_id,
+                        run_context.master_url,
+                        run_context.worker_id,
                     )
                     outputs[local_branch_idx] = local_value
                 except Exception as exc:
                     log(f"Worker - DistributedBranchCollector failed to send branch result: {exc}")
             return tuple(outputs)
 
-        delegate_mode = bool(delegate_only or is_master_delegate_only())
-        enabled_workers = self._parse_enabled_workers(enabled_worker_ids)
+        delegate_mode = bool(run_context.delegate_only or is_master_delegate_only())
+        enabled_workers = parse_enabled_worker_ids(run_context.enabled_worker_ids)
         slots_by_participant = self._participant_branch_slots(enabled_workers, delegate_mode, branch_count)
         expected_worker_ids = self._expected_worker_ids_for_branches(enabled_workers, delegate_mode, branch_count)
         expected_workers = set(expected_worker_ids)
@@ -293,56 +246,42 @@ class DistributedBranchCollector:
 
         prompt_server = _get_prompt_server_instance()
         async with prompt_server.distributed_jobs_lock:
-            if multi_job_id not in prompt_server.distributed_pending_jobs:
-                prompt_server.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
+            if run_context.multi_job_id not in prompt_server.distributed_pending_jobs:
+                prompt_server.distributed_pending_jobs[run_context.multi_job_id] = asyncio.Queue()
 
-        workers_done = set()
-        base_timeout = float(get_worker_timeout_seconds())
-        slice_timeout = min(max(0.1, HEARTBEAT_INTERVAL / 20.0), base_timeout)
-        last_activity = time.time()
+        workers_done: set[str] = set()
+
+        def _handle_queue_result(result: dict[str, Any]) -> None:
+            image_index = result.get("image_index")
+            tensor = result.get("tensor")
+            try:
+                slot_idx = int(image_index)
+            except (TypeError, ValueError):
+                slot_idx = -1
+
+            if 0 <= slot_idx < MAX_BRANCH_OUTPUTS and tensor is not None:
+                if isinstance(tensor, torch.Tensor):
+                    if tensor.is_cuda:
+                        tensor = tensor.cpu()
+                    tensor = ensure_contiguous(tensor)
+                outputs[slot_idx] = tensor
 
         try:
-            while len(workers_done) < len(expected_workers):
-                _throw_if_processing_interrupted()
-                try:
-                    async with prompt_server.distributed_jobs_lock:
-                        queue = prompt_server.distributed_pending_jobs[multi_job_id]
-                    result = await asyncio.wait_for(queue.get(), timeout=slice_timeout)
-                except asyncio.TimeoutError:
-                    if (time.time() - last_activity) < base_timeout:
-                        continue
-                    missing_workers = sorted(expected_workers - workers_done)
-                    log(
-                        "Master - DistributedBranchCollector heartbeat timeout. "
-                        f"Still waiting for workers: {missing_workers}"
-                    )
-                    break
-
-                worker_id_value = str(result.get("worker_id", ""))
-                image_index = result.get("image_index")
-                tensor = result.get("tensor")
-                is_last = bool(result.get("is_last", False))
-
-                try:
-                    slot_idx = int(image_index)
-                except (TypeError, ValueError):
-                    slot_idx = -1
-
-                if 0 <= slot_idx < MAX_BRANCH_OUTPUTS and tensor is not None:
-                    if isinstance(tensor, torch.Tensor):
-                        if tensor.is_cuda:
-                            tensor = tensor.cpu()
-                        tensor = ensure_contiguous(tensor)
-                    outputs[slot_idx] = tensor
-
-                last_activity = time.time()
-                base_timeout = float(get_worker_timeout_seconds())
-                if is_last and worker_id_value in expected_workers:
-                    workers_done.add(worker_id_value)
+            workers_done = await collect_worker_queue_results(
+                prompt_server=prompt_server,
+                multi_job_id=run_context.multi_job_id,
+                expected_workers=expected_workers,
+                on_result=_handle_queue_result,
+                timeout_log_prefix=(
+                    "Master - DistributedBranchCollector heartbeat timeout. "
+                    "Still waiting for workers: "
+                ),
+                throw_if_interrupted=_throw_if_processing_interrupted,
+            )
 
         finally:
             async with prompt_server.distributed_jobs_lock:
-                prompt_server.distributed_pending_jobs.pop(multi_job_id, None)
+                prompt_server.distributed_pending_jobs.pop(run_context.multi_job_id, None)
 
         missing_workers = sorted(expected_workers - workers_done)
         if missing_workers:

@@ -1,7 +1,8 @@
 import copy
+from typing import Any
 
 
-def clone_control_chain(control, clone_hint=True):
+def clone_control_chain(control: Any, clone_hint: bool = True) -> Any:
     """Shallow copy the ControlNet chain, optionally cloning hints but sharing models."""
     if control is None:
         return None
@@ -14,7 +15,10 @@ def clone_control_chain(control, clone_hint=True):
     return new_control
 
 
-def clone_conditioning(cond_list, clone_hints=True):
+def clone_conditioning(
+    cond_list: list[tuple[Any, dict[str, Any]]] | list[list[Any]],
+    clone_hints: bool = True,
+) -> list[list[Any]]:
     """Clone conditioning without duplicating ControlNet models."""
     new_cond = []
     for emb, cond_dict in cond_list:

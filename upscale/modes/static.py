@@ -2,7 +2,7 @@ import asyncio, time, torch
 from PIL import Image
 import comfy.model_management
 from ...utils.logging import debug_log, log
-from ...utils.image import tensor_to_pil, pil_to_tensor
+from ...utils.image import blend_processed_batch_item, pil_to_tensor, tensor_to_pil
 from ...utils.async_helpers import run_async_in_server_loop
 from ...utils.config import get_worker_timeout_seconds
 from ...utils.constants import (
@@ -15,9 +15,11 @@ from ...utils.constants import (
 )
 from ..job_store import (
     ensure_tile_jobs_initialized, init_static_job_batched,
-    _mark_task_completed, _cleanup_job, _drain_results_queue, _get_completed_count,
+    cleanup_job, drain_results_queue, get_completed_count, mark_task_completed,
 )
 from ..job_models import TileJobState
+from ..processing_args import UpscaleCoreArgs
+from ..tile_processing import TileBatchArgs, extract_and_process_tile_batch
 
 
 class StaticModeMixin:
@@ -71,14 +73,33 @@ class StaticModeMixin:
     ):
         """Extract one tile position for the whole batch and process it."""
         tx, ty = all_tiles[tile_id]
-        tile_batch, x1, y1, ew, eh = self.extract_batch_tile_with_padding(
-            upscaled_image, tx, ty, tile_width, tile_height, padding, force_uniform_tiles
+        tile_batch_args = TileBatchArgs(
+            core=UpscaleCoreArgs(
+                model=model,
+                positive=positive,
+                negative=negative,
+                vae=vae,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                denoise=denoise,
+                tiled_decode=tiled_decode,
+            ),
+            tile_width=tile_width,
+            tile_height=tile_height,
+            padding=padding,
+            force_uniform_tiles=force_uniform_tiles,
+            width=width,
+            height=height,
         )
-        region = (x1, y1, x1 + ew, y1 + eh)
-        processed_batch = self.process_tiles_batch(
-            tile_batch, model, positive, negative, vae,
-            seed, steps, cfg, sampler_name, scheduler, denoise, tiled_decode,
-            region, (width, height)
+        processed_batch, x1, y1, ew, eh = extract_and_process_tile_batch(
+            node=self,
+            upscaled_image=upscaled_image,
+            tx=tx,
+            ty=ty,
+            args=tile_batch_args,
         )
         return processed_batch, x1, y1, ew, eh
 
@@ -177,13 +198,21 @@ class StaticModeMixin:
         out_bs = processed_batch.shape[0] if hasattr(processed_batch, "shape") else batch_size
         processed_items = min(batch_size, out_bs)
         for b in range(processed_items):
-            tile_pil = tensor_to_pil(processed_batch, b)
-            if tile_pil.size != (ew, eh):
-                tile_pil = tile_pil.resize((ew, eh), Image.LANCZOS)
-            result_images[b] = self.blend_tile(result_images[b], tile_pil, x1, y1, (ew, eh), tile_mask, padding)
+            blend_processed_batch_item(
+                result_images,
+                processed_batch,
+                b,
+                self.blend_tile,
+                x1,
+                y1,
+                ew,
+                eh,
+                tile_mask,
+                padding,
+            )
             global_idx = b * num_tiles_per_image + tile_id
             run_async_in_server_loop(
-                _mark_task_completed(multi_job_id, global_idx, {'batch_idx': b, 'tile_idx': tile_id}),
+                mark_task_completed(multi_job_id, global_idx, {'batch_idx': b, 'tile_idx': tile_id}),
                 timeout=5.0
             )
         return processed_items
@@ -328,7 +357,7 @@ class StaticModeMixin:
                 raise comfy.model_management.InterruptProcessingException()
             
             # Drain any pending results
-            collected_count = await _drain_results_queue(multi_job_id)
+            collected_count = await drain_results_queue(multi_job_id)
             
             # Check and requeue timed-out workers periodically
             current_time = time.time()
@@ -339,7 +368,7 @@ class StaticModeMixin:
                 last_heartbeat_check = current_time
             
             # Get current completion count
-            completed_count = await _get_completed_count(multi_job_id)
+            completed_count = await get_completed_count(multi_job_id)
             
             # Progress logging
             if current_time - last_progress_log >= progress_interval:
@@ -368,157 +397,198 @@ class StaticModeMixin:
         # Get all completed tasks for return
         return await self._get_all_completed_tasks(multi_job_id)
 
-    def _process_master_static_sync(self, upscaled_image, model, positive, negative, vae,
-                                    seed, steps, cfg, sampler_name, scheduler, denoise,
-                                    tile_width, tile_height, padding, mask_blur,
-                                    force_uniform_tiles, tiled_decode, multi_job_id, enabled_workers,
-                                    all_tiles, num_tiles_per_image):
-        """Static mode master processing with optional dynamic queue pulling."""
-        batch_size = upscaled_image.shape[0]
+    def _init_master_static_state(
+        self,
+        upscaled_image,
+        multi_job_id,
+        batch_size,
+        num_tiles_per_image,
+        enabled_workers,
+        all_tiles,
+        tile_width,
+        tile_height,
+        mask_blur,
+    ):
         _, height, width, _ = upscaled_image.shape
-        total_tiles = batch_size * num_tiles_per_image
-        
-        # Convert batch to PIL list for processing
-        result_images = []
-        for b in range(batch_size):
-            image_pil = tensor_to_pil(upscaled_image[b:b+1], 0)
-            result_images.append(image_pil.copy())
-        
-        # Initialize queue: pending queue holds tile ids (batched per tile)
+        result_images = [tensor_to_pil(upscaled_image[b:b + 1], 0).copy() for b in range(batch_size)]
+
         log("USDU Dist: Using tile queue distribution")
         run_async_in_server_loop(
             init_static_job_batched(multi_job_id, batch_size, num_tiles_per_image, enabled_workers),
-            timeout=10.0
+            timeout=10.0,
         )
-        debug_log(
-            f"Initialized tile-id queue with {num_tiles_per_image} ids for batch {batch_size}"
-        )
+        debug_log(f"Initialized tile-id queue with {num_tiles_per_image} ids for batch {batch_size}")
 
-        # Precompute masks for all tile positions to avoid repeated Gaussian blur work during blending
-        tile_masks = []
-        for idx, (tx, ty) in enumerate(all_tiles):
-            tile_masks.append(self.create_tile_mask(width, height, tx, ty, tile_width, tile_height, mask_blur))
+        tile_masks = [
+            self.create_tile_mask(width, height, tx, ty, tile_width, tile_height, mask_blur)
+            for tx, ty in all_tiles
+        ]
+        return result_images, tile_masks, width, height
 
+    def _process_master_static_initial_tiles(
+        self,
+        multi_job_id,
+        total_tiles,
+        all_tiles,
+        upscaled_image,
+        result_images,
+        tile_masks,
+        batch_size,
+        num_tiles_per_image,
+        tile_width,
+        tile_height,
+        padding,
+        force_uniform_tiles,
+        model,
+        positive,
+        negative,
+        vae,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        denoise,
+        tiled_decode,
+        width,
+        height,
+    ):
         processed_count = 0
         consecutive_no_tile = 0
         max_consecutive_no_tile = 2
 
         while processed_count < total_tiles:
             comfy.model_management.throw_exception_if_processing_interrupted()
-            tile_idx = run_async_in_server_loop(
-                self._get_next_tile_index(multi_job_id),
-                timeout=5.0
-            )
-            if tile_idx is not None:
-                consecutive_no_tile = 0
-                tile_id = tile_idx
-                processed_count += self._master_process_one_tile(
-                    tile_id,
-                    all_tiles,
-                    upscaled_image,
-                    result_images,
-                    tile_masks,
-                    multi_job_id,
-                    batch_size,
-                    num_tiles_per_image,
-                    tile_width,
-                    tile_height,
-                    padding,
-                    force_uniform_tiles,
-                    model,
-                    positive,
-                    negative,
-                    vae,
-                    seed,
-                    steps,
-                    cfg,
-                    sampler_name,
-                    scheduler,
-                    denoise,
-                    tiled_decode,
-                    width,
-                    height,
-                )
-                log(f"USDU Dist: Tiles progress {processed_count}/{total_tiles} (tile {tile_id})")
-            else:
+            tile_id = run_async_in_server_loop(self._get_next_tile_index(multi_job_id), timeout=5.0)
+            if tile_id is None:
                 consecutive_no_tile += 1
                 if consecutive_no_tile >= max_consecutive_no_tile:
                     debug_log(f"Master processed {processed_count} tiles, moving to collection phase")
                     break
                 time.sleep(0.1)
-        master_processed_count = processed_count
-        
-        # Continue processing any remaining tiles while collecting worker results
-        remaining_tiles = total_tiles - master_processed_count
-        if remaining_tiles > 0:
-            debug_log(f"Master waiting for {remaining_tiles} tiles from workers")
-            
-            # Collect worker results using async operations
-            try:
-                # Wait until either all tasks are collected or there are no active workers left
-                collected_tasks = run_async_in_server_loop(
-                    self._async_collect_and_monitor_static(multi_job_id, total_tiles, expected_total=total_tiles),
-                    timeout=None
-                )
-            except comfy.model_management.InterruptProcessingException:
-                # Clean up job on interruption
-                run_async_in_server_loop(_cleanup_job(multi_job_id), timeout=5.0)
-                raise
-            
-            # Check if we need to process any remaining tasks locally after collection
-            completed_count = len(collected_tasks)
-            if completed_count < total_tiles:
-                log(f"Processing remaining {total_tiles - completed_count} tasks locally after worker failures")
-                
-                # Process any remaining pending tasks (batched-per-tile)
-                while True:
-                    # Check for user interruption
-                    comfy.model_management.throw_exception_if_processing_interrupted()
+                continue
 
-                    # Get next tile_id from pending queue
-                    tile_id = run_async_in_server_loop(
-                        self._get_next_tile_index(multi_job_id),
-                        timeout=5.0
-                    )
-
-                    if tile_id is None:
-                        break
-
-                    self._master_process_one_tile(
-                        tile_id,
-                        all_tiles,
-                        upscaled_image,
-                        result_images,
-                        tile_masks,
-                        multi_job_id,
-                        batch_size,
-                        num_tiles_per_image,
-                        tile_width,
-                        tile_height,
-                        padding,
-                        force_uniform_tiles,
-                        model,
-                        positive,
-                        negative,
-                        vae,
-                        seed,
-                        steps,
-                        cfg,
-                        sampler_name,
-                        scheduler,
-                        denoise,
-                        tiled_decode,
-                        width,
-                        height,
-                    )
-        else:
-            # Master processed all tiles
-            collected_tasks = run_async_in_server_loop(
-                self._get_all_completed_tasks(multi_job_id),
-                timeout=5.0
+            consecutive_no_tile = 0
+            processed_count += self._master_process_one_tile(
+                tile_id,
+                all_tiles,
+                upscaled_image,
+                result_images,
+                tile_masks,
+                multi_job_id,
+                batch_size,
+                num_tiles_per_image,
+                tile_width,
+                tile_height,
+                padding,
+                force_uniform_tiles,
+                model,
+                positive,
+                negative,
+                vae,
+                seed,
+                steps,
+                cfg,
+                sampler_name,
+                scheduler,
+                denoise,
+                tiled_decode,
+                width,
+                height,
             )
-        
-        # Blend worker tiles synchronously in deterministic tile order.
+            log(f"USDU Dist: Tiles progress {processed_count}/{total_tiles} (tile {tile_id})")
+        return processed_count
+
+    def _collect_remaining_static_tiles(
+        self,
+        multi_job_id,
+        total_tiles,
+        master_processed_count,
+        all_tiles,
+        upscaled_image,
+        result_images,
+        tile_masks,
+        batch_size,
+        num_tiles_per_image,
+        tile_width,
+        tile_height,
+        padding,
+        force_uniform_tiles,
+        model,
+        positive,
+        negative,
+        vae,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        denoise,
+        tiled_decode,
+        width,
+        height,
+    ):
+        remaining_tiles = total_tiles - master_processed_count
+        if remaining_tiles <= 0:
+            return run_async_in_server_loop(self._get_all_completed_tasks(multi_job_id), timeout=5.0)
+
+        debug_log(f"Master waiting for {remaining_tiles} tiles from workers")
+        collected_tasks = run_async_in_server_loop(
+            self._async_collect_and_monitor_static(multi_job_id, total_tiles, expected_total=total_tiles),
+            timeout=None,
+        )
+
+        completed_count = len(collected_tasks)
+        if completed_count >= total_tiles:
+            return collected_tasks
+
+        log(f"Processing remaining {total_tiles - completed_count} tasks locally after worker failures")
+        while True:
+            comfy.model_management.throw_exception_if_processing_interrupted()
+            tile_id = run_async_in_server_loop(self._get_next_tile_index(multi_job_id), timeout=5.0)
+            if tile_id is None:
+                break
+            self._master_process_one_tile(
+                tile_id,
+                all_tiles,
+                upscaled_image,
+                result_images,
+                tile_masks,
+                multi_job_id,
+                batch_size,
+                num_tiles_per_image,
+                tile_width,
+                tile_height,
+                padding,
+                force_uniform_tiles,
+                model,
+                positive,
+                negative,
+                vae,
+                seed,
+                steps,
+                cfg,
+                sampler_name,
+                scheduler,
+                denoise,
+                tiled_decode,
+                width,
+                height,
+            )
+        return collected_tasks
+
+    def _blend_static_collected_tiles(
+        self,
+        collected_tasks,
+        result_images,
+        all_tiles,
+        tile_masks,
+        num_tiles_per_image,
+        batch_size,
+        tile_width,
+        tile_height,
+        padding,
+    ):
         def _sort_key(item):
             global_idx, tile_data = item
             batch_idx = tile_data.get('batch_idx', global_idx // num_tiles_per_image)
@@ -526,45 +596,130 @@ class StaticModeMixin:
             return (tile_idx, batch_idx, global_idx)
 
         for global_idx, tile_data in sorted(collected_tasks.items(), key=_sort_key):
-            # Skip tiles that don't have tensor data (already processed)
             if 'tensor' not in tile_data and 'image' not in tile_data:
                 continue
-            
             batch_idx = tile_data.get('batch_idx', global_idx // num_tiles_per_image)
             tile_idx = tile_data.get('tile_idx', global_idx % num_tiles_per_image)
-            
             if batch_idx >= batch_size:
                 continue
-            
-            # Blend tile synchronously
+
             x = tile_data.get('x', 0)
             y = tile_data.get('y', 0)
-            # Prefer PIL image if present to avoid reconversion
-            if 'image' in tile_data:
-                tile_pil = tile_data['image']
-            else:
-                tile_tensor = tile_data['tensor']
-                tile_pil = tensor_to_pil(tile_tensor, 0)
-            orig_x, orig_y = all_tiles[tile_idx]
+            tile_pil = tile_data['image'] if 'image' in tile_data else tensor_to_pil(tile_data['tensor'], 0)
             tile_mask = tile_masks[tile_idx]
             extracted_width = tile_data.get('extracted_width', tile_width + 2 * padding)
             extracted_height = tile_data.get('extracted_height', tile_height + 2 * padding)
-            result_images[batch_idx] = self.blend_tile(result_images[batch_idx], tile_pil,
-                                                      x, y, (extracted_width, extracted_height), tile_mask, padding)
-        
+            result_images[batch_idx] = self.blend_tile(
+                result_images[batch_idx],
+                tile_pil,
+                x,
+                y,
+                (extracted_width, extracted_height),
+                tile_mask,
+                padding,
+            )
+
+    def _result_images_to_tensor(self, result_images, batch_size, upscaled_image):
+        if batch_size == 1:
+            result_tensor = pil_to_tensor(result_images[0])
+        else:
+            result_tensor = torch.cat([pil_to_tensor(img) for img in result_images], dim=0)
+        if upscaled_image.is_cuda:
+            result_tensor = result_tensor.cuda()
+        return result_tensor
+
+    def _process_master_static_sync(self, upscaled_image, model, positive, negative, vae,
+                                    seed, steps, cfg, sampler_name, scheduler, denoise,
+                                    tile_width, tile_height, padding, mask_blur,
+                                    force_uniform_tiles, tiled_decode, multi_job_id, enabled_workers,
+                                    all_tiles, num_tiles_per_image):
+        """Static mode master processing with optional dynamic queue pulling."""
+        batch_size = upscaled_image.shape[0]
+        total_tiles = batch_size * num_tiles_per_image
+        result_images, tile_masks, width, height = self._init_master_static_state(
+            upscaled_image=upscaled_image,
+            multi_job_id=multi_job_id,
+            batch_size=batch_size,
+            num_tiles_per_image=num_tiles_per_image,
+            enabled_workers=enabled_workers,
+            all_tiles=all_tiles,
+            tile_width=tile_width,
+            tile_height=tile_height,
+            mask_blur=mask_blur,
+        )
+
         try:
-            # Convert back to tensor
-            if batch_size == 1:
-                result_tensor = pil_to_tensor(result_images[0])
-            else:
-                result_tensors = [pil_to_tensor(img) for img in result_images]
-                result_tensor = torch.cat(result_tensors, dim=0)
-            
-            if upscaled_image.is_cuda:
-                result_tensor = result_tensor.cuda()
-            
+            master_processed_count = self._process_master_static_initial_tiles(
+                multi_job_id=multi_job_id,
+                total_tiles=total_tiles,
+                all_tiles=all_tiles,
+                upscaled_image=upscaled_image,
+                result_images=result_images,
+                tile_masks=tile_masks,
+                batch_size=batch_size,
+                num_tiles_per_image=num_tiles_per_image,
+                tile_width=tile_width,
+                tile_height=tile_height,
+                padding=padding,
+                force_uniform_tiles=force_uniform_tiles,
+                model=model,
+                positive=positive,
+                negative=negative,
+                vae=vae,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                denoise=denoise,
+                tiled_decode=tiled_decode,
+                width=width,
+                height=height,
+            )
+
+            collected_tasks = self._collect_remaining_static_tiles(
+                multi_job_id=multi_job_id,
+                total_tiles=total_tiles,
+                master_processed_count=master_processed_count,
+                all_tiles=all_tiles,
+                upscaled_image=upscaled_image,
+                result_images=result_images,
+                tile_masks=tile_masks,
+                batch_size=batch_size,
+                num_tiles_per_image=num_tiles_per_image,
+                tile_width=tile_width,
+                tile_height=tile_height,
+                padding=padding,
+                force_uniform_tiles=force_uniform_tiles,
+                model=model,
+                positive=positive,
+                negative=negative,
+                vae=vae,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                denoise=denoise,
+                tiled_decode=tiled_decode,
+                width=width,
+                height=height,
+            )
+
+            self._blend_static_collected_tiles(
+                collected_tasks=collected_tasks,
+                result_images=result_images,
+                all_tiles=all_tiles,
+                tile_masks=tile_masks,
+                num_tiles_per_image=num_tiles_per_image,
+                batch_size=batch_size,
+                tile_width=tile_width,
+                tile_height=tile_height,
+                padding=padding,
+            )
+
+            result_tensor = self._result_images_to_tensor(result_images, batch_size, upscaled_image)
             log(f"UltimateSDUpscale Master - Job {multi_job_id} complete")
             return (result_tensor,)
         finally:
-            # Cleanup (async operation) - always execute
-            run_async_in_server_loop(_cleanup_job(multi_job_id), timeout=5.0)
+            run_async_in_server_loop(cleanup_job(multi_job_id), timeout=5.0)

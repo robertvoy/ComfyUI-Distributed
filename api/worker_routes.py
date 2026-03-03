@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 import json
 import asyncio
 import os
 import time
 import platform
-import subprocess
+import subprocess  # nosec B404 - commands are fixed and never shell-expanded
 import socket
+from typing import Any
 
 import torch
 import aiohttp
@@ -41,7 +44,7 @@ except ImportError:
 
 
 @server.PromptServer.instance.routes.get("/distributed/worker_ws")
-async def worker_ws_endpoint(request):
+async def worker_ws_endpoint(request: web.Request) -> web.WebSocketResponse:
     """WebSocket endpoint for worker prompt dispatch."""
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
@@ -113,7 +116,7 @@ async def worker_ws_endpoint(request):
 
 
 @server.PromptServer.instance.routes.post("/distributed/worker/clear_launching")
-async def clear_launching_state(request):
+async def clear_launching_state(request: web.Request) -> web.StreamResponse:
     """Clear the launching flag when worker is confirmed running."""
     try:
         wm = get_worker_manager()
@@ -139,8 +142,9 @@ async def clear_launching_state(request):
         return await handle_api_error(request, e, 500)
 
 
-def get_network_ips():
+def get_network_ips() -> list[str]:
     """Get all network IPs, trying multiple methods."""
+    command_timeout = 5.0
     ips = []
     hostname = socket.gethostname()
 
@@ -151,8 +155,8 @@ def get_network_ips():
             ip = info[4][0]
             if ip and ip not in ips and not ip.startswith('::'):  # Skip IPv6 for now
                 ips.append(ip)
-    except (socket.gaierror, OSError):
-        pass
+    except (socket.gaierror, OSError) as exc:
+        debug_log(f"get_network_ips: getaddrinfo failed for hostname {hostname}: {exc}")
 
     # Method 2: Try to connect to external server and get local IP
     try:
@@ -162,14 +166,19 @@ def get_network_ips():
         s.close()
         if local_ip not in ips:
             ips.append(local_ip)
-    except (OSError, socket.error):
-        pass
+    except (OSError, socket.error) as exc:
+        debug_log(f"get_network_ips: UDP local IP probe failed: {exc}")
 
     # Method 3: Platform-specific commands
     try:
         if platform.system() == "Windows":
             # Windows ipconfig
-            result = subprocess.run(["ipconfig"], capture_output=True, text=True)
+            result = subprocess.run(  # nosec B603 - static command, no user input
+                ["ipconfig"],
+                capture_output=True,
+                text=True,
+                timeout=command_timeout,
+            )
             lines = result.stdout.split('\n')
             for i, line in enumerate(lines):
                 if 'IPv4' in line and i + 1 < len(lines):
@@ -179,10 +188,20 @@ def get_network_ips():
         else:
             # Unix/Linux/Mac ifconfig or ip addr
             try:
-                result = subprocess.run(["ip", "addr"], capture_output=True, text=True)
+                result = subprocess.run(  # nosec B603 - static command, no user input
+                    ["ip", "addr"],
+                    capture_output=True,
+                    text=True,
+                    timeout=command_timeout,
+                )
             except (FileNotFoundError, OSError):
                 try:
-                    result = subprocess.run(["ifconfig"], capture_output=True, text=True)
+                    result = subprocess.run(  # nosec B603 - static command, no user input
+                        ["ifconfig"],
+                        capture_output=True,
+                        text=True,
+                        timeout=command_timeout,
+                    )
                 except (FileNotFoundError, OSError):
                     result = None
 
@@ -193,13 +212,13 @@ def get_network_ips():
                     ip = match.group(1)
                     if ip and ip not in ips:
                         ips.append(ip)
-    except (OSError, subprocess.SubprocessError):
-        pass
+    except (OSError, subprocess.SubprocessError) as exc:
+        debug_log(f"get_network_ips: platform command probe failed: {exc}")
 
     return ips
 
 
-def get_recommended_ip(ips):
+def get_recommended_ip(ips: list[str]) -> str | None:
     """Choose the best IP for master-worker communication."""
     # Priority order:
     # 1. Private network ranges (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
@@ -234,7 +253,7 @@ def get_recommended_ip(ips):
         return None
 
 
-def _get_cuda_info():
+def _get_cuda_info() -> tuple[int | None, int, int]:
     """Detect CUDA device index and total physical GPU count.
 
     Returns (cuda_device, cuda_device_count, physical_device_count).
@@ -250,7 +269,7 @@ def _get_cuda_info():
             if visible_devices:
                 cuda_device = visible_devices[0]
                 try:
-                    result = subprocess.run(
+                    result = subprocess.run(  # nosec B603 - static command, no user input
                         ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
                         capture_output=True,
                         text=True,
@@ -274,7 +293,7 @@ def _get_cuda_info():
         return None, 0, 0
 
 
-def _collect_network_info_sync():
+def _collect_network_info_sync() -> dict[str, Any]:
     """Collect network/cuda info in a worker thread to avoid blocking route handlers."""
     cuda_device, cuda_device_count, physical_device_count = _get_cuda_info()
     hostname = socket.gethostname()
@@ -289,7 +308,7 @@ def _collect_network_info_sync():
     }
 
 
-def _read_worker_log_sync(log_file, lines_to_read):
+def _read_worker_log_sync(log_file: str, lines_to_read: int) -> dict[str, Any]:
     """Read worker log content from disk in a threadpool worker."""
     file_size = os.path.getsize(log_file)
 
@@ -325,7 +344,12 @@ def _read_worker_log_sync(log_file, lines_to_read):
     }
 
 
-def _parse_positive_int_query(value, default, minimum=1, maximum=10000):
+def _parse_positive_int_query(
+    value: Any,
+    default: int,
+    minimum: int = 1,
+    maximum: int | None = 10000,
+) -> int:
     """Parse bounded positive integer query params with sane fallback."""
     try:
         parsed = int(value)
@@ -337,7 +361,7 @@ def _parse_positive_int_query(value, default, minimum=1, maximum=10000):
     return parsed
 
 
-def _find_worker_by_id(config, worker_id):
+def _find_worker_by_id(config: dict[str, Any], worker_id: str) -> dict[str, Any] | None:
     worker_id_str = str(worker_id).strip()
     for worker in config.get("workers", []):
         if str(worker.get("id")).strip() == worker_id_str:
@@ -346,7 +370,7 @@ def _find_worker_by_id(config, worker_id):
 
 
 @server.PromptServer.instance.routes.get("/distributed/local_log")
-async def get_local_log_endpoint(request):
+async def get_local_log_endpoint(request: web.Request) -> web.StreamResponse:
     """Return this instance's in-memory ComfyUI log buffer."""
     try:
         from app.logger import get_logs
@@ -391,7 +415,7 @@ async def get_local_log_endpoint(request):
 
 
 @server.PromptServer.instance.routes.get("/distributed/network_info")
-async def get_network_info_endpoint(request):
+async def get_network_info_endpoint(request: web.Request) -> web.StreamResponse:
     """Get network interfaces and recommend best IP for master."""
     try:
         loop = asyncio.get_running_loop()
@@ -406,7 +430,7 @@ async def get_network_info_endpoint(request):
         return await handle_api_error(request, e, 500)
 
 @server.PromptServer.instance.routes.get("/distributed/system_info")
-async def get_system_info_endpoint(request):
+async def get_system_info_endpoint(request: web.Request) -> web.StreamResponse:
     """Get system information including machine ID for local worker detection."""
     try:
         import socket
@@ -430,7 +454,7 @@ async def get_system_info_endpoint(request):
         return await handle_api_error(request, e, 500)
 
 @server.PromptServer.instance.routes.post("/distributed/launch_worker")
-async def launch_worker_endpoint(request):
+async def launch_worker_endpoint(request: web.Request) -> web.StreamResponse:
     """Launch a worker process from the UI."""
     try:
         wm = get_worker_manager()
@@ -491,7 +515,7 @@ async def launch_worker_endpoint(request):
 
 
 @server.PromptServer.instance.routes.post("/distributed/stop_worker")
-async def stop_worker_endpoint(request):
+async def stop_worker_endpoint(request: web.Request) -> web.StreamResponse:
     """Stop a worker process that was launched from the UI."""
     try:
         wm = get_worker_manager()
@@ -521,7 +545,7 @@ async def stop_worker_endpoint(request):
 
 
 @server.PromptServer.instance.routes.get("/distributed/managed_workers")
-async def get_managed_workers_endpoint(request):
+async def get_managed_workers_endpoint(request: web.Request) -> web.StreamResponse:
     """Get list of workers managed by this UI instance."""
     try:
         managed = get_worker_manager().get_managed_workers()
@@ -534,7 +558,7 @@ async def get_managed_workers_endpoint(request):
 
 
 @server.PromptServer.instance.routes.get("/distributed/local-worker-status")
-async def get_local_worker_status_endpoint(request):
+async def get_local_worker_status_endpoint(request: web.Request) -> web.StreamResponse:
     """Check status of all local workers (localhost/no host specified)."""
     try:
         config = load_config()
@@ -604,7 +628,7 @@ async def get_local_worker_status_endpoint(request):
 
 
 @server.PromptServer.instance.routes.get("/distributed/worker_log/{worker_id}")
-async def get_worker_log_endpoint(request):
+async def get_worker_log_endpoint(request: web.Request) -> web.StreamResponse:
     """Get log content for a specific worker."""
     try:
         wm = get_worker_manager()
@@ -647,7 +671,7 @@ async def get_worker_log_endpoint(request):
 
 
 @server.PromptServer.instance.routes.get("/distributed/remote_worker_log/{worker_id}")
-async def get_remote_worker_log_endpoint(request):
+async def get_remote_worker_log_endpoint(request: web.Request) -> web.StreamResponse:
     """Proxy a remote worker log request to the worker's local in-memory log endpoint."""
     try:
         worker_id = str(request.match_info["worker_id"]).strip()

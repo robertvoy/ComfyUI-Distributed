@@ -2,6 +2,7 @@ import glob
 import os
 import shlex
 import shutil
+from typing import Any
 
 from ...utils.logging import debug_log
 from ...utils.process import get_python_executable
@@ -10,7 +11,7 @@ from ...utils.process import get_python_executable
 class LaunchCommandBuilder:
     """Build command-lines for launching worker ComfyUI processes."""
 
-    def _find_windows_terminal(self):
+    def _find_windows_terminal(self) -> str | None:
         """Find Windows Terminal executable."""
         possible_paths = [
             os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe"),
@@ -31,7 +32,7 @@ class LaunchCommandBuilder:
             return wt_path
         return None
 
-    def build_launch_command(self, worker_config, comfy_root):
+    def build_launch_command(self, worker_config: dict[str, Any], comfy_root: str) -> list[str]:
         """Build the command to launch a worker."""
         main_py = os.path.join(comfy_root, "main.py")
 

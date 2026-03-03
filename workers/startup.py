@@ -3,7 +3,6 @@ import threading
 import time
 import atexit
 import signal
-import sys
 import platform
 
 import server
@@ -16,7 +15,7 @@ from ..utils.constants import WORKER_STARTUP_DELAY
 from . import get_worker_manager
 
 
-def auto_launch_workers():
+def auto_launch_workers() -> None:
     """Launch enabled workers if auto_launch_workers is set to true."""
     wm = get_worker_manager()
     try:
@@ -76,7 +75,7 @@ def auto_launch_workers():
         log(f"Error during auto-launch: {e}")
 
 # Schedule auto-launch after a short delay to ensure server is ready
-def delayed_auto_launch():
+def delayed_auto_launch() -> None:
     """Delay auto-launch to ensure server is fully initialized."""
     import threading
     timer = threading.Timer(WORKER_STARTUP_DELAY, auto_launch_workers)
@@ -84,9 +83,11 @@ def delayed_auto_launch():
     timer.start()
 
 # Async cleanup function for proper shutdown
-async def async_cleanup_and_exit(signum=None):
+async def async_cleanup_and_exit(signum: int | None = None) -> None:
     """Async-friendly cleanup and exit."""
+    _ = signum
     wm = get_worker_manager()
+    cleanup_error = None
     try:
         config = load_config()
         if config.get('settings', {}).get('stop_workers_on_master_exit', True):
@@ -101,28 +102,27 @@ async def async_cleanup_and_exit(signum=None):
             log(f"[Distributed] Warning: Cloudflare tunnel did not stop cleanly during shutdown: {tunnel_error}")
     except Exception as e:
         print(f"[Distributed] Error during cleanup: {e}")
+        cleanup_error = e
     
-    # On Windows, we need to exit differently
-    if platform.system() == "Windows":
-        # Force exit on Windows
-        sys.exit(0)
-    else:
-        # On Unix, stop the event loop gracefully
-        loop = asyncio.get_running_loop()
-        loop.stop()
+    # Stop the event loop gracefully on all platforms.
+    loop = asyncio.get_running_loop()
+    loop.stop()
+    if cleanup_error is not None:
+        raise cleanup_error
 
-def register_async_signals():
+def register_async_signals() -> None:
     """Register async signal handlers for graceful shutdown."""
     wm = get_worker_manager()
     if platform.system() == "Windows":
         # Windows doesn't support add_signal_handler, use traditional signal handling
-        def signal_handler(signum, frame):
+        def signal_handler(signum: int, _frame: object) -> None:
             # Schedule the async cleanup in the event loop
             loop = server.PromptServer.instance.loop
             if loop and loop.is_running():
                 asyncio.run_coroutine_threadsafe(async_cleanup_and_exit(signum), loop)
             else:
                 # Fallback to sync cleanup if loop isn't running
+                cleanup_error = None
                 try:
                     config = load_config()
                     if config.get('settings', {}).get('stop_workers_on_master_exit', True):
@@ -133,7 +133,10 @@ def register_async_signals():
                         wm.save_processes()
                 except Exception as e:
                     print(f"[Distributed] Error during cleanup: {e}")
-                sys.exit(0)
+                    cleanup_error = e
+                if cleanup_error is not None:
+                    raise RuntimeError("Cleanup failed during Windows fallback signal handling") from cleanup_error
+                raise SystemExit(0)
         
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
@@ -147,7 +150,7 @@ def register_async_signals():
         # SIGHUP is Unix-only
         loop.add_signal_handler(signal.SIGHUP, lambda: asyncio.create_task(async_cleanup_and_exit(signal.SIGHUP)))
 
-def sync_cleanup():
+def sync_cleanup() -> None:
     """Synchronous wrapper for atexit."""
     wm = get_worker_manager()
     try:
@@ -172,3 +175,4 @@ def sync_cleanup():
             log(f"[Distributed] Warning: Cloudflare tunnel did not stop cleanly during sync cleanup: {tunnel_error}")
     except Exception as e:
         print(f"[Distributed] Error during cleanup: {e}")
+        raise

@@ -1,6 +1,7 @@
 import base64
 import binascii
 import os
+from typing import Any
 
 import numpy as np
 import torch
@@ -13,7 +14,7 @@ MAX_AUDIO_PAYLOAD_BYTES = int(
 )
 
 
-def encode_audio_payload(audio_payload):
+def encode_audio_payload(audio_payload: dict[str, Any] | None) -> dict[str, Any] | None:
     """Serialize an AUDIO dict into JSON-safe canonical envelope payload."""
     if not isinstance(audio_payload, dict):
         return None
@@ -43,7 +44,7 @@ def encode_audio_payload(audio_payload):
     }
 
 
-def decode_audio_payload(audio_payload):
+def decode_audio_payload(audio_payload: dict[str, Any] | None) -> dict[str, Any] | None:
     """Decode canonical envelope audio payload into an AUDIO dict."""
     if audio_payload is None:
         return None

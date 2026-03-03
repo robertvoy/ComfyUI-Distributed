@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import io
 import time
@@ -8,13 +10,13 @@ import server
 
 from ..upscale.job_models import BaseJobState, ImageJobState, TileJobState
 from ..upscale.job_store import MAX_PAYLOAD_SIZE, ensure_tile_jobs_initialized, init_dynamic_job
-from ..upscale.payload_parsers import _parse_tiles_from_form
+from ..upscale.payload_parsers import parse_tiles_from_form
 from ..utils.logging import debug_log
 from ..utils.network import handle_api_error
 
 
 @server.PromptServer.instance.routes.post("/distributed/heartbeat")
-async def heartbeat_endpoint(request):
+async def heartbeat_endpoint(request: web.Request) -> web.StreamResponse:
     try:
         data = await request.json()
         worker_id = data.get('worker_id')
@@ -38,7 +40,7 @@ async def heartbeat_endpoint(request):
 
 
 @server.PromptServer.instance.routes.post("/distributed/submit_tiles")
-async def submit_tiles_endpoint(request):
+async def submit_tiles_endpoint(request: web.Request) -> web.StreamResponse:
     """Endpoint for workers to submit processed tiles in static mode."""
     try:
         content_length = request.headers.get('content-length')
@@ -73,7 +75,7 @@ async def submit_tiles_endpoint(request):
                     return web.json_response({"status": "success"})
 
         try:
-            tiles = _parse_tiles_from_form(data)
+            tiles = parse_tiles_from_form(data)
         except ValueError as e:
             return await handle_api_error(request, str(e), 400)
 
@@ -106,7 +108,7 @@ async def submit_tiles_endpoint(request):
 
 
 @server.PromptServer.instance.routes.post("/distributed/submit_image")
-async def submit_image_endpoint(request):
+async def submit_image_endpoint(request: web.Request) -> web.StreamResponse:
     """Endpoint for workers to submit processed images in dynamic mode."""
     try:
         content_length = request.headers.get('content-length')
@@ -166,7 +168,7 @@ async def submit_image_endpoint(request):
 
 
 @server.PromptServer.instance.routes.post("/distributed/request_image")
-async def request_image_endpoint(request):
+async def request_image_endpoint(request: web.Request) -> web.StreamResponse:
     """Endpoint for workers to request tasks (images in dynamic mode, tiles in static mode)."""
     try:
         data = await request.json()
@@ -216,7 +218,7 @@ async def request_image_endpoint(request):
 
 
 @server.PromptServer.instance.routes.post("/distributed/init_list_queue")
-async def init_list_queue_endpoint(request):
+async def init_list_queue_endpoint(request: web.Request) -> web.StreamResponse:
     """Initialize a shared queue of list indices for dynamic DistributedListSplitter mode."""
     try:
         data = await request.json()
@@ -255,7 +257,7 @@ async def init_list_queue_endpoint(request):
 
 
 @server.PromptServer.instance.routes.post("/distributed/request_list_item")
-async def request_list_item_endpoint(request):
+async def request_list_item_endpoint(request: web.Request) -> web.StreamResponse:
     """Allow workers to pull one list item index for dynamic list distribution."""
     try:
         data = await request.json()
@@ -290,7 +292,7 @@ async def request_list_item_endpoint(request):
 
 
 @server.PromptServer.instance.routes.get("/distributed/job_status")
-async def job_status_endpoint(request):
+async def job_status_endpoint(request: web.Request) -> web.StreamResponse:
     """Endpoint to check if a job is ready."""
     multi_job_id = request.query.get('multi_job_id')
     if not multi_job_id:

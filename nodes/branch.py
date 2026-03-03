@@ -1,9 +1,11 @@
+from typing import Any
+
 from .utilities import any_type
 
 
 class DistributedBranch:
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls: type["DistributedBranch"]) -> dict[str, Any]:
         return {
             "required": {
                 "input": (any_type,),
@@ -22,5 +24,10 @@ class DistributedBranch:
     FUNCTION = "branch"
     CATEGORY = "utils"
 
-    def branch(self, input, num_branches=2, is_worker=False, worker_id="", assigned_branch=-1, multi_job_id=""):
+    def branch(
+        self,
+        input: Any,
+        num_branches: int = 2,
+        **_kwargs: Any,
+    ) -> tuple[Any, ...]:
         return tuple([input] * 10)

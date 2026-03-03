@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 def _load_prompt_transform_module():
-    module_path = Path(__file__).resolve().parents[1] / "api" / "orchestration" / "prompt_transform.py"
+    module_path = Path(__file__).resolve().parents[3] / "api" / "orchestration" / "prompt_transform.py"
     package_name = "dist_pt_testpkg"
 
     for mod_name in list(sys.modules):

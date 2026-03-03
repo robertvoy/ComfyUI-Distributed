@@ -1,60 +1,80 @@
+from __future__ import annotations
+
 """
 Network and API utilities for ComfyUI-Distributed.
 """
 import asyncio
 import aiohttp
-import re
 import server
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any
 from aiohttp import web
+from urllib.parse import urlsplit
+from .exceptions import DistributedError
 from .logging import debug_log
 
-# Shared session for connection pooling
-_client_session = None
+@dataclass
+class _NetworkState:
+    client_session: aiohttp.ClientSession | None = None
 
-async def get_client_session():
+
+@lru_cache(maxsize=1)
+def _network_state() -> _NetworkState:
+    return _NetworkState()
+
+async def get_client_session() -> aiohttp.ClientSession:
     """Get or create a shared aiohttp client session."""
-    global _client_session
+    state = _network_state()
     try:
         asyncio.get_running_loop()
     except RuntimeError as exc:
         raise RuntimeError("get_client_session() requires an active asyncio event loop.") from exc
 
-    if _client_session is None or _client_session.closed:
+    if state.client_session is None or state.client_session.closed:
         connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
         # Don't set timeout here - set it per request
-        _client_session = aiohttp.ClientSession(connector=connector)
-    return _client_session
+        state.client_session = aiohttp.ClientSession(connector=connector)
+    return state.client_session
 
-async def cleanup_client_session():
+async def cleanup_client_session() -> None:
     """Clean up the shared client session."""
-    global _client_session
-    if _client_session and not _client_session.closed:
-        await _client_session.close()
-        _client_session = None
+    state = _network_state()
+    if state.client_session and not state.client_session.closed:
+        await state.client_session.close()
+        state.client_session = None
 
-async def handle_api_error(request, error, status=500):
+async def handle_api_error(request: web.Request, error: Any, status: int = 500) -> web.StreamResponse:
     """Standardized error response handler."""
+    _ = request
     if isinstance(error, list):
         messages = [str(item) for item in error]
         debug_log(f"API Error [{status}]: {messages}")
         return web.json_response({"errors": messages}, status=status)
 
+    if isinstance(error, DistributedError):
+        debug_log(f"API Error [{status}] ({error.__class__.__name__}): {error}")
+        return web.json_response(
+            {"error": str(error), "error_type": error.__class__.__name__},
+            status=status,
+        )
+
     message = str(error)
     debug_log(f"API Error [{status}]: {message}")
     return web.json_response({"error": message}, status=status)
 
-def get_server_port():
+def get_server_port() -> int:
     """Get the ComfyUI server port."""
     import server
     return server.PromptServer.instance.port
 
-def get_server_loop():
+def get_server_loop() -> asyncio.AbstractEventLoop:
     """Get the ComfyUI server event loop."""
     import server
     return server.PromptServer.instance.loop
 
 
-def normalize_host(value):
+def normalize_host(value: Any) -> Any:
     if value is None:
         return None
     if not isinstance(value, str):
@@ -62,11 +82,13 @@ def normalize_host(value):
     host = value.strip()
     if not host:
         return host
-    host = re.sub(r"^https?://", "", host, flags=re.IGNORECASE)
+    if "://" in host:
+        parsed = urlsplit(host)
+        host = parsed.netloc or parsed.path
     return host.split("/")[0]
 
 
-def build_worker_url(worker, endpoint=""):
+def build_worker_url(worker: dict[str, Any], endpoint: str = "") -> str:
     """Construct the worker base URL with optional endpoint."""
     host = (worker.get("host") or "").strip()
     port = int(worker.get("port", worker.get("listen_port", 8188)) or 8188)
@@ -86,7 +108,7 @@ def build_worker_url(worker, endpoint=""):
     return f"{base}{endpoint}"
 
 
-async def probe_worker(worker_url: str, timeout: float = 5.0) -> dict | None:
+async def probe_worker(worker_url: str, timeout: float = 5.0) -> dict[str, Any] | None:
     """GET {worker_url}/prompt. Returns parsed JSON or None on any failure."""
     base_url = (worker_url or "").strip().rstrip("/")
     if not base_url:
@@ -117,7 +139,10 @@ async def probe_worker(worker_url: str, timeout: float = 5.0) -> dict | None:
         return None
 
 
-def build_master_url(config=None, prompt_server_instance=None):
+def build_master_url(
+    config: dict[str, Any] | None = None,
+    prompt_server_instance: Any | None = None,
+) -> str:
     """Build the best public URL workers should use to reach the master."""
     if config is None:
         from .config import load_config
@@ -158,7 +183,7 @@ def build_master_url(config=None, prompt_server_instance=None):
         return f"{scheme}://{host}{port_part}"
 
     address = getattr(prompt_server_instance, "address", "127.0.0.1") or "127.0.0.1"
-    if address in ("0.0.0.0", "::"):
+    if address in ("0.0.0.0", "::"):  # nosec B104 - normalization of wildcard bind host
         address = "127.0.0.1"
     scheme = "https" if port == 443 else "http"
     default_port_for_scheme = 443 if scheme == "https" else 80

@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torchvision.transforms import GaussianBlur
 import math
+from typing import Any
 
 if (not hasattr(Image, 'Resampling')):  # For older versions of Pillow
     Image.Resampling = Image
@@ -11,13 +12,13 @@ if (not hasattr(Image, 'Resampling')):  # For older versions of Pillow
 BLUR_KERNEL_SIZE = 15
 
 
-def tensor_to_pil(img_tensor, batch_index=0):
+def tensor_to_pil(img_tensor: torch.Tensor, batch_index: int = 0) -> Image.Image:
     # Takes a batch of images in the form of a tensor of shape [batch_size, height, width, channels]
     # and returns an RGB PIL Image. Assumes channels=3
     return Image.fromarray((255 * img_tensor[batch_index].cpu().numpy()).astype(np.uint8))
 
 
-def pil_to_tensor(image):
+def pil_to_tensor(image: Image.Image) -> torch.Tensor:
     # Takes a PIL image and returns a tensor of shape [1, height, width, channels]
     image = np.array(image).astype(np.float32) / 255.0
     image = torch.from_numpy(image).unsqueeze(0)
@@ -26,27 +27,31 @@ def pil_to_tensor(image):
     return image
 
 
-def controlnet_hint_to_pil(tensor, batch_index=0):
+def controlnet_hint_to_pil(tensor: torch.Tensor, batch_index: int = 0) -> Image.Image:
     return tensor_to_pil(tensor.movedim(1, -1), batch_index)
 
 
-def pil_to_controlnet_hint(img):
+def pil_to_controlnet_hint(img: Image.Image) -> torch.Tensor:
     return pil_to_tensor(img).movedim(-1, 1)
 
 
-def crop_tensor(tensor, region):
+def crop_tensor(tensor: torch.Tensor, region: tuple[int, int, int, int]) -> torch.Tensor:
     # Takes a tensor of shape [batch_size, height, width, channels] and crops it to the given region
     x1, y1, x2, y2 = region
     return tensor[:, y1:y2, x1:x2, :]
 
 
-def resize_tensor(tensor, size, mode="nearest-exact"):
+def resize_tensor(
+    tensor: torch.Tensor,
+    size: tuple[int, int],
+    mode: str = "nearest-exact",
+) -> torch.Tensor:
     # Takes a tensor of shape [B, C, H, W] and resizes
     # it to a shape of [B, C, size[0], size[1]] using the given mode
     return torch.nn.functional.interpolate(tensor, size=size, mode=mode)
 
 
-def get_crop_region(mask, pad=0):
+def get_crop_region(mask: Image.Image, pad: int = 0) -> tuple[int, int, int, int]:
     # Takes a black and white PIL image in 'L' mode and returns the coordinates of the white rectangular mask region
     # Should be equivalent to the get_crop_region function from https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/master/modules/masking.py
     coordinates = mask.getbbox()
@@ -62,7 +67,10 @@ def get_crop_region(mask, pad=0):
     return fix_crop_region((x1, y1, x2, y2), (mask.width, mask.height))
 
 
-def fix_crop_region(region, image_size):
+def fix_crop_region(
+    region: tuple[int, int, int, int],
+    image_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
     # Remove the extra pixel added by the get_crop_region function
     image_width, image_height = image_size
     x1, y1, x2, y2 = region
@@ -73,7 +81,13 @@ def fix_crop_region(region, image_size):
     return x1, y1, x2, y2
 
 
-def expand_crop(region, width, height, target_width, target_height):
+def expand_crop(
+    region: tuple[int, int, int, int],
+    width: int,
+    height: int,
+    target_width: int,
+    target_height: int,
+) -> tuple[tuple[int, int, int, int], tuple[int, int]]:
     '''
     Expands a crop region to a specified target size.
     :param region: A tuple of the form (x1, y1, x2, y2) denoting the upper left and the lower right points
@@ -112,7 +126,11 @@ def expand_crop(region, width, height, target_width, target_height):
     return (x1, y1, x2, y2), (target_width, target_height)
 
 
-def resize_region(region, init_size, resize_size):
+def resize_region(
+    region: tuple[int, int, int, int],
+    init_size: tuple[int, int],
+    resize_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
     # Resize a crop so that it fits an image that was resized to the given width and height
     x1, y1, x2, y2 = region
     init_width, init_height = init_size
@@ -124,7 +142,15 @@ def resize_region(region, init_size, resize_size):
     return (x1, y1, x2, y2)
 
 
-def pad_image(image, left_pad, right_pad, top_pad, bottom_pad, fill=False, blur=False):
+def pad_image(
+    image: Image.Image,
+    left_pad: int,
+    right_pad: int,
+    top_pad: int,
+    bottom_pad: int,
+    fill: bool = False,
+    blur: bool = False,
+) -> Image.Image:
     '''
     Pads an image with the given number of pixels on each side and fills the padding with data from the edges.
     :param image: A PIL image
@@ -166,7 +192,15 @@ def pad_image(image, left_pad, right_pad, top_pad, bottom_pad, fill=False, blur=
     return padded_image
 
 
-def pad_image2(image, left_pad, right_pad, top_pad, bottom_pad, fill=False, blur=False):
+def pad_image2(
+    image: Image.Image,
+    left_pad: int,
+    right_pad: int,
+    top_pad: int,
+    bottom_pad: int,
+    fill: bool = False,
+    blur: bool = False,
+) -> Image.Image:
     '''
     Pads an image with the given number of pixels on each side and fills the padding with data from the edges. 
     Faster than pad_image, but only pads with edge data in straight lines.
@@ -203,7 +237,15 @@ def pad_image2(image, left_pad, right_pad, top_pad, bottom_pad, fill=False, blur
     return padded_image
 
 
-def pad_tensor(tensor, left_pad, right_pad, top_pad, bottom_pad, fill=False, blur=False):
+def pad_tensor(
+    tensor: torch.Tensor,
+    left_pad: int,
+    right_pad: int,
+    top_pad: int,
+    bottom_pad: int,
+    fill: bool = False,
+    blur: bool = False,
+) -> torch.Tensor:
     '''
     Pads an image tensor with the given number of pixels on each side and fills the padding with data from the edges.
     :param tensor: A tensor of shape [B, H, W, C]
@@ -239,7 +281,13 @@ def pad_tensor(tensor, left_pad, right_pad, top_pad, bottom_pad, fill=False, blu
     return padded
 
 
-def resize_and_pad_image(image, width, height, fill=False, blur=False):
+def resize_and_pad_image(
+    image: Image.Image,
+    width: int,
+    height: int,
+    fill: bool = False,
+    blur: bool = False,
+) -> tuple[Image.Image, tuple[int, int]]:
     '''
     Resizes an image to the given width and height and pads it to the given width and height.
     :param image: A PIL image
@@ -266,7 +314,13 @@ def resize_and_pad_image(image, width, height, fill=False, blur=False):
     return result, (horizontal_pad, vertical_pad)
 
 
-def resize_and_pad_tensor(tensor, width, height, fill=False, blur=False):
+def resize_and_pad_tensor(
+    tensor: torch.Tensor,
+    width: int,
+    height: int,
+    fill: bool = False,
+    blur: bool = False,
+) -> torch.Tensor:
     '''
     Resizes an image tensor to the given width and height and pads it to the given width and height.
     :param tensor: A tensor of shape [B, H, W, C]
@@ -294,7 +348,15 @@ def resize_and_pad_tensor(tensor, width, height, fill=False, blur=False):
     return result
 
 
-def crop_controlnet(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad):
+def crop_controlnet(
+    cond_dict: dict[str, Any],
+    region: tuple[int, int, int, int],
+    init_size: tuple[int, int],
+    canvas_size: tuple[int, int],
+    tile_size: tuple[int, int],
+    w_pad: int,
+    h_pad: int,
+) -> None:
     if "control" not in cond_dict:
         return
     c = cond_dict["control"]
@@ -312,7 +374,10 @@ def crop_controlnet(cond_dict, region, init_size, canvas_size, tile_size, w_pad,
         controlnet = controlnet.previous_controlnet
 
 
-def region_intersection(region1, region2):
+def region_intersection(
+    region1: tuple[int, int, int, int],
+    region2: tuple[int, int, int, int],
+) -> tuple[int, int, int, int] | None:
     """
     Returns the coordinates of the intersection of two rectangular regions.
     :param region1: A tuple of the form (x1, y1, x2, y2) denoting the upper left and the lower right points 
@@ -332,7 +397,15 @@ def region_intersection(region1, region2):
     return (x1, y1, x2, y2)
 
 
-def crop_gligen(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad):
+def crop_gligen(
+    cond_dict: dict[str, Any],
+    region: tuple[int, int, int, int],
+    init_size: tuple[int, int],
+    canvas_size: tuple[int, int],
+    tile_size: tuple[int, int],
+    w_pad: int,
+    h_pad: int,
+) -> None:
     if "gligen" not in cond_dict:
         return
     type, model, cond = cond_dict["gligen"]
@@ -378,7 +451,15 @@ def crop_gligen(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_p
     cond_dict["gligen"] = (type, model, cropped)
 
 
-def crop_area(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad):
+def crop_area(
+    cond_dict: dict[str, Any],
+    region: tuple[int, int, int, int],
+    init_size: tuple[int, int],
+    canvas_size: tuple[int, int],
+    tile_size: tuple[int, int],
+    w_pad: int,
+    h_pad: int,
+) -> None:
     if "area" not in cond_dict:
         return
 
@@ -412,7 +493,15 @@ def crop_area(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad
     cond_dict["area"] = (h, w, y, x)
 
 
-def crop_mask(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad):
+def crop_mask(
+    cond_dict: dict[str, Any],
+    region: tuple[int, int, int, int],
+    init_size: tuple[int, int],
+    canvas_size: tuple[int, int],
+    tile_size: tuple[int, int],
+    w_pad: int,
+    h_pad: int,
+) -> None:
     if "mask" not in cond_dict:
         return
     mask_tensor = cond_dict["mask"]  # (B, H, W)
@@ -442,7 +531,15 @@ def crop_mask(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad
     cond_dict["mask"] = torch.cat(masks, dim=0)  # (B, H, W)
 
 # Added Flux-Kontext Support crop_reference_latents by TBG ETUR
-def crop_reference_latents(cond_dict, region, init_size, canvas_size, tile_size, w_pad, h_pad):
+def crop_reference_latents(
+    cond_dict: dict[str, Any],
+    region: tuple[int, int, int, int],
+    init_size: tuple[int, int],
+    canvas_size: tuple[int, int],
+    tile_size: tuple[int, int],
+    w_pad: int,
+    h_pad: int,
+) -> None:
     """
     1. Resize each latent to `canvas_size` in latent units.
     2. Crop the rectangle `region` (pixel coordinates).
@@ -503,7 +600,15 @@ def crop_reference_latents(cond_dict, region, init_size, canvas_size, tile_size,
 
 
 
-def crop_cond(cond, region, init_size, canvas_size, tile_size, w_pad=0, h_pad=0):
+def crop_cond(
+    cond: list[list[Any]],
+    region: tuple[int, int, int, int],
+    init_size: tuple[int, int],
+    canvas_size: tuple[int, int],
+    tile_size: tuple[int, int],
+    w_pad: int = 0,
+    h_pad: int = 0,
+) -> list[list[Any]]:
     cropped = []
     for emb, x in cond:
         cond_dict = x.copy()

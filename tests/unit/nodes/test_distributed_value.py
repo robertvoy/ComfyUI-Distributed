@@ -13,7 +13,7 @@ class DistributedValueTests(unittest.TestCase):
         from pathlib import Path
         from unittest.mock import MagicMock
 
-        module_path = Path(__file__).resolve().parents[1] / "nodes" / "utilities.py"
+        module_path = Path(__file__).resolve().parents[3] / "nodes" / "utilities.py"
         pkg_name = "dv_test_pkg"
 
         for mod_name in list(sys.modules):

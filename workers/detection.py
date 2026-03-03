@@ -1,17 +1,18 @@
 import os
 import platform
 import uuid
+from typing import Any, Mapping
 
 import aiohttp
 
-from ..utils.network import normalize_host, get_client_session
+from ..utils.network import build_worker_url, get_client_session, normalize_host
 from ..utils.logging import debug_log
 
 
-async def is_local_worker(worker_config):
+async def is_local_worker(worker_config: Mapping[str, Any]) -> bool:
     """Check if a worker is running on the same machine as the master."""
     host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
-    if host in ['localhost', '127.0.0.1', '0.0.0.0', ''] or worker_config.get('type') == 'local':
+    if host in ['localhost', '127.0.0.1', '0.0.0.0', ''] or worker_config.get('type') == 'local':  # nosec B104 - intentional local/wildcard handling
         return True
     
     # For cloud workers, check if on same physical host
@@ -20,19 +21,18 @@ async def is_local_worker(worker_config):
     
     return False
 
-async def is_same_physical_host(worker_config):
+async def is_same_physical_host(worker_config: Mapping[str, Any]) -> bool:
     """Compare machine IDs to determine if worker is on same physical host."""
     try:
         # Get master machine ID
         master_machine_id = get_machine_id()
         
         # Fetch worker's machine ID via API
-        host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
-        port = worker_config.get('port', 8188)
-        
+        system_info_url = build_worker_url(dict(worker_config), "/distributed/system_info")
+
         session = await get_client_session()
         async with session.get(
-            f"http://{host}:{port}/distributed/system_info",
+            system_info_url,
             timeout=aiohttp.ClientTimeout(total=5)
         ) as resp:
             if resp.status == 200:
@@ -46,7 +46,7 @@ async def is_same_physical_host(worker_config):
         debug_log(f"Error checking same physical host: {e}")
         return False
 
-def get_machine_id():
+def get_machine_id() -> str:
     """Get a unique identifier for this machine."""
     # Try multiple methods to get a stable machine ID
     try:

@@ -62,7 +62,7 @@ class _DummyWorkerManager:
         worker_id = str(worker["id"])
         self.processes[worker_id] = {
             "pid": 12345,
-            "log_file": f"/tmp/distributed_worker_{worker_id}.log",
+            "log_file": f"/tmp/distributed_worker_{worker_id}.log",  # nosec B108 - deterministic fake test path
             "process": None,
         }
         return 12345

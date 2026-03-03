@@ -165,6 +165,7 @@ def _load_usdu_routes_module():
     sys.modules[f"{package_name}.upscale.job_models"] = job_models_module
 
     parsers_module = types.ModuleType(f"{package_name}.upscale.payload_parsers")
+    parsers_module.parse_tiles_from_form = lambda _data: []
     parsers_module._parse_tiles_from_form = lambda _data: []
     sys.modules[f"{package_name}.upscale.payload_parsers"] = parsers_module
 

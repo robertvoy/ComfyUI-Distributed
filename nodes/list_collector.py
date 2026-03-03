@@ -1,34 +1,33 @@
 import asyncio
-import base64
-import io
-import json
-import time
+from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 import torch
 
 from ..utils.async_helpers import run_async_in_server_loop
-from ..utils.config import get_worker_timeout_seconds, is_master_delegate_only
-from ..utils.constants import HEARTBEAT_INTERVAL
-from ..utils.image import ensure_contiguous, tensor_to_pil
+from ..utils.config import is_master_delegate_only
+from ..utils.image import encode_tensor_png_data_url, ensure_contiguous
 from ..utils.logging import debug_log, log
 from ..utils.network import get_client_session
+from ..utils.worker_ids import parse_enabled_worker_ids
+from .context_kwargs import parse_distributed_hidden_context
+from .hidden_inputs import build_distributed_hidden_inputs
+from .queue_wait import collect_worker_queue_results
+from .runtime_helpers import (
+    get_prompt_server_instance as _get_prompt_server_instance,
+    throw_if_processing_interrupted as _throw_if_processing_interrupted,
+)
 
 
-def _get_prompt_server_instance():
-    import server as _server
-
-    return _server.PromptServer.instance
-
-
-def _throw_if_processing_interrupted():
-    try:
-        import comfy.model_management as model_management
-
-        model_management.throw_exception_if_processing_interrupted()
-    except Exception:
-        # Tests and non-Comfy contexts may not have interruption support.
-        return
+@dataclass(frozen=True)
+class ListCollectorRunContext:
+    multi_job_id: str = ""
+    is_worker: bool = False
+    master_url: str = ""
+    enabled_worker_ids: str = "[]"
+    worker_id: str = ""
+    delegate_only: bool = False
 
 
 class DistributedListCollector:
@@ -36,19 +35,12 @@ class DistributedListCollector:
     OUTPUT_IS_LIST = (True,)
 
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls: type["DistributedListCollector"]) -> dict[str, Any]:
         return {
             "required": {
                 "images": ("IMAGE",),
             },
-            "hidden": {
-                "multi_job_id": ("STRING", {"default": ""}),
-                "is_worker": ("BOOLEAN", {"default": False}),
-                "master_url": ("STRING", {"default": ""}),
-                "enabled_worker_ids": ("STRING", {"default": "[]"}),
-                "worker_id": ("STRING", {"default": ""}),
-                "delegate_only": ("BOOLEAN", {"default": False}),
-            },
+            "hidden": build_distributed_hidden_inputs(),
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -56,40 +48,40 @@ class DistributedListCollector:
     FUNCTION = "run"
     CATEGORY = "image"
 
+    def _build_run_context(self, **kwargs: Any) -> ListCollectorRunContext:
+        return ListCollectorRunContext(**parse_distributed_hidden_context(kwargs))
+
     def run(
         self,
-        images,
-        multi_job_id="",
-        is_worker=False,
-        master_url="",
-        enabled_worker_ids="[]",
-        worker_id="",
-        delegate_only=False,
-    ):
+        images: list[Any] | torch.Tensor | None,
+        **kwargs: Any,
+    ) -> tuple[list[Any]]:
+        context = self._build_run_context(**kwargs)
         image_list = self._normalize_image_list(images)
-        if not multi_job_id:
+        if not context.multi_job_id:
             return (image_list,)
 
         return run_async_in_server_loop(
             self.execute(
                 image_list,
-                multi_job_id=multi_job_id,
-                is_worker=is_worker,
-                master_url=master_url,
-                enabled_worker_ids=enabled_worker_ids,
-                worker_id=worker_id,
-                delegate_only=delegate_only,
+                context=context,
             )
         )
 
-    def _normalize_image_list(self, images):
+    def _normalize_image_list(self, images: list[Any] | torch.Tensor | None) -> list[Any]:
         if images is None:
             return []
         if isinstance(images, list):
             return list(images)
         return [images]
 
-    async def send_list_to_master(self, image_list, multi_job_id, master_url, worker_id):
+    async def send_list_to_master(
+        self,
+        image_list: list[Any],
+        multi_job_id: str,
+        master_url: str,
+        worker_id: str,
+    ) -> None:
         if not image_list:
             return
 
@@ -111,15 +103,11 @@ class DistributedListCollector:
         url = f"{master_url}/distributed/job_complete"
 
         for send_pos, (image_index, image_batch) in enumerate(sendable):
-            img = tensor_to_pil(image_batch, 0)
-            byte_io = io.BytesIO()
-            img.save(byte_io, format="PNG", compress_level=0)
-            encoded_image = base64.b64encode(byte_io.getvalue()).decode("utf-8")
             payload = {
                 "job_id": str(multi_job_id),
                 "worker_id": str(worker_id),
                 "batch_idx": int(image_index),
-                "image": f"data:image/png;base64,{encoded_image}",
+                "image": encode_tensor_png_data_url(image_batch, 0),
                 "is_last": bool(send_pos == len(sendable) - 1),
             }
             try:
@@ -144,22 +132,6 @@ class DistributedListCollector:
         worker_images.setdefault(worker_id, {})
         worker_images[worker_id][int(image_index)] = tensor
         return 1
-
-    def _parse_enabled_workers(self, enabled_worker_ids):
-        try:
-            raw = json.loads(enabled_worker_ids)
-        except Exception:
-            raw = []
-
-        workers = []
-        seen = set()
-        for worker_id in raw if isinstance(raw, list) else []:
-            worker_id_str = str(worker_id)
-            if worker_id_str in seen:
-                continue
-            seen.add(worker_id_str)
-            workers.append(worker_id_str)
-        return workers
 
     def _reorder_and_combine_list(self, worker_images, worker_order, master_images, delegate_mode):
         ordered = []
@@ -192,25 +164,33 @@ class DistributedListCollector:
 
         return combined
 
-    async def execute(
+    async def execute(self, *args: Any, **kwargs: Any) -> tuple[list[Any]]:
+        """Compatibility wrapper with a uniform execute() signature across collectors."""
+        return await self._execute_list(*args, **kwargs)
+
+    async def _execute_list(
         self,
-        images,
-        multi_job_id="",
-        is_worker=False,
-        master_url="",
-        enabled_worker_ids="[]",
-        worker_id="",
-        delegate_only=False,
-    ):
+        images: list[Any] | torch.Tensor | None,
+        context: ListCollectorRunContext | None = None,
+    ) -> tuple[list[Any]]:
+        run_context = context or ListCollectorRunContext()
         image_list = self._normalize_image_list(images)
 
-        if is_worker:
-            debug_log(f"Worker - Job {multi_job_id} complete. Sending {len(image_list)} image list item(s) to master")
-            await self.send_list_to_master(image_list, multi_job_id, master_url, worker_id)
+        if run_context.is_worker:
+            debug_log(
+                "Worker - Job "
+                f"{run_context.multi_job_id} complete. Sending {len(image_list)} image list item(s) to master"
+            )
+            await self.send_list_to_master(
+                image_list,
+                run_context.multi_job_id,
+                run_context.master_url,
+                run_context.worker_id,
+            )
             return (image_list,)
 
-        delegate_mode = bool(delegate_only or is_master_delegate_only())
-        enabled_workers = self._parse_enabled_workers(enabled_worker_ids)
+        delegate_mode = bool(run_context.delegate_only or is_master_delegate_only())
+        enabled_workers = parse_enabled_worker_ids(run_context.enabled_worker_ids)
         expected_workers = set(enabled_workers)
         if not expected_workers:
             return (image_list,)
@@ -218,49 +198,41 @@ class DistributedListCollector:
         prompt_server = _get_prompt_server_instance()
 
         async with prompt_server.distributed_jobs_lock:
-            if multi_job_id not in prompt_server.distributed_pending_jobs:
-                prompt_server.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
-                debug_log(f"Master - Initialized queue early for list collector job {multi_job_id}")
+            if run_context.multi_job_id not in prompt_server.distributed_pending_jobs:
+                prompt_server.distributed_pending_jobs[run_context.multi_job_id] = asyncio.Queue()
+                debug_log(
+                    "Master - Initialized queue early for list collector job "
+                    f"{run_context.multi_job_id}"
+                )
 
         master_images = [] if delegate_mode else image_list
 
         worker_images = {}
-        workers_done = set()
-        base_timeout = float(get_worker_timeout_seconds())
-        slice_timeout = min(max(0.1, HEARTBEAT_INTERVAL / 20.0), base_timeout)
-        last_activity = time.time()
+        workers_done: set[str] = set()
+
+        def _handle_queue_result(result: dict[str, Any]) -> None:
+            self._store_worker_result(worker_images, result)
 
         try:
-            while len(workers_done) < len(expected_workers):
-                _throw_if_processing_interrupted()
-                try:
-                    async with prompt_server.distributed_jobs_lock:
-                        queue = prompt_server.distributed_pending_jobs[multi_job_id]
-                    result = await asyncio.wait_for(queue.get(), timeout=slice_timeout)
-                except asyncio.TimeoutError:
-                    if (time.time() - last_activity) < base_timeout:
-                        continue
-                    missing_workers = sorted(expected_workers - workers_done)
-                    log(
-                        "Master - List collector heartbeat timeout. "
-                        f"Still waiting for workers: {missing_workers}"
-                    )
-                    break
-
-                worker_id_value = str(result.get("worker_id", ""))
-                is_last = bool(result.get("is_last", False))
-                self._store_worker_result(worker_images, result)
-                last_activity = time.time()
-                base_timeout = float(get_worker_timeout_seconds())
-                if is_last and worker_id_value in expected_workers:
-                    workers_done.add(worker_id_value)
+            workers_done = await collect_worker_queue_results(
+                prompt_server=prompt_server,
+                multi_job_id=run_context.multi_job_id,
+                expected_workers=expected_workers,
+                on_result=_handle_queue_result,
+                timeout_log_prefix=(
+                    "Master - List collector heartbeat timeout. "
+                    "Still waiting for workers: "
+                ),
+                throw_if_interrupted=_throw_if_processing_interrupted,
+            )
 
         finally:
             async with prompt_server.distributed_jobs_lock:
-                prompt_server.distributed_pending_jobs.pop(multi_job_id, None)
+                prompt_server.distributed_pending_jobs.pop(run_context.multi_job_id, None)
 
         combined = self._reorder_and_combine_list(worker_images, enabled_workers, master_images, delegate_mode)
         debug_log(
-            f"Master - List collector job {multi_job_id} complete. Combined {len(combined)} image list item(s)."
+            "Master - List collector job "
+            f"{run_context.multi_job_id} complete. Combined {len(combined)} image list item(s)."
         )
         return (combined,)

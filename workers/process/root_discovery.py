@@ -6,7 +6,7 @@ from ...utils.logging import debug_log, log
 class ComfyRootDiscovery:
     """Resolve the ComfyUI root directory across local and container layouts."""
 
-    def find_comfy_root(self):
+    def find_comfy_root(self) -> str:
         # Start from current file location.
         current_dir = os.path.dirname(os.path.abspath(__file__))
         potential_root = os.path.dirname(os.path.dirname(current_dir))

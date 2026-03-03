@@ -8,7 +8,7 @@ import torch
 
 
 def _load_utilities_module():
-    module_path = Path(__file__).resolve().parents[1] / "nodes" / "utilities.py"
+    module_path = Path(__file__).resolve().parents[3] / "nodes" / "utilities.py"
     package_name = "dist_divider_testpkg"
 
     for mod_name in list(sys.modules):

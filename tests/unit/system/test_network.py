@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def _load_network_module():
-    module_path = Path(__file__).resolve().parents[1] / "utils" / "network.py"
+    module_path = Path(__file__).resolve().parents[3] / "utils" / "network.py"
 
     package_name = "dist_utils_testpkg"
     package_module = types.ModuleType(package_name)
@@ -16,6 +16,10 @@ def _load_network_module():
     logging_module = types.ModuleType(f"{package_name}.logging")
     logging_module.debug_log = lambda *_args, **_kwargs: None
     sys.modules[f"{package_name}.logging"] = logging_module
+
+    exceptions_module = types.ModuleType(f"{package_name}.exceptions")
+    exceptions_module.DistributedError = type("DistributedError", (Exception,), {})
+    sys.modules[f"{package_name}.exceptions"] = exceptions_module
 
     server_module = types.ModuleType("server")
     server_module.PromptServer = types.SimpleNamespace(
@@ -92,7 +96,7 @@ class NetworkHelpersTests(unittest.TestCase):
 
     def test_build_master_url_falls_back_to_server_address(self):
         cfg = {"master": {"host": ""}}
-        prompt_server = types.SimpleNamespace(address="0.0.0.0", port=8190)
+        prompt_server = types.SimpleNamespace(address="0.0.0.0", port=8190)  # nosec B104 - wildcard bind normalization test
         self.assertEqual(
             network.build_master_url(config=cfg, prompt_server_instance=prompt_server),
             "http://127.0.0.1:8190",

@@ -3,11 +3,17 @@ import platform
 import signal
 import subprocess
 import time
+from typing import Any
 
 from ...utils.config import load_config, save_config
 from ...utils.constants import PROCESS_TERMINATION_TIMEOUT, PROCESS_WAIT_TIMEOUT, WORKER_CHECK_INTERVAL
 from ...utils.logging import debug_log, log
-from ...utils.process import get_python_executable, is_process_alive, terminate_process
+from ...utils.process import (
+    get_python_executable,
+    is_process_alive,
+    launch_process_with_timeout,
+    terminate_process,
+)
 
 try:
     import psutil
@@ -24,7 +30,7 @@ class ProcessLifecycle:
     def __init__(self, manager):
         self._manager = manager
 
-    def launch_worker(self, worker_config, show_window=False):
+    def launch_worker(self, worker_config: dict[str, Any], show_window: bool = False) -> int:
         """Launch a worker process with logging."""
         _ = show_window  # Kept for API compatibility.
         comfy_root = self._manager.find_comfy_root()
@@ -74,25 +80,22 @@ class ProcessLifecycle:
             else:
                 monitored_cmd = cmd
 
+            popen_kwargs = {
+                "env": env,
+                "cwd": cwd,
+                "stdout": log_handle,
+                "stderr": subprocess.STDOUT,
+            }
             if platform.system() == "Windows":
-                create_no_window = 0x08000000
-                process = subprocess.Popen(
-                    monitored_cmd,
-                    env=env,
-                    cwd=cwd,
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    creationflags=create_no_window,
-                )
+                popen_kwargs["creationflags"] = 0x08000000
             else:
-                process = subprocess.Popen(
-                    monitored_cmd,
-                    env=env,
-                    cwd=cwd,
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
+                popen_kwargs["start_new_session"] = True
+
+            process = launch_process_with_timeout(
+                monitored_cmd,
+                timeout_seconds=PROCESS_WAIT_TIMEOUT,
+                **popen_kwargs,
+            )
 
         worker_id = str(worker_config["id"])
         self._manager.processes[worker_id] = {
@@ -114,7 +117,7 @@ class ProcessLifecycle:
         debug_log(f"Log file: {log_file}")
         return process.pid
 
-    def stop_worker(self, worker_id):
+    def stop_worker(self, worker_id: str | int) -> tuple[bool, str]:
         """Stop a worker process."""
         worker_id = str(worker_id)
         if worker_id not in self._manager.processes:
@@ -161,7 +164,7 @@ class ProcessLifecycle:
             log(f"[Distributed] Exception during stop: {exc}")
             return False, f"Error stopping worker: {str(exc)}"
 
-    def get_managed_workers(self):
+    def get_managed_workers(self) -> dict[str, dict[str, Any]]:
         """Get list of workers managed by this process."""
         managed = {}
         for worker_id, proc_info in list(self._manager.processes.items()):
@@ -178,7 +181,7 @@ class ProcessLifecycle:
 
         return managed
 
-    def cleanup_all(self):
+    def cleanup_all(self) -> None:
         """Stop all managed workers (called on shutdown)."""
         for worker_id in list(self._manager.processes.keys()):
             try:
@@ -190,11 +193,11 @@ class ProcessLifecycle:
         config["managed_processes"] = {}
         save_config(config)
 
-    def _is_process_running(self, pid):
+    def _is_process_running(self, pid: int) -> bool:
         """Check if a process with given PID is running."""
         return is_process_alive(pid)
 
-    def _check_worker_process(self, worker_id, proc_info):
+    def _check_worker_process(self, worker_id: str, proc_info: dict[str, Any]) -> tuple[bool, bool]:
         """Check if a worker process is still running and return status."""
         _ = worker_id  # Signature retained for compatibility with existing callers.
         process = proc_info.get("process")
@@ -222,7 +225,7 @@ class ProcessLifecycle:
                         debug_log(f"Terminating child {child.pid}")
                         child.terminate()
                     except psutil.NoSuchProcess:
-                        pass
+                        debug_log(f"Child process {child.pid} already exited before terminate")
 
                 _, alive = psutil.wait_procs(children, timeout=PROCESS_WAIT_TIMEOUT)
                 for child in alive:
@@ -230,7 +233,7 @@ class ProcessLifecycle:
                         debug_log(f"Force killing child {child.pid}")
                         child.kill()
                     except psutil.NoSuchProcess:
-                        pass
+                        debug_log(f"Child process {child.pid} already exited before kill")
 
                 try:
                     debug_log(f"Terminating parent {pid}")
@@ -255,6 +258,7 @@ class ProcessLifecycle:
                     ["wmic", "process", "where", f"ParentProcessId={pid}", "get", "ProcessId"],
                     capture_output=True,
                     text=True,
+                    timeout=PROCESS_WAIT_TIMEOUT,
                 )
                 if result.returncode == 0:
                     lines = result.stdout.strip().split("\n")[1:]
@@ -266,6 +270,7 @@ class ProcessLifecycle:
                                 ["taskkill", "/F", "/PID", child_pid],
                                 capture_output=True,
                                 check=False,
+                                timeout=PROCESS_WAIT_TIMEOUT,
                             )
                         except (FileNotFoundError, OSError) as exc:
                             debug_log(f"[Distributed] Warning: taskkill failed for PID {child_pid}: {exc}")
@@ -274,6 +279,7 @@ class ProcessLifecycle:
                     ["taskkill", "/F", "/PID", str(pid), "/T"],
                     capture_output=True,
                     text=True,
+                    timeout=PROCESS_WAIT_TIMEOUT,
                 )
                 debug_log(f"[Distributed] Taskkill result: {result.stdout.strip()}")
                 return result.returncode == 0
@@ -282,9 +288,17 @@ class ProcessLifecycle:
                 return False
 
         try:
-            subprocess.run(["pkill", "-TERM", "-P", str(pid)], check=False)
+            subprocess.run(
+                ["pkill", "-TERM", "-P", str(pid)],
+                check=False,
+                timeout=PROCESS_WAIT_TIMEOUT,
+            )
             time.sleep(WORKER_CHECK_INTERVAL)
-            subprocess.run(["pkill", "-KILL", "-P", str(pid)], check=False)
+            subprocess.run(
+                ["pkill", "-KILL", "-P", str(pid)],
+                check=False,
+                timeout=PROCESS_WAIT_TIMEOUT,
+            )
             os.kill(pid, signal.SIGKILL)
             return True
         except Exception as exc:

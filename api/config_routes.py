@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from contextlib import asynccontextmanager
 
@@ -26,7 +28,7 @@ from ..utils.logging import debug_log, log
 from ..utils.network import handle_api_error, normalize_host
 
 
-def _positive_int(value):
+def _positive_int(value: int) -> bool:
     return value > 0
 
 
@@ -87,13 +89,13 @@ def _apply_field_patch(target: dict, data: dict, field_rules: list) -> None:
 
 
 @server.PromptServer.instance.routes.get("/distributed/config")
-async def get_config_endpoint(request):
+async def get_config_endpoint(request: web.Request) -> web.StreamResponse:
     config = load_config()
     return web.json_response(config)
 
 
 @server.PromptServer.instance.routes.post("/distributed/config")
-async def update_config_endpoint(request):
+async def update_config_endpoint(request: web.Request) -> web.StreamResponse:
     """Bulk config update with schema validation."""
     try:
         data = await request.json()
@@ -145,7 +147,7 @@ async def update_config_endpoint(request):
 
 
 @server.PromptServer.instance.routes.get("/distributed/queue_status/{job_id}")
-async def queue_status_endpoint(request):
+async def queue_status_endpoint(request: web.Request) -> web.StreamResponse:
     """Check if a job queue is initialized."""
     try:
         job_id = request.match_info['job_id']
@@ -163,7 +165,7 @@ async def queue_status_endpoint(request):
         return await handle_api_error(request, e, 500)
 
 @server.PromptServer.instance.routes.post("/distributed/config/update_worker")
-async def update_worker_endpoint(request):
+async def update_worker_endpoint(request: web.Request) -> web.StreamResponse:
     try:
         data = await request.json()
         worker_id = data.get("worker_id")
@@ -207,7 +209,7 @@ async def update_worker_endpoint(request):
         return await handle_api_error(request, e, 400)
 
 @server.PromptServer.instance.routes.post("/distributed/config/delete_worker")
-async def delete_worker_endpoint(request):
+async def delete_worker_endpoint(request: web.Request) -> web.StreamResponse:
     try:
         data = await request.json()
         worker_id = data.get("worker_id")
@@ -239,7 +241,7 @@ async def delete_worker_endpoint(request):
         return await handle_api_error(request, e, 400)
 
 @server.PromptServer.instance.routes.post("/distributed/config/update_setting")
-async def update_setting_endpoint(request):
+async def update_setting_endpoint(request: web.Request) -> web.StreamResponse:
     """Updates a specific key in the settings object."""
     try:
         data = await request.json()
@@ -262,7 +264,7 @@ async def update_setting_endpoint(request):
         return await handle_api_error(request, e, 400)
 
 @server.PromptServer.instance.routes.post("/distributed/config/update_master")
-async def update_master_endpoint(request):
+async def update_master_endpoint(request: web.Request) -> web.StreamResponse:
     """Updates master configuration."""
     try:
         data = await request.json()

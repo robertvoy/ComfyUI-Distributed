@@ -1,10 +1,12 @@
 import io
 import json
+from collections.abc import Mapping
+from typing import Any
 
 from PIL import Image
 
 
-def _parse_tiles_from_form(data):
+def parse_tiles_from_form(data: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Parse tiles submitted via multipart/form-data into a list of tile dicts."""
     try:
         padding = int(data.get('padding', 0)) if data.get('padding') is not None else 0
@@ -51,14 +53,18 @@ def _parse_tiles_from_form(data):
         if 'batch_idx' in meta:
             try:
                 tile_info['batch_idx'] = int(meta['batch_idx'])
-            except Exception:
-                pass
+            except Exception as exc:
+                raise ValueError(f"Invalid batch_idx for tile {i}: {meta.get('batch_idx')} ({exc})")
         if 'global_idx' in meta:
             try:
                 tile_info['global_idx'] = int(meta['global_idx'])
-            except Exception:
-                pass
+            except Exception as exc:
+                raise ValueError(f"Invalid global_idx for tile {i}: {meta.get('global_idx')} ({exc})")
 
         tiles.append(tile_info)
 
     return tiles
+
+
+# Backward compatibility for existing imports.
+_parse_tiles_from_form = parse_tiles_from_form

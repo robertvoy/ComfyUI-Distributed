@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 
 def _load_dispatch_module():
-    module_path = Path(__file__).resolve().parents[1] / "api" / "orchestration" / "dispatch.py"
+    module_path = Path(__file__).resolve().parents[3] / "api" / "orchestration" / "dispatch.py"
 
     package_name = "dist_dispatch_testpkg"
     root_pkg = types.ModuleType(package_name)

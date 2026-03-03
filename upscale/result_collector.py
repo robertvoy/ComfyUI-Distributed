@@ -4,8 +4,8 @@ import server
 from ..utils.constants import DYNAMIC_MODE_MAX_POLL_TIMEOUT, HEARTBEAT_INTERVAL
 from ..utils.logging import debug_log, log
 from ..utils.config import get_worker_timeout_seconds
-from .job_store import ensure_tile_jobs_initialized, _mark_task_completed
-from .job_timeout import _check_and_requeue_timed_out_workers
+from .job_store import ensure_tile_jobs_initialized, mark_task_completed
+from .job_timeout import check_and_requeue_timed_out_workers
 from .job_models import BaseJobState, ImageJobState, TileJobState
 
 
@@ -32,6 +32,10 @@ class ResultCollectorMixin:
                 f"job={multi_job_id}, worker={worker_id}, elapsed={elapsed:.1f}s"
             )
         return list(worker_status.keys())
+
+    async def _check_and_requeue_timed_out_workers(self, multi_job_id, batch_size):
+        """Default timeout requeue hook; override in host mixins when needed."""
+        return await check_and_requeue_timed_out_workers(multi_job_id, batch_size)
 
     async def _async_collect_results(self, multi_job_id, num_workers, mode='static', 
                                    remaining_to_collect=None, batch_size=None):
@@ -110,21 +114,13 @@ class ResultCollectorMixin:
                         tile_idx = tile_data['tile_idx']
                         key = tile_data.get('global_idx', tile_idx)
                         entry = {
+                            **tile_data,
                             'tile_idx': tile_idx,
-                            'x': tile_data['x'],
-                            'y': tile_data['y'],
-                            'extracted_width': tile_data['extracted_width'],
-                            'extracted_height': tile_data['extracted_height'],
-                            'padding': tile_data['padding'],
                             'worker_id': worker_id,
-                            'batch_idx': tile_data.get('batch_idx', 0),
-                            'global_idx': tile_data.get('global_idx', tile_idx),
+                            'global_idx': key,
                         }
-                        if 'image' in tile_data:
-                            entry['image'] = tile_data['image']
-                        elif 'tensor' in tile_data:
-                            entry['tensor'] = tile_data['tensor']
-                        collected_results[key] = entry
+                        _ = entry['tile_idx'], entry['worker_id'], entry['global_idx']
+                        collected_results[entry['global_idx']] = entry
                 
                 elif mode == 'dynamic':
                     # Handle full images
@@ -142,12 +138,21 @@ class ResultCollectorMixin:
                     
             except asyncio.TimeoutError:
                 current_time = time.time()
-                waiting_workers = self._log_worker_timeout_status(job_data_snapshot, current_time, multi_job_id)
+                waiting_workers = type(self)._log_worker_timeout_status(
+                    self,
+                    job_data_snapshot,
+                    current_time,
+                    multi_job_id,
+                )
                 if mode == 'dynamic':
                     # Check for worker timeouts periodically
                     if current_time - last_heartbeat_check >= HEARTBEAT_INTERVAL:
-                        # Use the class method to check and requeue
-                        requeued = await self._check_and_requeue_timed_out_workers(multi_job_id, batch_size)
+                        # Use the class hook (can be overridden by host mixins/tests).
+                        requeued = await type(self)._check_and_requeue_timed_out_workers(
+                            self,
+                            multi_job_id,
+                            batch_size,
+                        )
                         if requeued > 0:
                             log(f"UltimateSDUpscale Master - Requeued {requeued} images from timed out workers")
                         last_heartbeat_check = current_time
@@ -179,12 +184,12 @@ class ResultCollectorMixin:
 
     async def _async_collect_worker_tiles(self, multi_job_id, num_workers):
         """Async helper to collect tiles from workers."""
-        return await self._async_collect_results(multi_job_id, num_workers, mode='static')
+        return await type(self)._async_collect_results(self, multi_job_id, num_workers, mode='static')
 
     async def _mark_image_completed(self, multi_job_id, image_idx, image_pil):
         """Mark an image as completed in the job data."""
         # Mark the image as completed with the image data
-        await _mark_task_completed(multi_job_id, image_idx, {'image': image_pil})
+        await mark_task_completed(multi_job_id, image_idx, {'image': image_pil})
         prompt_server = ensure_tile_jobs_initialized()
         async with prompt_server.distributed_tile_jobs_lock:
             job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
@@ -193,6 +198,12 @@ class ResultCollectorMixin:
 
     async def _async_collect_dynamic_images(self, multi_job_id, remaining_to_collect, num_workers, batch_size, master_processed_count):
         """Collect remaining processed images from workers."""
-        return await self._async_collect_results(multi_job_id, num_workers, mode='dynamic', 
-                                               remaining_to_collect=remaining_to_collect, 
-                                               batch_size=batch_size)
+        _ = master_processed_count
+        return await type(self)._async_collect_results(
+            self,
+            multi_job_id,
+            num_workers,
+            mode='dynamic',
+            remaining_to_collect=remaining_to_collect,
+            batch_size=batch_size,
+        )

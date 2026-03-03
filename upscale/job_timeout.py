@@ -148,3 +148,8 @@ async def _check_and_requeue_timed_out_workers(multi_job_id, total_tasks):
                 job_data.assigned_to_workers[worker] = []
 
         return requeued_count
+
+
+async def check_and_requeue_timed_out_workers(multi_job_id, total_tasks):
+    """Public wrapper for worker-timeout requeue checks."""
+    return await _check_and_requeue_timed_out_workers(multi_job_id, total_tasks)

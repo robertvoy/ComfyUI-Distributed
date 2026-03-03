@@ -1,20 +1,33 @@
 import asyncio, io, json, time
+from typing import Any
 import aiohttp
 from PIL import Image
 from ..utils.logging import debug_log, log
 from ..utils.network import get_client_session
 from ..utils.constants import TILE_SEND_TIMEOUT
-from ..utils.usdu_managment import MAX_PAYLOAD_SIZE, _send_heartbeat_to_master
+from ..utils.usdu_managment import MAX_PAYLOAD_SIZE, send_heartbeat_to_master
 from ..utils.image import tensor_to_pil
 
 
 class WorkerCommsMixin:
-    async def _send_heartbeat_to_master(self, multi_job_id, master_url, worker_id):
+    async def _send_heartbeat_to_master(
+        self,
+        multi_job_id: str,
+        master_url: str,
+        worker_id: str,
+    ) -> None:
         """Proxy heartbeat helper used by worker processing mixins."""
-        await _send_heartbeat_to_master(multi_job_id, master_url, worker_id)
+        await send_heartbeat_to_master(multi_job_id, master_url, worker_id)
 
-    async def send_tiles_batch_to_master(self, processed_tiles, multi_job_id, master_url, 
-                                       padding, worker_id, is_final_flush=False):
+    async def send_tiles_batch_to_master(
+        self,
+        processed_tiles: list[dict[str, Any]],
+        multi_job_id: str,
+        master_url: str,
+        padding: int,
+        worker_id: str,
+        is_final_flush: bool = False,
+    ) -> None:
         """Send all processed tiles to master, chunked if large."""
         if not processed_tiles:
             if is_final_flush:

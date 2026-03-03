@@ -4,22 +4,39 @@ Configuration management for ComfyUI-Distributed.
 import asyncio
 import os
 import json
+from dataclasses import dataclass
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from functools import lru_cache
+from typing import Any
 from .logging import log
 
 # Import defaults for timeout fallbacks
-from .constants import HEARTBEAT_TIMEOUT
+from .constants import GPU_CONFIG_FILE, HEARTBEAT_TIMEOUT
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "gpu_config.json")
-_config_cache = None
-_config_mtime = 0.0
-_config_lock = asyncio.Lock()
+CONFIG_FILE = GPU_CONFIG_FILE
 
 
-def _config_path():
+@dataclass
+class _ConfigState:
+    cache: dict[str, Any] | None = None
+    mtime: float = 0.0
+
+
+@lru_cache(maxsize=1)
+def _config_state() -> _ConfigState:
+    return _ConfigState()
+
+
+@lru_cache(maxsize=1)
+def _config_lock() -> asyncio.Lock:
+    return asyncio.Lock()
+
+
+def _config_path() -> str:
     return CONFIG_FILE
 
-def get_default_config():
+def get_default_config() -> dict[str, Any]:
     """Returns the default configuration dictionary. Single source of truth."""
     return {
         "master": {"host": ""},
@@ -44,7 +61,7 @@ def get_default_config():
         }
     }
 
-def _merge_with_defaults(data, defaults):
+def _merge_with_defaults(data: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
     """Recursively merge loaded config data with default keys."""
     if not isinstance(data, dict):
         return defaults
@@ -65,38 +82,38 @@ def _merge_with_defaults(data, defaults):
     return merged
 
 
-def invalidate_config_cache():
+def invalidate_config_cache() -> None:
     """Invalidate in-memory config cache so next load reads from disk."""
-    global _config_cache, _config_mtime
-    _config_cache = None
-    _config_mtime = 0.0
+    state = _config_state()
+    state.cache = None
+    state.mtime = 0.0
 
 
-def load_config():
+def load_config() -> dict[str, Any]:
     """Loads the config, falling back to defaults if the file is missing or invalid."""
-    global _config_cache, _config_mtime
+    state = _config_state()
     path = _config_path()
 
     try:
         mtime = os.path.getmtime(path)
     except OSError:
-        if _config_cache is None:
-            _config_cache = get_default_config()
-        return _config_cache
+        if state.cache is None:
+            state.cache = get_default_config()
+        return state.cache
 
-    if _config_cache is None or mtime != _config_mtime:
+    if state.cache is None or mtime != state.mtime:
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 loaded = json.load(f)
-            _config_cache = _merge_with_defaults(loaded, get_default_config())
+            state.cache = _merge_with_defaults(loaded, get_default_config())
         except Exception as e:
             log(f"Error loading config, using defaults: {e}")
-            _config_cache = get_default_config()
-        _config_mtime = mtime
+            state.cache = get_default_config()
+        state.mtime = mtime
 
-    return _config_cache
+    return state.cache
 
-def save_config(config):
+def save_config(config: dict[str, Any]) -> bool:
     """Saves the configuration to file."""
     tmp_path = f"{_config_path()}.tmp"
     try:
@@ -110,16 +127,16 @@ def save_config(config):
     except Exception as e:
         try:
             os.unlink(tmp_path)
-        except OSError:
-            pass
+        except OSError as cleanup_error:
+            log(f"Error removing temporary config file '{tmp_path}': {cleanup_error}")
         log(f"Error saving config: {e}")
         return False
 
 
 @asynccontextmanager
-async def config_transaction():
+async def config_transaction() -> AsyncIterator[dict[str, Any]]:
     """Acquire config lock, yield loaded config, and save if changed."""
-    async with _config_lock:
+    async with _config_lock():
         config = load_config()
         original_snapshot = json.dumps(config, sort_keys=True)
         yield config
@@ -128,7 +145,7 @@ async def config_transaction():
             if not save_config(config):
                 raise RuntimeError("Failed to save config")
 
-def ensure_config_exists():
+def ensure_config_exists() -> None:
     """Creates default config file if it doesn't exist. Used by __init__.py"""
     if not os.path.exists(_config_path()):
         default_config = get_default_config()

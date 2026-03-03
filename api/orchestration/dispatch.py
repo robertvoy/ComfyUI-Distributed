@@ -1,6 +1,7 @@
 import asyncio
 import json
 import uuid
+from typing import Any
 
 import aiohttp
 
@@ -9,11 +10,11 @@ from ...utils.network import build_worker_url, get_client_session, probe_worker
 try:
     from ...utils.trace_logger import trace_debug, trace_info
 except ImportError:
-    def trace_debug(*_args, **_kwargs):
-        return None
+    def _trace_fallback(_execution_id: str, message: str) -> None:
+        debug_log(message)
 
-    def trace_info(*_args, **_kwargs):
-        return None
+    trace_debug = _trace_fallback
+    trace_info = _trace_fallback
 
 try:
     from ..schemas import parse_positive_int
@@ -28,13 +29,13 @@ except ImportError:
 _least_busy_rr_index = 0
 
 
-async def worker_is_active(worker):
+async def worker_is_active(worker: dict[str, Any]) -> bool:
     """Ping worker's /prompt endpoint to confirm it's reachable."""
     url = build_worker_url(worker)
     return await probe_worker(url, timeout=3.0) is not None
 
 
-async def worker_ws_is_active(worker):
+async def worker_ws_is_active(worker: dict[str, Any]) -> bool:
     """Ping worker's websocket endpoint to confirm it's reachable."""
     session = await get_client_session()
     url = build_worker_url(worker, "/distributed/worker_ws")
@@ -96,13 +97,13 @@ async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
 
 
 async def dispatch_worker_prompt(
-    worker,
-    prompt_obj,
-    workflow_meta,
-    client_id=None,
-    use_websocket=False,
-    trace_execution_id=None,
-):
+    worker: dict[str, Any],
+    prompt_obj: dict[str, Any],
+    workflow_meta: dict[str, Any] | None,
+    client_id: str | None = None,
+    use_websocket: bool = False,
+    trace_execution_id: str | None = None,
+) -> None:
     """Send the prepared prompt to a worker ComfyUI instance."""
     worker_url = build_worker_url(worker)
     url = build_worker_url(worker, "/prompt")
@@ -142,12 +143,12 @@ async def dispatch_worker_prompt(
 
 
 async def select_active_workers(
-    workers,
-    use_websocket,
-    delegate_master,
-    trace_execution_id=None,
-    probe_concurrency=8,
-):
+    workers: list[dict[str, Any]],
+    use_websocket: bool,
+    delegate_master: bool,
+    trace_execution_id: str | None = None,
+    probe_concurrency: int = 8,
+) -> tuple[list[dict[str, Any]], bool]:
     """Probe workers and return (active_workers, updated_delegate_master)."""
     probe_limit = parse_positive_int(probe_concurrency, 8)
     probe_semaphore = asyncio.Semaphore(probe_limit)
@@ -223,11 +224,11 @@ def _select_idle_round_robin(statuses):
 
 
 async def select_least_busy_worker(
-    workers,
-    trace_execution_id=None,
-    probe_concurrency=8,
-    probe_timeout=3.0,
-):
+    workers: list[dict[str, Any]],
+    trace_execution_id: str | None = None,
+    probe_concurrency: int = 8,
+    probe_timeout: float = 3.0,
+) -> dict[str, Any] | None:
     """Select one worker by queue depth, round-robin among idle workers."""
     if not workers:
         return None
@@ -269,11 +270,11 @@ async def select_least_busy_worker(
 
 
 async def rank_workers_by_load(
-    workers,
-    trace_execution_id=None,
-    probe_concurrency=8,
-    probe_timeout=3.0,
-):
+    workers: list[dict[str, Any]],
+    trace_execution_id: str | None = None,
+    probe_concurrency: int = 8,
+    probe_timeout: float = 3.0,
+) -> list[dict[str, Any]]:
     """Return all workers sorted by queue depth (ascending), preserving unreachable workers at the end."""
     if not workers:
         return []

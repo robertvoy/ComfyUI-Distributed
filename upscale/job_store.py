@@ -1,7 +1,8 @@
 import asyncio
 import os
 import time
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Any
 
 import server
 
@@ -12,7 +13,17 @@ from .job_models import BaseJobState, ImageJobState, TileJobState
 MAX_PAYLOAD_SIZE = int(os.environ.get('COMFYUI_MAX_PAYLOAD_SIZE', str(50 * 1024 * 1024)))
 
 
-def ensure_tile_jobs_initialized():
+@dataclass(frozen=True)
+class JobQueueInitConfig:
+    mode: str
+    batch_size: int = 0
+    num_tiles_per_image: int = 0
+    all_indices: list[int] | None = None
+    enabled_workers: list[str] | None = None
+    batched_static: bool = False
+
+
+def ensure_tile_jobs_initialized() -> Any:
     """Ensure tile job storage is initialized on the server instance."""
     prompt_server = server.PromptServer.instance
     if not hasattr(prompt_server, 'distributed_pending_tile_jobs'):
@@ -32,14 +43,9 @@ def ensure_tile_jobs_initialized():
 
 
 async def _init_job_queue(
-    multi_job_id,
-    mode,
-    batch_size=None,
-    num_tiles_per_image=None,
-    all_indices=None,
-    enabled_workers=None,
-    batched_static: bool = False,
-):
+    multi_job_id: str,
+    config: JobQueueInitConfig,
+) -> None:
     """Unified initialization for job queues in static and dynamic modes."""
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
@@ -47,33 +53,34 @@ async def _init_job_queue(
             debug_log(f"Queue already exists for {multi_job_id}")
             return
 
-        if mode == 'dynamic':
+        if config.mode == 'dynamic':
             job_data = ImageJobState(multi_job_id=multi_job_id)
-        elif mode == 'static':
+        elif config.mode == 'static':
             job_data = TileJobState(multi_job_id=multi_job_id)
         else:
-            raise ValueError(f"Unknown mode: {mode}")
+            raise ValueError(f"Unknown mode: {config.mode}")
 
-        job_data.worker_status = {w: time.time() for w in enabled_workers or []}
-        job_data.assigned_to_workers = {w: [] for w in enabled_workers or []}
+        job_data.worker_status = {w: time.time() for w in config.enabled_workers or []}
+        job_data.assigned_to_workers = {w: [] for w in config.enabled_workers or []}
 
-        if mode == 'dynamic':
-            job_data.batch_size = int(batch_size or 0)
+        if config.mode == 'dynamic':
+            job_data.batch_size = int(config.batch_size or 0)
             pending_queue = job_data.pending_images
-            for i in (all_indices or range(int(batch_size or 0))):
+            indices = config.all_indices or list(range(int(config.batch_size or 0)))
+            for i in indices:
                 await pending_queue.put(i)
-            debug_log(f"Initialized image queue with {batch_size} pending items")
-        elif mode == 'static':
-            job_data.num_tiles_per_image = int(num_tiles_per_image or 0)
-            job_data.batch_size = int(batch_size or 0)
-            job_data.batched_static = bool(batched_static)
+            debug_log(f"Initialized image queue with {config.batch_size} pending items")
+        elif config.mode == 'static':
+            job_data.num_tiles_per_image = int(config.num_tiles_per_image or 0)
+            job_data.batch_size = int(config.batch_size or 0)
+            job_data.batched_static = bool(config.batched_static)
             # For batched static distribution, populate only tile ids [0..num_tiles_per_image-1]
             pending_queue = job_data.pending_tasks
-            if batched_static and num_tiles_per_image is not None:
-                for i in range(num_tiles_per_image):
+            if config.batched_static and config.num_tiles_per_image > 0:
+                for i in range(config.num_tiles_per_image):
                     await pending_queue.put(i)
             else:
-                total_tiles = int(batch_size or 0) * int(num_tiles_per_image or 0)
+                total_tiles = int(config.batch_size or 0) * int(config.num_tiles_per_image or 0)
                 for i in range(total_tiles):
                     await pending_queue.put(i)
 
@@ -83,16 +90,18 @@ async def _init_job_queue(
 async def init_dynamic_job(
     multi_job_id: str,
     batch_size: int,
-    enabled_workers: List[str],
-    all_indices: Optional[List[int]] = None,
-):
+    enabled_workers: list[str],
+    all_indices: list[int] | None = None,
+) -> None:
     """Initialize queue for dynamic mode (per-image), with collector fields."""
     await _init_job_queue(
         multi_job_id,
-        'dynamic',
-        batch_size=batch_size,
-        all_indices=all_indices or list(range(batch_size)),
-        enabled_workers=enabled_workers,
+        JobQueueInitConfig(
+            mode='dynamic',
+            batch_size=batch_size,
+            all_indices=all_indices or list(range(batch_size)),
+            enabled_workers=enabled_workers,
+        ),
     )
     debug_log(f"Job {multi_job_id} initialized with {batch_size} images")
 
@@ -101,20 +110,22 @@ async def init_static_job_batched(
     multi_job_id: str,
     batch_size: int,
     num_tiles_per_image: int,
-    enabled_workers: List[str],
-):
+    enabled_workers: list[str],
+) -> None:
     """Initialize queue for static mode (batched-per-tile)."""
     await _init_job_queue(
         multi_job_id,
-        'static',
-        batch_size=batch_size,
-        num_tiles_per_image=num_tiles_per_image,
-        enabled_workers=enabled_workers,
-        batched_static=True,
+        JobQueueInitConfig(
+            mode='static',
+            batch_size=batch_size,
+            num_tiles_per_image=num_tiles_per_image,
+            enabled_workers=enabled_workers,
+            batched_static=True,
+        ),
     )
 
 
-async def _drain_results_queue(multi_job_id):
+async def _drain_results_queue(multi_job_id: str) -> int:
     """Drain pending results from queue and update completed_tasks. Returns count drained."""
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
@@ -152,7 +163,7 @@ async def _drain_results_queue(multi_job_id):
         return collected
 
 
-async def _get_completed_count(multi_job_id):
+async def _get_completed_count(multi_job_id: str) -> int:
     """Get count of completed tasks."""
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
@@ -162,7 +173,7 @@ async def _get_completed_count(multi_job_id):
         return 0
 
 
-async def _mark_task_completed(multi_job_id, task_id, result):
+async def _mark_task_completed(multi_job_id: str, task_id: int, result: Any) -> None:
     """Mark a task as completed."""
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
@@ -171,10 +182,38 @@ async def _mark_task_completed(multi_job_id, task_id, result):
             job_data.completed_tasks[task_id] = result
 
 
-async def _cleanup_job(multi_job_id):
+async def _cleanup_job(multi_job_id: str) -> None:
     """Cleanup the job data."""
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
         if multi_job_id in prompt_server.distributed_pending_tile_jobs:
             del prompt_server.distributed_pending_tile_jobs[multi_job_id]
             debug_log(f"Cleaned up job {multi_job_id}")
+
+
+async def init_job_queue(
+    multi_job_id: str,
+    config: JobQueueInitConfig,
+) -> None:
+    """Public wrapper for unified job queue initialization."""
+    await _init_job_queue(multi_job_id, config)
+
+
+async def drain_results_queue(multi_job_id: str) -> int:
+    """Public wrapper for draining queued worker results."""
+    return await _drain_results_queue(multi_job_id)
+
+
+async def get_completed_count(multi_job_id: str) -> int:
+    """Public wrapper for counting completed tasks in a job."""
+    return await _get_completed_count(multi_job_id)
+
+
+async def mark_task_completed(multi_job_id: str, task_id: int, result: Any) -> None:
+    """Public wrapper for marking a task complete."""
+    await _mark_task_completed(multi_job_id, task_id, result)
+
+
+async def cleanup_job(multi_job_id: str) -> None:
+    """Public wrapper for deleting finished job state."""
+    await _cleanup_job(multi_job_id)

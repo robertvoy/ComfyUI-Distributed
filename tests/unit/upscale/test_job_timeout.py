@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 def _load_job_timeout_module():
-    module_path = Path(__file__).resolve().parents[1] / "upscale" / "job_timeout.py"
+    module_path = Path(__file__).resolve().parents[3] / "upscale" / "job_timeout.py"
     package_name = "dist_job_timeout_testpkg"
 
     for mod_name in list(sys.modules):

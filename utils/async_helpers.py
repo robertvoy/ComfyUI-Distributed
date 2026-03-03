@@ -105,7 +105,11 @@ class PromptValidationError(RuntimeError):
         super().__init__(f"Invalid prompt: {merged}")
 
 
-async def queue_prompt_payload(prompt_obj, workflow_meta=None, client_id=None):
+async def queue_prompt_payload(
+    prompt_obj: dict[str, Any],
+    workflow_meta: dict[str, Any] | None = None,
+    client_id: str | None = None,
+) -> str:
     """Validate and queue a prompt via ComfyUI's prompt queue."""
     payload = {"prompt": prompt_obj}
     payload = prompt_server.trigger_on_prompt(payload)

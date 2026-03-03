@@ -6,6 +6,7 @@ import shutil
 import stat
 from urllib import error as urlerror
 from urllib import request
+from urllib.parse import urlsplit
 
 from ..logging import debug_log
 
@@ -44,9 +45,24 @@ def _get_binary_path(bin_dir=None):
     return os.path.join(bin_dir, binary_name)
 
 
+def _get_release_download_base() -> str:
+    """Resolve cloudflared release download base URL from environment/config."""
+    configured = (os.environ.get("CLOUDFLARED_RELEASE_BASE") or "").strip()
+    if configured:
+        return configured.rstrip("/")
+    return "github.com/cloudflare/cloudflared/releases/latest/download"
+
+
 def _download_cloudflared():
     asset = _get_platform_binary_name()
-    url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}"
+    base = _get_release_download_base()
+    if "://" not in base:
+        scheme = (os.environ.get("CLOUDFLARED_RELEASE_SCHEME") or "https").strip() or "https"
+        base = f"{scheme}://{base}"
+    url = f"{base}/{asset}"
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise RuntimeError(f"Unsupported cloudflared download URL scheme: {parsed.scheme}")
 
     bin_dir = _get_cloudflared_dir()
     os.makedirs(bin_dir, exist_ok=True)
@@ -54,7 +70,7 @@ def _download_cloudflared():
 
     debug_log(f"Downloading cloudflared from {url}")
     try:
-        with request.urlopen(url, timeout=30) as resp:
+        with request.urlopen(url, timeout=30) as resp:  # nosec B310 - scheme is allowlisted above
             with open(target_path, "wb") as f:
                 shutil.copyfileobj(resp, f)
     except urlerror.URLError as exc:

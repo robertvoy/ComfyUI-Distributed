@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import asyncio
 import io
@@ -5,6 +7,7 @@ import os
 import base64
 import binascii
 import time
+from typing import Any
 
 from aiohttp import web
 import server
@@ -20,8 +23,12 @@ try:
 except ImportError:
     from .queue_orchestration import orchestrate_distributed_execution
 
-    def ensure_distributed_state():
-        return None
+    def ensure_distributed_state() -> None:
+        prompt_server_instance = server.PromptServer.instance
+        if not hasattr(prompt_server_instance, "distributed_jobs_lock"):
+            prompt_server_instance.distributed_jobs_lock = asyncio.Lock()
+        if not hasattr(prompt_server_instance, "distributed_pending_jobs"):
+            prompt_server_instance.distributed_pending_jobs = {}
 from .queue_request import parse_queue_request_payload
 
 prompt_server = server.PromptServer.instance
@@ -30,7 +37,7 @@ prompt_server = server.PromptServer.instance
 # { "job_id": str, "worker_id": str, "batch_idx": int, "image": <base64 PNG>, "is_last": bool }
 
 
-def _decode_image_sync(image_path):
+def _decode_image_sync(image_path: str) -> dict[str, Any]:
     """Decode image/video file and compute hash in a threadpool worker."""
     import base64
     import hashlib
@@ -76,7 +83,7 @@ def _decode_image_sync(image_path):
     }
 
 
-def _check_file_sync(filename, expected_hash):
+def _check_file_sync(filename: str, expected_hash: str) -> dict[str, Any]:
     """Check file presence and hash in a threadpool worker."""
     import hashlib
     import folder_paths
@@ -101,7 +108,7 @@ def _check_file_sync(filename, expected_hash):
     }
 
 
-def _decode_canonical_png_tensor(image_payload):
+def _decode_canonical_png_tensor(image_payload: str) -> torch.Tensor:
     """Decode canonical base64 PNG payload into a contiguous IMAGE tensor."""
     if not isinstance(image_payload, str) or not image_payload.strip():
         raise ValueError("Field 'image' must be a non-empty base64 PNG string.")
@@ -132,7 +139,7 @@ def _decode_canonical_png_tensor(image_payload):
         raise ValueError(f"Failed to decode PNG image payload: {exc}") from exc
 
 
-def _decode_audio_payload(audio_payload):
+def _decode_audio_payload(audio_payload: dict[str, Any]) -> dict[str, Any]:
     """Decode canonical audio payload into an AUDIO dict."""
     from ..utils.audio_payload import decode_audio_payload
 
@@ -140,7 +147,7 @@ def _decode_audio_payload(audio_payload):
 
 
 @server.PromptServer.instance.routes.post("/distributed/prepare_job")
-async def prepare_job_endpoint(request):
+async def prepare_job_endpoint(request: web.Request) -> web.StreamResponse:
     try:
         data = await request.json()
         multi_job_id = data.get('multi_job_id')
@@ -158,7 +165,7 @@ async def prepare_job_endpoint(request):
         return await handle_api_error(request, e)
 
 @server.PromptServer.instance.routes.post("/distributed/clear_memory")
-async def clear_memory_endpoint(request):
+async def clear_memory_endpoint(request: web.Request) -> web.StreamResponse:
     debug_log("Received request to clear VRAM.")
     try:
         # Use ComfyUI's prompt server queue system like the /free endpoint does
@@ -204,7 +211,7 @@ async def clear_memory_endpoint(request):
 
 
 @server.PromptServer.instance.routes.post("/distributed/queue")
-async def distributed_queue_endpoint(request):
+async def distributed_queue_endpoint(request: web.Request) -> web.StreamResponse:
     """Queue a distributed workflow, mirroring the UI orchestration pipeline."""
     try:
         raw_payload = await request.json()
@@ -234,7 +241,7 @@ async def distributed_queue_endpoint(request):
         return await handle_api_error(request, exc, 500)
 
 @server.PromptServer.instance.routes.post("/distributed/load_image")
-async def load_image_endpoint(request):
+async def load_image_endpoint(request: web.Request) -> web.StreamResponse:
     """Load an image or video file and return it as base64 data with hash."""
     try:
         data = await request.json()
@@ -251,7 +258,7 @@ async def load_image_endpoint(request):
         return await handle_api_error(request, e, 500)
 
 @server.PromptServer.instance.routes.post("/distributed/check_file")
-async def check_file_endpoint(request):
+async def check_file_endpoint(request: web.Request) -> web.StreamResponse:
     """Check if a file exists and matches the given hash."""
     try:
         data = await request.json()
@@ -269,7 +276,7 @@ async def check_file_endpoint(request):
 
 
 @server.PromptServer.instance.routes.post("/distributed/job_complete")
-async def job_complete_endpoint(request):
+async def job_complete_endpoint(request: web.Request) -> web.StreamResponse:
     try:
         data = await request.json()
     except Exception as exc:
@@ -314,14 +321,16 @@ async def job_complete_endpoint(request):
             async with prompt_server.distributed_jobs_lock:
                 pending = prompt_server.distributed_pending_jobs.get(multi_job_id)
                 if pending is not None:
+                    queue_item = {
+                        "tensor": tensor,
+                        "worker_id": worker_id,
+                        "image_index": int(batch_idx),
+                        "is_last": is_last,
+                    }
+                    if decoded_audio is not None:
+                        queue_item["audio"] = decoded_audio
                     await pending.put(
-                        {
-                            "tensor": tensor,
-                            "worker_id": worker_id,
-                            "image_index": int(batch_idx),
-                            "is_last": is_last,
-                            "audio": decoded_audio,
-                        }
+                        queue_item
                     )
                     queue_size = pending.qsize()
                     break

@@ -1,4 +1,6 @@
 import asyncio
+from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 
@@ -10,12 +12,22 @@ from ..utils.network import get_client_session
 from .utilities import _chunk_bounds
 
 
+@dataclass(frozen=True)
+class ListSplitterRunContext:
+    participant_index: int = 0
+    total_participants: int = 1
+    multi_job_id: str = ""
+    is_worker: bool = False
+    master_url: str = ""
+    worker_id: str = ""
+
+
 class DistributedListSplitter:
     INPUT_IS_LIST = True
     OUTPUT_IS_LIST = (True,)
 
     @classmethod
-    def INPUT_TYPES(cls):
+    def INPUT_TYPES(cls: type["DistributedListSplitter"]) -> dict[str, Any]:
         return {
             "required": {
                 "images": ("IMAGE",),
@@ -36,31 +48,50 @@ class DistributedListSplitter:
     FUNCTION = "split"
     CATEGORY = "image"
 
+    def _build_run_context(self, **kwargs: Any) -> ListSplitterRunContext:
+        try:
+            participant_index = int(kwargs.get("participant_index", 0))
+        except (TypeError, ValueError):
+            participant_index = 0
+        try:
+            total_participants = int(kwargs.get("total_participants", 1))
+        except (TypeError, ValueError):
+            total_participants = 1
+
+        return ListSplitterRunContext(
+            participant_index=participant_index,
+            total_participants=max(total_participants, 1),
+            multi_job_id=str(kwargs.get("multi_job_id", "")),
+            is_worker=bool(kwargs.get("is_worker", False)),
+            master_url=str(kwargs.get("master_url", "")),
+            worker_id=str(kwargs.get("worker_id", "")),
+        )
+
     def split(
         self,
-        images,
-        mode="static",
-        participant_index=0,
-        total_participants=1,
-        multi_job_id="",
-        is_worker=False,
-        master_url="",
-        worker_id="",
-    ):
+        images: list[Any] | Any | None,
+        mode: str = "static",
+        **kwargs: Any,
+    ) -> tuple[list[Any]]:
+        context = self._build_run_context(**kwargs)
         if images is None:
             return ([],)
 
         image_list = images if isinstance(images, list) else [images]
-        if mode != "dynamic" or not multi_job_id:
-            return self._split_static(image_list, participant_index, total_participants)
+        if mode != "dynamic" or not context.multi_job_id:
+            return self._split_static(
+                image_list,
+                context.participant_index,
+                context.total_participants,
+            )
 
         return run_async_in_server_loop(
             self._split_dynamic(
                 image_list,
-                multi_job_id,
-                bool(is_worker),
-                master_url,
-                worker_id,
+                context.multi_job_id,
+                context.is_worker,
+                context.master_url,
+                context.worker_id,
             )
         )
 
@@ -161,7 +192,8 @@ class DistributedListSplitter:
 
             try:
                 pulled.append(int(item_idx))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as exc:
+                debug_log(f"DistributedListSplitter dynamic mode: invalid item index '{item_idx}' ignored: {exc}")
                 continue
 
         return pulled

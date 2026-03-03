@@ -9,7 +9,7 @@ import torch
 
 
 def _load_static_mode_module():
-    module_path = Path(__file__).resolve().parents[1] / "upscale" / "modes" / "static.py"
+    module_path = Path(__file__).resolve().parents[3] / "upscale" / "modes" / "static.py"
     package_name = "dist_static_mode_testpkg"
 
     for mod_name in list(sys.modules):
@@ -65,8 +65,34 @@ def _load_static_mode_module():
         arr = np.array(image).astype(np.float32) / 255.0
         return torch.from_numpy(arr).unsqueeze(0)
 
+    def _blend_processed_batch_item(
+        result_images,
+        processed_batch,
+        batch_index,
+        blend_fn,
+        x1,
+        y1,
+        ew,
+        eh,
+        tile_mask,
+        padding,
+    ):
+        tile_pil = _tensor_to_pil(processed_batch, batch_index)
+        if tile_pil.size != (ew, eh):
+            tile_pil = tile_pil.resize((ew, eh), PILImage.LANCZOS)
+        result_images[batch_index] = blend_fn(
+            result_images[batch_index],
+            tile_pil,
+            x1,
+            y1,
+            (ew, eh),
+            tile_mask,
+            padding,
+        )
+
     image_module.tensor_to_pil = _tensor_to_pil
     image_module.pil_to_tensor = _pil_to_tensor
+    image_module.blend_processed_batch_item = _blend_processed_batch_item
     sys.modules[f"{package_name}.utils.image"] = image_module
 
     async_helpers_module = types.ModuleType(f"{package_name}.utils.async_helpers")
@@ -102,6 +128,10 @@ def _load_static_mode_module():
         distributed_pending_tile_jobs={},
     )
     job_store_module.init_static_job_batched = _noop
+    job_store_module.mark_task_completed = _noop
+    job_store_module.cleanup_job = _noop
+    job_store_module.drain_results_queue = _noop
+    job_store_module.get_completed_count = _noop
     job_store_module._mark_task_completed = _noop
     job_store_module._cleanup_job = _noop
     job_store_module._drain_results_queue = _noop
@@ -115,6 +145,26 @@ def _load_static_mode_module():
 
     job_models_module.TileJobState = _TileJobState
     sys.modules[f"{package_name}.upscale.job_models"] = job_models_module
+
+    processing_args_path = Path(__file__).resolve().parents[3] / "upscale" / "processing_args.py"
+    processing_args_spec = importlib.util.spec_from_file_location(
+        f"{package_name}.upscale.processing_args",
+        processing_args_path,
+    )
+    processing_args_module = importlib.util.module_from_spec(processing_args_spec)
+    assert processing_args_spec is not None and processing_args_spec.loader is not None
+    sys.modules[processing_args_spec.name] = processing_args_module
+    processing_args_spec.loader.exec_module(processing_args_module)
+
+    tile_processing_path = Path(__file__).resolve().parents[3] / "upscale" / "tile_processing.py"
+    tile_processing_spec = importlib.util.spec_from_file_location(
+        f"{package_name}.upscale.tile_processing",
+        tile_processing_path,
+    )
+    tile_processing_module = importlib.util.module_from_spec(tile_processing_spec)
+    assert tile_processing_spec is not None and tile_processing_spec.loader is not None
+    sys.modules[tile_processing_spec.name] = tile_processing_module
+    tile_processing_spec.loader.exec_module(tile_processing_module)
 
     spec = importlib.util.spec_from_file_location(f"{package_name}.upscale.modes.static", module_path)
     module = importlib.util.module_from_spec(spec)

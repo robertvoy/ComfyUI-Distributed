@@ -8,7 +8,7 @@ class ProcessPersistence:
     def __init__(self, manager):
         self._manager = manager
 
-    def load_processes(self):
+    def load_processes(self) -> None:
         """Load persisted process information from config."""
         config = load_config()
         managed_processes = config.get("managed_processes", {})
@@ -27,7 +27,7 @@ class ProcessPersistence:
             elif pid:
                 debug_log(f"[Distributed] Worker {worker_id} (PID: {pid}) is no longer running")
 
-    def save_processes(self):
+    def save_processes(self) -> None:
         """Save process information to config."""
         config = load_config()
         managed_processes = {}

@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import importlib.util
+import io
 import json
 import sys
 import types
@@ -51,8 +53,16 @@ def _bootstrap_package(package_name):
         array = (tensor.numpy() * 255.0).astype("uint8")
         return Image.fromarray(array)
 
+    def encode_tensor_png_data_url(image_batch, batch_index=0):
+        image = tensor_to_pil(image_batch, batch_index)
+        byte_io = io.BytesIO()
+        image.save(byte_io, format="PNG", compress_level=0)
+        encoded = base64.b64encode(byte_io.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{encoded}"
+
     image_module.ensure_contiguous = ensure_contiguous
     image_module.tensor_to_pil = tensor_to_pil
+    image_module.encode_tensor_png_data_url = encode_tensor_png_data_url
     sys.modules[f"{package_name}.utils.image"] = image_module
 
     network_module = types.ModuleType(f"{package_name}.utils.network")
@@ -69,7 +79,7 @@ def _bootstrap_package(package_name):
 
 
 def _load_module(package_name, module_rel_path, module_name):
-    module_path = Path(__file__).resolve().parents[1] / module_rel_path
+    module_path = Path(__file__).resolve().parents[3] / module_rel_path
     spec = importlib.util.spec_from_file_location(
         f"{package_name}.{module_name}",
         module_path,
@@ -85,10 +95,28 @@ def _load_branch_collector_module():
     package_name = "dist_join_testpkg"
     _bootstrap_package(package_name)
     _load_module(package_name, "nodes/utilities.py", "nodes.utilities")
+    _load_module(package_name, "nodes/hidden_inputs.py", "nodes.hidden_inputs")
+    _load_module(package_name, "nodes/runtime_helpers.py", "nodes.runtime_helpers")
+    _load_module(package_name, "nodes/queue_wait.py", "nodes.queue_wait")
+    _load_module(package_name, "utils/worker_ids.py", "utils.worker_ids")
     return _load_module(package_name, "nodes/branch_collector.py", "nodes.branch_collector")
 
 
 branch_collector_module = _load_branch_collector_module()
+
+
+def _context(**overrides):
+    defaults = {
+        "multi_job_id": "",
+        "is_worker": False,
+        "master_url": "",
+        "enabled_worker_ids": "[]",
+        "worker_id": "",
+        "assigned_branch": -1,
+        "delegate_only": False,
+    }
+    defaults.update(overrides)
+    return branch_collector_module.BranchRunContext(**defaults)
 
 
 class _FakeResponseCtx:
@@ -138,11 +166,13 @@ class DistributedBranchCollectorTests(unittest.IsolatedAsyncioTestCase):
         outputs = await self.node.execute(
             [None, tensor, None, None, None, None, None, None, None, None],
             num_branches=2,
-            multi_job_id="join-job",
-            is_worker=True,
-            master_url="http://master.local:8188",
-            worker_id="worker-a",
-            assigned_branch=1,
+            context=_context(
+                multi_job_id="join-job",
+                is_worker=True,
+                master_url="http://master.local:8188",
+                worker_id="worker-a",
+                assigned_branch=1,
+            ),
         )
 
         self.assertEqual(len(fake_session.calls), 1)
@@ -167,10 +197,11 @@ class DistributedBranchCollectorTests(unittest.IsolatedAsyncioTestCase):
         outputs = await self.node.execute(
             [master_tensor, None, None, None, None, None, None, None, None, None],
             num_branches=3,
-            multi_job_id="join-job",
-            is_worker=False,
-            enabled_worker_ids=json.dumps(["worker-a", "worker-b"]),
-            assigned_branch=0,
+            context=_context(
+                multi_job_id="join-job",
+                enabled_worker_ids=json.dumps(["worker-a", "worker-b"]),
+                assigned_branch=0,
+            ),
         )
 
         self.assertTrue(torch.equal(outputs[0], master_tensor))
@@ -190,10 +221,11 @@ class DistributedBranchCollectorTests(unittest.IsolatedAsyncioTestCase):
         outputs = await self.node.execute(
             [master_tensor, None, None, None, None, None, None, None, None, None],
             num_branches=2,
-            multi_job_id="join-job",
-            is_worker=False,
-            enabled_worker_ids=json.dumps(["worker-a"]),
-            assigned_branch=0,
+            context=_context(
+                multi_job_id="join-job",
+                enabled_worker_ids=json.dumps(["worker-a"]),
+                assigned_branch=0,
+            ),
         )
 
         self.assertIsNone(outputs[2])
@@ -211,10 +243,11 @@ class DistributedBranchCollectorTests(unittest.IsolatedAsyncioTestCase):
         outputs = await self.node.execute(
             [master_tensor, None, None, None, None, None, None, None, None, None],
             num_branches=3,
-            multi_job_id="join-job",
-            is_worker=False,
-            enabled_worker_ids=json.dumps(["worker-a", "worker-b"]),
-            assigned_branch=0,
+            context=_context(
+                multi_job_id="join-job",
+                enabled_worker_ids=json.dumps(["worker-a", "worker-b"]),
+                assigned_branch=0,
+            ),
         )
 
         self.assertTrue(torch.equal(outputs[0], master_tensor))
@@ -235,10 +268,11 @@ class DistributedBranchCollectorTests(unittest.IsolatedAsyncioTestCase):
             # Local value arrives on slot 1 even though participant is assigned slot 0.
             [None, local_tensor, None, None, None, None, None, None, None, None],
             num_branches=3,
-            multi_job_id="join-job",
-            is_worker=False,
-            enabled_worker_ids=json.dumps([]),
-            assigned_branch=0,
+            context=_context(
+                multi_job_id="join-job",
+                enabled_worker_ids=json.dumps([]),
+                assigned_branch=0,
+            ),
         )
 
         self.assertTrue(torch.equal(outputs[0], local_tensor))

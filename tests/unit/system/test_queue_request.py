@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 def _load_queue_request_module():
-    module_path = Path(__file__).resolve().parents[1] / "api" / "queue_request.py"
+    module_path = Path(__file__).resolve().parents[3] / "api" / "queue_request.py"
     spec = importlib.util.spec_from_file_location("queue_request", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
