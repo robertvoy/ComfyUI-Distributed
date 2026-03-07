@@ -486,6 +486,11 @@ class ApplyOverridesSeedTests(unittest.TestCase):
         result = _apply(self._seed_prompt(), "master")
         self.assertEqual(result["1"]["inputs"]["worker_id"], "")
 
+    def test_enabled_worker_ids_is_set(self):
+        enabled = ["worker-a", "worker-b"]
+        result = _apply(self._seed_prompt(), "worker-a", enabled_worker_ids=enabled)
+        self.assertEqual(result["1"]["inputs"]["enabled_worker_ids"], json.dumps(enabled))
+
 
 # ---------------------------------------------------------------------------
 # apply_participant_overrides – UltimateSDUpscaleDistributed
@@ -543,6 +548,11 @@ class ApplyOverridesValueTests(unittest.TestCase):
     def test_master_sets_empty_worker_id(self):
         result = _apply(self._value_prompt(), "master")
         self.assertEqual(result["1"]["inputs"]["worker_id"], "")
+
+    def test_enabled_worker_ids_is_set(self):
+        enabled = ["worker-a", "worker-b"]
+        result = _apply(self._value_prompt(), "worker-a", enabled_worker_ids=enabled)
+        self.assertEqual(result["1"]["inputs"]["enabled_worker_ids"], json.dumps(enabled))
 
 
 class ApplyOverridesBranchTests(unittest.TestCase):

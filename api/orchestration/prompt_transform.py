@@ -447,7 +447,7 @@ def generate_job_id_map(prompt_index: PromptIndex, prefix: str) -> dict[str, str
     return job_map
 
 
-def _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id):
+def _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, enabled_json):
     """Configure DistributedSeed nodes for master or worker role."""
     for node_id in prompt_index.nodes_for_class("DistributedSeed"):
         node = prompt_copy.get(node_id)
@@ -455,6 +455,7 @@ def _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id):
             continue
         inputs = node.setdefault("inputs", {})
         inputs["is_worker"] = not is_master
+        inputs["enabled_worker_ids"] = enabled_json
         if is_master:
             inputs["worker_id"] = ""
         else:
@@ -521,7 +522,7 @@ def _override_upscale_nodes(
             inputs["worker_id"] = participant_id
 
 
-def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id):
+def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, enabled_json):
     """Configure DistributedValue nodes for master or worker role."""
     for node_id in prompt_index.nodes_for_class("DistributedValue"):
         node = prompt_copy.get(node_id)
@@ -529,6 +530,7 @@ def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id):
             continue
         inputs = node.setdefault("inputs", {})
         inputs["is_worker"] = not is_master
+        inputs["enabled_worker_ids"] = enabled_json
         if is_master:
             inputs["worker_id"] = ""
         else:
@@ -672,8 +674,8 @@ def apply_participant_overrides(
     is_master = participant_id == "master"
     enabled_json = json.dumps(enabled_worker_ids)
 
-    _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id)
-    _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id)
+    _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, enabled_json)
+    _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, enabled_json)
     _override_collector_nodes(
         prompt_copy,
         prompt_index,
