@@ -16,7 +16,7 @@ class ResultCollectorMixin:
     Expected co-mixins/attributes:
     - JobStateMixin methods for queue/task access.
     - `self._check_and_requeue_timed_out_workers(...)` coroutine.
-    - `self._async_yield(...)` optional helper from WorkerCommsMixin.
+    - `self.async_yield(...)` optional helper from WorkerCommsMixin.
     """
 
     def _log_worker_timeout_status(self, job_data, current_time: float, multi_job_id: str) -> list[str]:
@@ -196,6 +196,10 @@ class ResultCollectorMixin:
             if isinstance(job_data, ImageJobState):
                 job_data.completed_images[image_idx] = image_pil
 
+    async def mark_image_completed(self, multi_job_id, image_idx, image_pil):
+        """Public image-completion API."""
+        await self._mark_image_completed(multi_job_id, image_idx, image_pil)
+
     async def _async_collect_dynamic_images(self, multi_job_id, remaining_to_collect, num_workers, batch_size, master_processed_count):
         """Collect remaining processed images from workers."""
         _ = master_processed_count
@@ -206,4 +210,21 @@ class ResultCollectorMixin:
             mode='dynamic',
             remaining_to_collect=remaining_to_collect,
             batch_size=batch_size,
+        )
+
+    async def collect_dynamic_images(
+        self,
+        multi_job_id,
+        remaining_to_collect,
+        num_workers,
+        batch_size,
+        master_processed_count,
+    ):
+        """Public dynamic image-collection API."""
+        return await self._async_collect_dynamic_images(
+            multi_job_id,
+            remaining_to_collect,
+            num_workers,
+            batch_size,
+            master_processed_count,
         )

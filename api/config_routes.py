@@ -1,31 +1,12 @@
 from __future__ import annotations
 
-import json
-from contextlib import asynccontextmanager
-
 from aiohttp import web
 import server
 
-try:
-    from ..utils.config import config_transaction, load_config, save_config
-except ImportError:
-    from ..utils.config import load_config
-
-    try:
-        from ..utils.config import save_config
-    except ImportError:
-        def save_config(_config):
-            return True
-
-    @asynccontextmanager
-    async def config_transaction():
-        config = load_config()
-        original_snapshot = json.dumps(config, sort_keys=True)
-        yield config
-        if json.dumps(config, sort_keys=True) != original_snapshot:
-            save_config(config)
-from ..utils.logging import debug_log, log
+from ..utils.config import config_transaction, load_config
+from ..utils.logging import debug_log
 from ..utils.network import handle_api_error, normalize_host
+from .endpoint_policy import run_authorized_endpoint
 
 
 def _positive_int(value: int) -> bool:
@@ -88,68 +69,103 @@ def _apply_field_patch(target: dict, data: dict, field_rules: list) -> None:
             target[key] = normalizer(value) if (normalizer and value is not None) else value
 
 
+def _validate_workers_payload(workers_value: object) -> list[str]:
+    """Validate top-level workers payload shape before persisting config."""
+    if not isinstance(workers_value, list):
+        return ["workers: expected list"]
+
+    errors: list[str] = []
+    seen_ids: set[str] = set()
+    for index, worker in enumerate(workers_value):
+        if not isinstance(worker, dict):
+            errors.append(f"workers[{index}]: expected object")
+            continue
+
+        worker_id = str(worker.get("id", "")).strip()
+        if not worker_id:
+            errors.append(f"workers[{index}].id: expected non-empty string")
+        elif worker_id in seen_ids:
+            errors.append(f"workers[{index}].id: duplicate id '{worker_id}'")
+        else:
+            seen_ids.add(worker_id)
+
+        if "port" in worker and worker.get("port") is not None:
+            try:
+                port = int(worker.get("port"))
+            except (TypeError, ValueError):
+                errors.append(f"workers[{index}].port: expected integer")
+            else:
+                if port <= 0:
+                    errors.append(f"workers[{index}].port: expected positive integer")
+
+    return errors
+
+
 @server.PromptServer.instance.routes.get("/distributed/config")
 async def get_config_endpoint(request: web.Request) -> web.StreamResponse:
-    config = load_config()
-    return web.json_response(config)
+    async def _operation() -> web.StreamResponse:
+        return web.json_response(load_config())
+
+    return await run_authorized_endpoint(request, _operation)
 
 
 @server.PromptServer.instance.routes.post("/distributed/config")
 async def update_config_endpoint(request: web.Request) -> web.StreamResponse:
     """Bulk config update with schema validation."""
-    try:
-        data = await request.json()
-    except Exception as e:
-        return await handle_api_error(request, f"Invalid JSON payload: {e}", 400)
+    async def _operation() -> web.StreamResponse:
+        try:
+            data = await request.json()
+        except Exception as exc:
+            return await handle_api_error(request, f"Invalid JSON payload: {exc}", 400)
 
-    if not isinstance(data, dict):
-        return await handle_api_error(request, "Config payload must be an object", 400)
+        if not isinstance(data, dict):
+            return await handle_api_error(request, "Config payload must be an object", 400)
 
-    validated_settings = {}
-    validated_root = {}
-    errors = []
+        validated_settings = {}
+        validated_root = {}
+        errors = []
 
-    for key, value in data.items():
-        if key not in CONFIG_SCHEMA:
-            errors.append(f"Unknown field: {key}")
-            continue
+        for key, value in data.items():
+            if key not in CONFIG_SCHEMA:
+                errors.append(f"Unknown field: {key}")
+                continue
 
-        expected_type, validator = CONFIG_SCHEMA[key]
-        if not isinstance(value, expected_type):
-            errors.append(f"{key}: expected {expected_type.__name__}")
-            continue
+            expected_type, validator = CONFIG_SCHEMA[key]
+            if not isinstance(value, expected_type):
+                errors.append(f"{key}: expected {expected_type.__name__}")
+                continue
 
-        if validator and not validator(value):
-            errors.append(f"{key}: value {value!r} failed validation")
-            continue
+            if validator and not validator(value):
+                errors.append(f"{key}: value {value!r} failed validation")
+                continue
 
-        if key in _SETTINGS_FIELDS:
-            validated_settings[key] = value
-        else:
-            validated_root[key] = value
+            if key == "workers":
+                errors.extend(_validate_workers_payload(value))
+                if errors:
+                    continue
 
-    if errors:
-        return web.json_response({
-            "status": "error",
-            "error": errors,
-            "message": "; ".join(errors),
-        }, status=400)
+            if key in _SETTINGS_FIELDS:
+                validated_settings[key] = value
+            else:
+                validated_root[key] = value
 
-    try:
+        if errors:
+            return await handle_api_error(request, errors, 400)
+
         async with config_transaction() as config:
             settings = config.setdefault("settings", {})
             settings.update(validated_settings)
             for key, value in validated_root.items():
                 config[key] = value
             return web.json_response({"status": "success", "config": config})
-    except Exception as e:
-        return await handle_api_error(request, e)
+
+    return await run_authorized_endpoint(request, _operation)
 
 
 @server.PromptServer.instance.routes.get("/distributed/queue_status/{job_id}")
 async def queue_status_endpoint(request: web.Request) -> web.StreamResponse:
     """Check if a job queue is initialized."""
-    try:
+    async def _operation() -> web.StreamResponse:
         job_id = request.match_info['job_id']
         
         # Import to ensure initialization
@@ -161,12 +177,12 @@ async def queue_status_endpoint(request: web.Request) -> web.StreamResponse:
         
         debug_log(f"Queue status check for job {job_id}: {'exists' if exists else 'not found'}")
         return web.json_response({"exists": exists, "job_id": job_id})
-    except Exception as e:
-        return await handle_api_error(request, e, 500)
+
+    return await run_authorized_endpoint(request, _operation, unexpected_status=500)
 
 @server.PromptServer.instance.routes.post("/distributed/config/update_worker")
 async def update_worker_endpoint(request: web.Request) -> web.StreamResponse:
-    try:
+    async def _operation() -> web.StreamResponse:
         data = await request.json()
         worker_id = data.get("worker_id")
         
@@ -205,12 +221,12 @@ async def update_worker_endpoint(request: web.Request) -> web.StreamResponse:
                     )
 
             return web.json_response({"status": "success"})
-    except Exception as e:
-        return await handle_api_error(request, e, 400)
+
+    return await run_authorized_endpoint(request, _operation, unexpected_status=500)
 
 @server.PromptServer.instance.routes.post("/distributed/config/delete_worker")
 async def delete_worker_endpoint(request: web.Request) -> web.StreamResponse:
-    try:
+    async def _operation() -> web.StreamResponse:
         data = await request.json()
         worker_id = data.get("worker_id")
         
@@ -237,13 +253,13 @@ async def delete_worker_endpoint(request: web.Request) -> web.StreamResponse:
                 "status": "success",
                 "message": f"Worker {removed_worker.get('name', worker_id)} deleted"
             })
-    except Exception as e:
-        return await handle_api_error(request, e, 400)
+
+    return await run_authorized_endpoint(request, _operation, unexpected_status=500)
 
 @server.PromptServer.instance.routes.post("/distributed/config/update_setting")
 async def update_setting_endpoint(request: web.Request) -> web.StreamResponse:
     """Updates a specific key in the settings object."""
-    try:
+    async def _operation() -> web.StreamResponse:
         data = await request.json()
         key = data.get("key")
         value = data.get("value")
@@ -260,13 +276,13 @@ async def update_setting_endpoint(request: web.Request) -> web.StreamResponse:
             config['settings'][key] = value
 
             return web.json_response({"status": "success", "message": f"Setting '{key}' updated."})
-    except Exception as e:
-        return await handle_api_error(request, e, 400)
+
+    return await run_authorized_endpoint(request, _operation, unexpected_status=500)
 
 @server.PromptServer.instance.routes.post("/distributed/config/update_master")
 async def update_master_endpoint(request: web.Request) -> web.StreamResponse:
     """Updates master configuration."""
-    try:
+    async def _operation() -> web.StreamResponse:
         data = await request.json()
         
         async with config_transaction() as config:
@@ -275,5 +291,5 @@ async def update_master_endpoint(request: web.Request) -> web.StreamResponse:
             _apply_field_patch(config['master'], data, _MASTER_FIELDS)
 
             return web.json_response({"status": "success", "message": "Master configuration updated."})
-    except Exception as e:
-        return await handle_api_error(request, e, 400)
+
+    return await run_authorized_endpoint(request, _operation, unexpected_status=500)

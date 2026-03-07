@@ -3,8 +3,6 @@ import time
 import uuid
 from typing import Any
 
-import server
-
 from ..utils.async_helpers import queue_prompt_payload
 from ..utils.config import load_config
 from ..utils.constants import (
@@ -15,8 +13,9 @@ from ..utils.constants import (
 )
 from ..utils.logging import debug_log, log
 from ..utils.network import build_master_url
+from ..utils.runtime_state import ensure_distributed_runtime_state, get_prompt_server_instance
 from ..utils.trace_logger import trace_debug
-from .schemas import parse_positive_float, parse_positive_int
+from .schemas import coerce_positive_float, coerce_positive_int
 from .orchestration.dispatch import (
     dispatch_worker_prompt,
     rank_workers_by_load,
@@ -33,33 +32,21 @@ from .orchestration.prompt_transform import (
     prune_prompt_for_worker,
 )
 
-
-prompt_server = server.PromptServer.instance
-
-
 def _generate_execution_trace_id():
     return f"exec_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
 
 
 def ensure_distributed_state(server_instance=None):
     """Ensure prompt_server has the state used by distributed queue orchestration."""
-    ps = server_instance or prompt_server
-    if not hasattr(ps, "distributed_pending_jobs"):
-        ps.distributed_pending_jobs = {}
-    if not hasattr(ps, "distributed_jobs_lock"):
-        ps.distributed_jobs_lock = asyncio.Lock()
-
-
-# Initialize top-level distributed queue state at module import time.
-ensure_distributed_state()
+    ensure_distributed_runtime_state(server_instance)
 
 
 async def _ensure_distributed_queue(job_id):
     """Ensure a queue exists for the given distributed job ID."""
-    ensure_distributed_state()
-    async with prompt_server.distributed_jobs_lock:
-        if job_id not in prompt_server.distributed_pending_jobs:
-            prompt_server.distributed_pending_jobs[job_id] = asyncio.Queue()
+    runtime_state = ensure_distributed_runtime_state()
+    async with runtime_state.distributed_jobs_lock:
+        if job_id not in runtime_state.distributed_pending_jobs:
+            runtime_state.distributed_pending_jobs[job_id] = asyncio.Queue()
 
 
 def _resolve_enabled_workers(config, requested_ids=None):
@@ -98,19 +85,19 @@ def _resolve_enabled_workers(config, requested_ids=None):
 def _resolve_orchestration_limits(config):
     """Resolve bounded concurrency/timeouts for worker preparation pipeline."""
     settings = (config or {}).get("settings", {}) or {}
-    worker_probe_concurrency = parse_positive_int(
+    worker_probe_concurrency = coerce_positive_int(
         settings.get("worker_probe_concurrency"),
         ORCHESTRATION_WORKER_PROBE_CONCURRENCY,
     )
-    worker_prep_concurrency = parse_positive_int(
+    worker_prep_concurrency = coerce_positive_int(
         settings.get("worker_prep_concurrency"),
         ORCHESTRATION_WORKER_PREP_CONCURRENCY,
     )
-    media_sync_concurrency = parse_positive_int(
+    media_sync_concurrency = coerce_positive_int(
         settings.get("media_sync_concurrency"),
         ORCHESTRATION_MEDIA_SYNC_CONCURRENCY,
     )
-    media_sync_timeout_seconds = parse_positive_float(
+    media_sync_timeout_seconds = coerce_positive_float(
         settings.get("media_sync_timeout_seconds"),
         ORCHESTRATION_MEDIA_SYNC_TIMEOUT,
     )
@@ -272,11 +259,18 @@ async def _select_execution_workers(
 def _distributed_queue_nodes(prompt_index):
     return (
         prompt_index.nodes_for_class("DistributedCollector")
-        + prompt_index.nodes_for_class("DistributedListCollector")
         + prompt_index.nodes_for_class("DistributedBranchCollector")
         + prompt_index.nodes_for_class("DistributedBranch")
         + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
     )
+
+
+def _register_job_allowed_workers(job_id_map, enabled_ids):
+    runtime_state = ensure_distributed_runtime_state()
+    allowed = {str(worker_id) for worker_id in (enabled_ids or []) if str(worker_id).strip()}
+    for job_id in job_id_map.values():
+        if job_id:
+            runtime_state.distributed_job_allowed_workers[str(job_id)] = set(allowed)
 
 
 async def _ensure_job_queues(prompt_index, job_id_map):
@@ -309,7 +303,6 @@ def _build_master_prompt(
 
     collector_ids = (
         find_nodes_by_class(master_prompt, "DistributedCollector")
-        + find_nodes_by_class(master_prompt, "DistributedListCollector")
         + find_nodes_by_class(master_prompt, "DistributedBranchCollector")
     )
     upscale_nodes = find_nodes_by_class(master_prompt, "UltimateSDUpscaleDistributed")
@@ -405,7 +398,7 @@ async def orchestrate_distributed_execution(
 
     config = load_config()
     use_websocket = bool(config.get("settings", {}).get("websocket_orchestration", False))
-    master_url = build_master_url(config=config, prompt_server_instance=prompt_server)
+    master_url = build_master_url(config=config, prompt_server_instance=get_prompt_server_instance())
     (
         worker_probe_concurrency,
         worker_prep_concurrency,
@@ -463,6 +456,7 @@ async def orchestrate_distributed_execution(
         prompt_id = await queue_prompt_payload(prompt_obj, workflow_meta, client_id)
         return prompt_id, 0
 
+    _register_job_allowed_workers(job_id_map, enabled_ids)
     await _ensure_job_queues(prompt_index, job_id_map)
 
     master_prompt = _build_master_prompt(

@@ -1,4 +1,3 @@
-import json
 import math
 from functools import wraps
 from typing import Any, Callable
@@ -18,6 +17,7 @@ from ..upscale.processing_args import UpscaleCoreArgs
 from ..upscale.modes.single_gpu import SingleGpuModeMixin
 from ..upscale.modes.static import StaticModeMixin
 from ..upscale.modes.dynamic import DynamicModeMixin
+from ..utils.worker_ids import coerce_enabled_worker_ids
 
 def sync_wrapper(async_func: Callable[..., Any]) -> Callable[..., Any]:
     """Decorator to wrap async methods for synchronous execution."""
@@ -30,21 +30,10 @@ def sync_wrapper(async_func: Callable[..., Any]) -> Callable[..., Any]:
         )
     return sync_func
 
-def _parse_enabled_worker_ids(enabled_worker_ids):
-    """Parse enabled worker IDs from either JSON or list input."""
-    if isinstance(enabled_worker_ids, list):
-        return [str(worker_id) for worker_id in enabled_worker_ids]
-    if not enabled_worker_ids:
-        return []
-    if isinstance(enabled_worker_ids, str):
-        try:
-            parsed = json.loads(enabled_worker_ids)
-        except json.JSONDecodeError:
-            log("USDU Dist: Invalid enabled_worker_ids JSON; defaulting to no workers.")
-            return []
-        if isinstance(parsed, list):
-            return [str(wid) for wid in parsed]
-    return []
+
+def _parse_enabled_worker_ids(enabled_worker_ids: str | list[str] | None) -> list[str]:
+    """Backward-compatible alias for enabled-worker normalization."""
+    return coerce_enabled_worker_ids(enabled_worker_ids)
 
 class UltimateSDUpscaleDistributed(
     DynamicModeMixin,
@@ -255,7 +244,7 @@ class UltimateSDUpscaleDistributed(
         
         # Ensure mode consistency across master/workers via shared threshold
         # Determine mode (must match master's logic)
-        enabled_workers = _parse_enabled_worker_ids(enabled_worker_ids)
+        enabled_workers = coerce_enabled_worker_ids(enabled_worker_ids)
         num_workers = len(enabled_workers)
         # Compute number of tiles for this image to decide if tile distribution makes sense
         _, height, width, _ = upscaled_image.shape
@@ -264,8 +253,8 @@ class UltimateSDUpscaleDistributed(
 
         mode = self._determine_processing_mode(batch_size, num_workers, dynamic_threshold)
         # For USDU-style processing, we want tile distribution whenever workers are available
-        # and there is more than one tile to process, even if batch == 1.
-        if num_workers > 0 and num_tiles_per_image > 1:
+        # and there is more than one tile to process for single-image runs.
+        if num_workers > 0 and batch_size <= 1 and num_tiles_per_image > 1:
             mode = "static"
             
         debug_log(f"USDU Dist Worker - Batch size {batch_size}")
@@ -324,14 +313,14 @@ class UltimateSDUpscaleDistributed(
         )
         
         # Parse enabled workers
-        enabled_workers = _parse_enabled_worker_ids(enabled_worker_ids)
+        enabled_workers = coerce_enabled_worker_ids(enabled_worker_ids)
         num_workers = len(enabled_workers)
         
         # Determine processing mode
         mode = self._determine_processing_mode(batch_size, num_workers, dynamic_threshold)
         # Prefer tile-based static distribution when workers are available and there are multiple tiles,
-        # even for batch == 1, to spread tiles across GPUs like the legacy dynamic tile queue.
-        if num_workers > 0 and num_tiles_per_image > 1:
+        # for single-image jobs to spread tiles across GPUs like the legacy tile queue.
+        if num_workers > 0 and batch_size <= 1 and num_tiles_per_image > 1:
             mode = "static"
         
         log(f"USDU Dist: Workers {num_workers} | Mode {mode} | Threshold {dynamic_threshold}")
@@ -370,17 +359,13 @@ class UltimateSDUpscaleDistributed(
                                                all_tiles, num_tiles_per_image)
 
     def _determine_processing_mode(self, batch_size: int, num_workers: int, dynamic_threshold: int) -> str:
-        """Determines processing mode per requested policy:
-        - any workers     => prefer static (tile-based) for USDU
-        - no workers      => single_gpu
-        """
+        """Determine mode from worker availability and configured threshold."""
         if num_workers == 0:
             return "single_gpu"
-        # Default to static when distributed; master/worker may still override if special cases arise
+        threshold = max(1, int(dynamic_threshold))
+        if int(batch_size) >= threshold:
+            return "dynamic"
         return "static"
-
-# Ensure initialization before registering routes
-ensure_tile_jobs_initialized()
 
 # Node registration
 NODE_CLASS_MAPPINGS = {

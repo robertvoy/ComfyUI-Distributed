@@ -3,6 +3,8 @@ import json
 from typing import Any
 
 from ..utils.logging import debug_log, log
+from ..utils.worker_ids import coerce_enabled_worker_ids, parse_worker_index, worker_value_key
+from .hidden_inputs import build_worker_identity_hidden_inputs
 
 
 def _chunk_bounds(total_items: int, n_splits: int) -> list[tuple[int, int]]:
@@ -40,8 +42,7 @@ class DistributedSeed:
                 }),
             },
             "hidden": {
-                "is_worker": ("BOOLEAN", {"default": False}),
-                "worker_id": ("STRING", {"default": ""}),
+                **build_worker_identity_hidden_inputs(),
             },
         }
     
@@ -55,30 +56,24 @@ class DistributedSeed:
         seed: int,
         is_worker: bool = False,
         worker_id: str = "",
+        enabled_worker_ids: str = "[]",
     ) -> tuple[int]:
         if not is_worker:
             # Master node: pass through original values
             debug_log(f"Distributor - Master: seed={seed}")
             return (seed,)
         else:
-            # Worker node: apply offset based on worker index
-            # Find worker index from enabled_worker_ids
-            try:
-                # Worker IDs are passed as "worker_0", "worker_1", etc.
-                if worker_id.startswith("worker_"):
-                    worker_index = int(worker_id.split("_")[1])
-                else:
-                    # Fallback: try to parse as direct index
-                    worker_index = int(worker_id)
-                
+            enabled_workers = coerce_enabled_worker_ids(enabled_worker_ids)
+            worker_index = parse_worker_index(worker_id, enabled_workers)
+            if worker_index is not None:
                 offset = worker_index + 1
                 new_seed = seed + offset
                 debug_log(f"Distributor - Worker {worker_index}: seed={seed} → {new_seed}")
                 return (new_seed,)
-            except (ValueError, IndexError) as e:
-                debug_log(f"Distributor - Error parsing worker_id '{worker_id}': {e}")
-                # Fallback: return original seed
-                return (seed,)
+
+            debug_log(f"Distributor - Error parsing worker_id '{worker_id}': no worker index resolved")
+            # Fallback: return original seed
+            return (seed,)
 
 
 # Define ByPassTypeTuple for flexible return types
@@ -105,8 +100,7 @@ class DistributedValue:
                 "worker_values": ("STRING", {"default": "{}"}),
             },
             "hidden": {
-                "is_worker": ("BOOLEAN", {"default": False}),
-                "worker_id": ("STRING", {"default": ""}),
+                **build_worker_identity_hidden_inputs(),
             },
         }
 
@@ -149,12 +143,14 @@ class DistributedValue:
         worker_values: str | dict[str, Any] = "{}",
         is_worker: bool = False,
         worker_id: str = "",
+        enabled_worker_ids: str = "[]",
     ) -> tuple[Any]:
         values = {}
         value_type = "STRING"
 
         try:
-            values = json.loads(worker_values) if isinstance(worker_values, str) else worker_values
+            raw_values = json.loads(worker_values) if isinstance(worker_values, str) else worker_values
+            values = dict(raw_values) if isinstance(raw_values, dict) else {}
             if not isinstance(values, dict):
                 values = {}
         except json.JSONDecodeError as e:
@@ -165,26 +161,23 @@ class DistributedValue:
         value_type = values.get("_type", inferred_type)
         if value_type not in {"STRING", "COMBO", "INT", "FLOAT"}:
             value_type = inferred_type
-        values["_type"] = value_type
         coerced_default = self._coerce_safe(default_value, value_type)
 
         if not is_worker:
             debug_log(f"DistributedValue - Master: returning default '{coerced_default}'")
             return (coerced_default,)
 
-        try:
-            if worker_id.startswith("worker_"):
-                idx = int(worker_id.split("_")[1])
-            else:
-                idx = int(worker_id)
-            key = str(idx + 1)  # worker_0 → key "1" (1-indexed)
-            raw = values.get(key, "")
-            if raw:
+        enabled_workers = coerce_enabled_worker_ids(enabled_worker_ids)
+        direct_key = str(worker_id).strip()
+        lookup_key = direct_key if direct_key in values else worker_value_key(worker_id, enabled_workers)
+        raw = values.get(lookup_key)
+        if raw is not None and raw != "":
+            try:
                 coerced = self._coerce(raw, value_type)
-                debug_log(f"DistributedValue - Worker {idx}: returning '{coerced}'")
+                debug_log(f"DistributedValue - Worker key {lookup_key}: returning '{coerced}'")
                 return (coerced,)
-        except (ValueError, IndexError) as e:
-            debug_log(f"DistributedValue - Error: {e}")
+            except (TypeError, ValueError) as e:
+                debug_log(f"DistributedValue - Error coercing worker value for key {lookup_key}: {e}")
         debug_log(f"DistributedValue - Worker fallback: returning default '{coerced_default}'")
         return (coerced_default,)
 

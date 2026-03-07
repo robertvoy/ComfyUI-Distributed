@@ -5,32 +5,22 @@ import types
 import unittest
 from pathlib import Path
 
+from tests.api.harness import (
+    bootstrap_test_package,
+    install_server_stub,
+)
+
 
 def _bootstrap_package(package_name):
-    for mod_name in list(sys.modules):
-        if mod_name == package_name or mod_name.startswith(f"{package_name}."):
-            del sys.modules[mod_name]
-
-    root_pkg = types.ModuleType(package_name)
-    root_pkg.__path__ = []
-    sys.modules[package_name] = root_pkg
-
-    api_pkg = types.ModuleType(f"{package_name}.api")
-    api_pkg.__path__ = []
-    sys.modules[f"{package_name}.api"] = api_pkg
-
-    orchestration_pkg = types.ModuleType(f"{package_name}.api.orchestration")
-    orchestration_pkg.__path__ = []
-    sys.modules[f"{package_name}.api.orchestration"] = orchestration_pkg
-
-    utils_pkg = types.ModuleType(f"{package_name}.utils")
-    utils_pkg.__path__ = []
-    sys.modules[f"{package_name}.utils"] = utils_pkg
+    bootstrap_test_package(
+        package_name,
+        with_api=True,
+        with_utils=True,
+        with_orchestration=True,
+    )
 
     prompt_server_instance = types.SimpleNamespace(address="127.0.0.1", port=8188)
-    server_module = types.ModuleType("server")
-    server_module.PromptServer = types.SimpleNamespace(instance=prompt_server_instance)
-    sys.modules["server"] = server_module
+    install_server_stub(prompt_server_instance)
 
     async_helpers_module = types.ModuleType(f"{package_name}.utils.async_helpers")
 
@@ -65,9 +55,37 @@ def _bootstrap_package(package_name):
     trace_logger_module.trace_debug = lambda *_args, **_kwargs: None
     sys.modules[f"{package_name}.utils.trace_logger"] = trace_logger_module
 
+    runtime_state_module = types.ModuleType(f"{package_name}.utils.runtime_state")
+
+    def _ensure_distributed_runtime_state(server_instance=None):
+        ps = server_instance or prompt_server_instance
+        if not hasattr(ps, "distributed_pending_jobs"):
+            ps.distributed_pending_jobs = {}
+        if not hasattr(ps, "distributed_jobs_lock"):
+            ps.distributed_jobs_lock = asyncio.Lock()
+        if not hasattr(ps, "distributed_job_allowed_workers"):
+            ps.distributed_job_allowed_workers = {}
+        if not hasattr(ps, "distributed_pending_tile_jobs"):
+            ps.distributed_pending_tile_jobs = {}
+        if not hasattr(ps, "distributed_tile_jobs_lock"):
+            ps.distributed_tile_jobs_lock = asyncio.Lock()
+        return types.SimpleNamespace(
+            distributed_pending_jobs=ps.distributed_pending_jobs,
+            distributed_jobs_lock=ps.distributed_jobs_lock,
+            distributed_job_allowed_workers=ps.distributed_job_allowed_workers,
+            distributed_pending_tile_jobs=ps.distributed_pending_tile_jobs,
+            distributed_tile_jobs_lock=ps.distributed_tile_jobs_lock,
+        )
+
+    runtime_state_module.ensure_distributed_runtime_state = _ensure_distributed_runtime_state
+    runtime_state_module.get_prompt_server_instance = lambda: prompt_server_instance
+    sys.modules[f"{package_name}.utils.runtime_state"] = runtime_state_module
+
     schemas_module = types.ModuleType(f"{package_name}.api.schemas")
-    schemas_module.parse_positive_int = lambda value, default: int(value) if str(value).isdigit() and int(value) > 0 else default
-    schemas_module.parse_positive_float = (
+    schemas_module.coerce_positive_int = (
+        lambda value, default: int(value) if str(value).isdigit() and int(value) > 0 else default
+    )
+    schemas_module.coerce_positive_float = (
         lambda value, default: float(value) if isinstance(value, (int, float, str)) and float(value) > 0 else default
     )
     sys.modules[f"{package_name}.api.schemas"] = schemas_module

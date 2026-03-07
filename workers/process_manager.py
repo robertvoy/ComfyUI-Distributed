@@ -5,10 +5,11 @@ from .process.root_discovery import ComfyRootDiscovery
 
 
 class WorkerProcessManager:
-    """Thin composition wrapper around worker process subsystems."""
+    """Worker process service composed from launch, lifecycle, and persistence subsystems."""
 
     def __init__(self):
         self.processes = {}
+        self.queues = {}
         self._root_discovery = ComfyRootDiscovery()
         self._launch_builder = LaunchCommandBuilder()
         self._lifecycle = ProcessLifecycle(self)
@@ -17,9 +18,6 @@ class WorkerProcessManager:
 
     def find_comfy_root(self):
         return self._root_discovery.find_comfy_root()
-
-    def _find_windows_terminal(self):
-        return self._launch_builder._find_windows_terminal()
 
     def build_launch_command(self, worker_config, comfy_root):
         return self._launch_builder.build_launch_command(worker_config, comfy_root)
@@ -42,11 +40,11 @@ class WorkerProcessManager:
     def save_processes(self):
         return self._persistence.save_processes()
 
-    def _is_process_running(self, pid):
+    def is_process_running(self, pid):
         return self._lifecycle._is_process_running(pid)
 
-    def _check_worker_process(self, worker_id, proc_info):
+    def check_worker_process(self, worker_id, proc_info):
         return self._lifecycle._check_worker_process(worker_id, proc_info)
 
-    def _kill_process_tree(self, pid):
+    def kill_process_tree(self, pid):
         return self._lifecycle._kill_process_tree(pid)

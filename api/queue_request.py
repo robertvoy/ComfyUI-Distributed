@@ -1,27 +1,26 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
+
+try:
+    from ..utils.worker_ids import require_enabled_worker_ids
+except ImportError:  # pragma: no cover - supports direct module loading in isolated tests.
+    from utils.worker_ids import require_enabled_worker_ids
 
 
 @dataclass(frozen=True)
 class QueueRequestPayload:
-    prompt: Dict[str, Any]
-    workflow_meta: Any
+    prompt: dict[str, Any]
+    workflow_meta: dict[str, Any] | None
     client_id: str
-    delegate_master: Optional[bool]
-    enabled_worker_ids: List[str]
-    auto_prepare: bool
-    trace_execution_id: Optional[str]
+    delegate_master: bool | None
+    enabled_worker_ids: list[str]
+    trace_execution_id: str | None
 
 
 def parse_queue_request_payload(data: Any) -> QueueRequestPayload:
     """Parse and validate /distributed/queue payload into a normalized shape."""
     if not isinstance(data, dict):
         raise ValueError("Expected a JSON object body")
-
-    auto_prepare_raw = data.get("auto_prepare", True)
-    if not isinstance(auto_prepare_raw, bool):
-        raise ValueError("auto_prepare must be a boolean when provided")
-    auto_prepare = auto_prepare_raw
 
     prompt = data.get("prompt")
     # Auto-prepare is always on server-side; keep the field for wire compatibility.
@@ -34,6 +33,10 @@ def parse_queue_request_payload(data: Any) -> QueueRequestPayload:
 
     if not isinstance(prompt, dict):
         raise ValueError("Field 'prompt' must be an object")
+
+    workflow_meta = data.get("workflow")
+    if workflow_meta is not None and not isinstance(workflow_meta, dict):
+        raise ValueError("Field 'workflow' must be an object when provided")
 
     enabled_ids_raw = data.get("enabled_worker_ids")
     workers_field = data.get("workers")
@@ -51,7 +54,10 @@ def parse_queue_request_payload(data: Any) -> QueueRequestPayload:
     else:
         if not isinstance(enabled_ids_raw, list):
             raise ValueError("enabled_worker_ids must be a list of worker IDs")
-        enabled_ids = [str(worker_id).strip() for worker_id in enabled_ids_raw if str(worker_id).strip()]
+        try:
+            enabled_ids = require_enabled_worker_ids(enabled_ids_raw)
+        except ValueError as exc:
+            raise ValueError(f"enabled_worker_ids invalid: {exc}") from exc
 
     delegate_master = data.get("delegate_master")
     if delegate_master is not None and not isinstance(delegate_master, bool):
@@ -70,10 +76,9 @@ def parse_queue_request_payload(data: Any) -> QueueRequestPayload:
 
     return QueueRequestPayload(
         prompt=prompt,
-        workflow_meta=data.get("workflow"),
+        workflow_meta=workflow_meta,
         client_id=client_id,
         delegate_master=delegate_master,
         enabled_worker_ids=enabled_ids,
-        auto_prepare=auto_prepare,
         trace_execution_id=trace_execution_id,
     )

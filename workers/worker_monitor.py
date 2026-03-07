@@ -6,53 +6,17 @@ and terminates the worker if the master dies.
 import os
 import sys
 import time
-import subprocess
 import platform
 import signal
 from typing import Any
 
 try:
+    from ..utils.process import is_process_alive, launch_process_with_timeout, terminate_process
+    from ..utils.constants import WORKER_CHECK_INTERVAL, PROCESS_TERMINATION_TIMEOUT
+except ImportError:
+    # Fallback when executed as a standalone script.
     from utils.process import is_process_alive, launch_process_with_timeout, terminate_process
     from utils.constants import WORKER_CHECK_INTERVAL, PROCESS_TERMINATION_TIMEOUT
-except ImportError:
-    # Fallback if running from different context
-    def is_process_alive(pid: int | str) -> bool:
-        """Best-effort fallback process liveness probe."""
-        try:
-            pid = int(pid)
-        except (TypeError, ValueError):
-            return False
-
-        if os.name == "nt":
-            try:
-                output = subprocess.check_output(
-                    ["tasklist", "/FI", f"PID eq {pid}"],
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    timeout=5.0,
-                )
-            except Exception:
-                return False
-            return str(pid) in output
-
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-    
-    def launch_process_with_timeout(
-        command: list[str],
-        timeout_seconds: float = 10.0,
-        **kwargs: Any,
-    ):
-        _ = kwargs
-        raise RuntimeError(
-            "launch_process_with_timeout unavailable: utils.process import failed"
-        )
-
-    WORKER_CHECK_INTERVAL = 2.0
-    PROCESS_TERMINATION_TIMEOUT = 5.0
 
 def monitor_and_run(master_pid: int, command: list[str]) -> int:
     """Run command and monitor master process; return process exit code."""
@@ -98,15 +62,8 @@ def monitor_and_run(master_pid: int, command: list[str]) -> int:
         if worker_process.poll() is None:  # Still running
             try:
                 terminate_process(worker_process, timeout=PROCESS_TERMINATION_TIMEOUT)
-            except NameError:
-                # Fallback if terminate_process wasn't imported
-                worker_process.terminate()
-                try:
-                    worker_process.wait(timeout=PROCESS_TERMINATION_TIMEOUT)
-                except subprocess.TimeoutExpired:
-                    print("[Distributed] Worker didn't terminate gracefully, forcing kill...")
-                    worker_process.kill()
-                    worker_process.wait()
+            except TimeoutError:
+                print("[Distributed] Worker did not terminate within timeout.")
         
         print("[Distributed] Worker terminated.")
 

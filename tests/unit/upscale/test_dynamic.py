@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
@@ -67,6 +68,8 @@ def _bootstrap_package(package_name):
     sys.modules[f"{package_name}.utils.config"] = config_module
 
     constants_module = types.ModuleType(f"{package_name}.utils.constants")
+    constants_module.JOB_POLL_INTERVAL = 0.0
+    constants_module.JOB_POLL_MAX_ATTEMPTS = 3
     constants_module.TILE_WAIT_TIMEOUT = 5.0
     constants_module.TILE_SEND_TIMEOUT = 5.0
     sys.modules[f"{package_name}.utils.constants"] = constants_module
@@ -110,6 +113,7 @@ def _load_dynamic_mode_module():
     package_name = "dist_dynamic_mode_testpkg"
     _bootstrap_package(package_name)
     _load_module(package_name, "upscale/processing_args.py", "upscale.processing_args")
+    _load_module(package_name, "upscale/mode_contexts.py", "upscale.mode_contexts")
     return _load_module(package_name, "upscale/modes/dynamic.py", "upscale.modes.dynamic")
 
 
@@ -143,24 +147,33 @@ class _DummyDynamicNode(dynamic_module.DynamicModeMixin):
     def _poll_job_ready(self, *_args, **_kwargs):
         return self._poll_ready
 
-    async def _request_image_from_master(self, *_args, **_kwargs):
-        if self._assignments:
-            return self._assignments.pop(0)
-        return (None, 0)
+    async def check_job_status(self, *_args, **_kwargs):
+        return self._poll_ready
 
-    def _slice_conditioning(self, positive, negative, _image_idx):
+    async def request_assignment(self, *_args, **_kwargs):
+        if self._assignments:
+            image_idx, estimated_remaining = self._assignments.pop(0)
+            return SimpleNamespace(
+                kind="image" if image_idx is not None else "none",
+                task_idx=image_idx,
+                estimated_remaining=estimated_remaining,
+                batched_static=False,
+            )
+        return SimpleNamespace(kind="none", task_idx=None, estimated_remaining=0, batched_static=False)
+
+    def slice_conditioning(self, positive, negative, _image_idx):
         return positive, negative
 
-    def _process_and_blend_tile(self, _tile_idx, _pos, _source_tensor, local_image, *_args, **_kwargs):
+    def process_and_blend_tile(self, _tile_idx, _pos, _source_tensor, local_image, *_args, **_kwargs):
         return local_image
 
-    async def _send_heartbeat_to_master(self, *_args, **_kwargs):
+    async def send_heartbeat(self, *_args, **_kwargs):
         self.heartbeat_count += 1
 
-    async def _send_full_image_to_master(self, local_image, image_idx, _multi_job_id, _master_url, _worker_id, is_last):
+    async def send_full_image(self, local_image, image_idx, _multi_job_id, _master_url, _worker_id, is_last):
         self.sent_images.append((image_idx, is_last, local_image.size))
 
-    async def _send_worker_complete_signal(self, *_args, **_kwargs):
+    async def send_worker_complete_signal(self, *_args, **_kwargs):
         self.completion_sent = True
 
 

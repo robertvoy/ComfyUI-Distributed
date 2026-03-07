@@ -4,6 +4,14 @@ import types
 import unittest
 from pathlib import Path
 
+from tests.api.harness import (
+    bootstrap_test_package,
+    install_aiohttp_stub,
+    install_endpoint_policy_passthrough_stub,
+    install_request_guards_stub,
+    install_server_stub,
+)
+
 
 class _FakeResponse:
     def __init__(self, payload, status=200):
@@ -15,38 +23,9 @@ def _load_tunnel_routes_module():
     module_path = Path(__file__).resolve().parents[2] / "api" / "tunnel_routes.py"
     package_name = "dist_tunnel_routes_testpkg"
 
-    for mod_name in list(sys.modules):
-        if mod_name == package_name or mod_name.startswith(f"{package_name}."):
-            del sys.modules[mod_name]
-
-    root_pkg = types.ModuleType(package_name)
-    root_pkg.__path__ = []
-    sys.modules[package_name] = root_pkg
-
-    api_pkg = types.ModuleType(f"{package_name}.api")
-    api_pkg.__path__ = []
-    sys.modules[f"{package_name}.api"] = api_pkg
-
-    utils_pkg = types.ModuleType(f"{package_name}.utils")
-    utils_pkg.__path__ = []
-    sys.modules[f"{package_name}.utils"] = utils_pkg
-
-    class _Routes:
-        def get(self, _path):
-            return lambda fn: fn
-
-        def post(self, _path):
-            return lambda fn: fn
-
-    server_module = types.ModuleType("server")
-    server_module.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(routes=_Routes()))
-    sys.modules["server"] = server_module
-
-    aiohttp_module = types.ModuleType("aiohttp")
-    aiohttp_module.web = types.SimpleNamespace(
-        json_response=lambda payload, status=200: _FakeResponse(payload, status=status)
-    )
-    sys.modules["aiohttp"] = aiohttp_module
+    bootstrap_test_package(package_name, with_api=True, with_utils=True)
+    install_server_stub()
+    install_aiohttp_stub(lambda payload, status=200: _FakeResponse(payload, status=status))
 
     cloudflare_module = types.ModuleType(f"{package_name}.utils.cloudflare")
 
@@ -79,6 +58,9 @@ def _load_tunnel_routes_module():
 
     network_module.handle_api_error = _handle_api_error
     sys.modules[f"{package_name}.utils.network"] = network_module
+
+    install_request_guards_stub(package_name)
+    install_endpoint_policy_passthrough_stub(package_name)
 
     spec = importlib.util.spec_from_file_location(f"{package_name}.api.tunnel_routes", module_path)
     module = importlib.util.module_from_spec(spec)

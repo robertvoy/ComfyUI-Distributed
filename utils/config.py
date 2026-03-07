@@ -9,10 +9,16 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
-from .logging import log
 
 # Import defaults for timeout fallbacks
-from .constants import GPU_CONFIG_FILE, HEARTBEAT_TIMEOUT
+from .constants import (
+    GPU_CONFIG_FILE,
+    HEARTBEAT_TIMEOUT,
+    ORCHESTRATION_MEDIA_SYNC_CONCURRENCY,
+    ORCHESTRATION_MEDIA_SYNC_TIMEOUT,
+    ORCHESTRATION_WORKER_PREP_CONCURRENCY,
+    ORCHESTRATION_WORKER_PROBE_CONCURRENCY,
+)
 
 CONFIG_FILE = GPU_CONFIG_FILE
 
@@ -36,6 +42,11 @@ def _config_lock() -> asyncio.Lock:
 def _config_path() -> str:
     return CONFIG_FILE
 
+
+def _log(message: str) -> None:
+    print(f"[Distributed] {message}")
+
+
 def get_default_config() -> dict[str, Any]:
     """Returns the default configuration dictionary. Single source of truth."""
     return {
@@ -47,10 +58,10 @@ def get_default_config() -> dict[str, Any]:
             "stop_workers_on_master_exit": True,
             "master_delegate_only": False,
             "websocket_orchestration": True,
-            "worker_probe_concurrency": 8,
-            "worker_prep_concurrency": 4,
-            "media_sync_concurrency": 2,
-            "media_sync_timeout_seconds": 120
+            "worker_probe_concurrency": ORCHESTRATION_WORKER_PROBE_CONCURRENCY,
+            "worker_prep_concurrency": ORCHESTRATION_WORKER_PREP_CONCURRENCY,
+            "media_sync_concurrency": ORCHESTRATION_MEDIA_SYNC_CONCURRENCY,
+            "media_sync_timeout_seconds": ORCHESTRATION_MEDIA_SYNC_TIMEOUT,
         },
         "tunnel": {
             "status": "stopped",
@@ -107,7 +118,7 @@ def load_config() -> dict[str, Any]:
                 loaded = json.load(f)
             state.cache = _merge_with_defaults(loaded, get_default_config())
         except Exception as e:
-            log(f"Error loading config, using defaults: {e}")
+            _log(f"Error loading config, using defaults: {e}")
             state.cache = get_default_config()
         state.mtime = mtime
 
@@ -128,8 +139,8 @@ def save_config(config: dict[str, Any]) -> bool:
         try:
             os.unlink(tmp_path)
         except OSError as cleanup_error:
-            log(f"Error removing temporary config file '{tmp_path}': {cleanup_error}")
-        log(f"Error saving config: {e}")
+            _log(f"Error removing temporary config file '{tmp_path}': {cleanup_error}")
+        _log(f"Error saving config: {e}")
         return False
 
 
@@ -149,11 +160,8 @@ def ensure_config_exists() -> None:
     """Creates default config file if it doesn't exist. Used by __init__.py"""
     if not os.path.exists(_config_path()):
         default_config = get_default_config()
-        if save_config(default_config):
-            from .logging import debug_log
-            debug_log("Created default config file")
-        else:
-            log("Could not create default config file")
+        if not save_config(default_config):
+            _log("Could not create default config file")
 
 def get_worker_timeout_seconds(default: int = HEARTBEAT_TIMEOUT) -> int:
     """Return the unified worker timeout (seconds).
@@ -181,3 +189,12 @@ def is_master_delegate_only() -> bool:
         return bool(cfg.get('settings', {}).get('master_delegate_only', False))
     except Exception:
         return False
+
+
+def get_debug_enabled(default: bool = False) -> bool:
+    """Return whether distributed debug logging is enabled in config settings."""
+    try:
+        cfg = load_config()
+        return bool(cfg.get("settings", {}).get("debug", default))
+    except Exception:
+        return bool(default)

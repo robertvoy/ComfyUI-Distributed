@@ -332,11 +332,10 @@ def prune_prompt_for_branch_worker(
 def prune_prompt_for_worker(prompt_obj: dict[str, Any]) -> dict[str, Any]:
     """Prune worker prompt to distributed nodes and their upstream dependencies."""
     collector_ids = find_nodes_by_class(prompt_obj, "DistributedCollector")
-    list_collector_ids = find_nodes_by_class(prompt_obj, "DistributedListCollector")
     branch_collector_ids = find_nodes_by_class(prompt_obj, "DistributedBranchCollector")
     upscale_ids = find_nodes_by_class(prompt_obj, "UltimateSDUpscaleDistributed")
     branch_ids = find_nodes_by_class(prompt_obj, "DistributedBranch")
-    distributed_ids = collector_ids + list_collector_ids + branch_collector_ids + upscale_ids + branch_ids
+    distributed_ids = collector_ids + branch_collector_ids + upscale_ids + branch_ids
     if not distributed_ids:
         return prompt_obj
 
@@ -439,8 +438,6 @@ def generate_job_id_map(prompt_index: PromptIndex, prefix: str) -> dict[str, str
     job_map = {}
     distributed_nodes = (
         prompt_index.nodes_for_class("DistributedCollector")
-        + prompt_index.nodes_for_class("DistributedListSplitter")
-        + prompt_index.nodes_for_class("DistributedListCollector")
         + prompt_index.nodes_for_class("DistributedBranchCollector")
         + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
         + prompt_index.nodes_for_class("DistributedBranch")
@@ -450,7 +447,7 @@ def generate_job_id_map(prompt_index: PromptIndex, prefix: str) -> dict[str, str
     return job_map
 
 
-def _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map):
+def _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id):
     """Configure DistributedSeed nodes for master or worker role."""
     for node_id in prompt_index.nodes_for_class("DistributedSeed"):
         node = prompt_copy.get(node_id)
@@ -461,7 +458,7 @@ def _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, w
         if is_master:
             inputs["worker_id"] = ""
         else:
-            inputs["worker_id"] = f"worker_{worker_index_map.get(participant_id, 0)}"
+            inputs["worker_id"] = str(participant_id)
 
 
 def _override_collector_nodes(
@@ -524,7 +521,7 @@ def _override_upscale_nodes(
             inputs["worker_id"] = participant_id
 
 
-def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map):
+def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id):
     """Configure DistributedValue nodes for master or worker role."""
     for node_id in prompt_index.nodes_for_class("DistributedValue"):
         node = prompt_copy.get(node_id)
@@ -535,74 +532,7 @@ def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, 
         if is_master:
             inputs["worker_id"] = ""
         else:
-            inputs["worker_id"] = f"worker_{worker_index_map.get(participant_id, 0)}"
-
-
-def _override_list_splitter_nodes(
-    prompt_copy,
-    prompt_index,
-    is_master,
-    participant_id,
-    enabled_worker_ids,
-    job_id_map,
-    master_url,
-    delegate_master,
-):
-    """Configure participant chunk mapping for DistributedListSplitter nodes."""
-    participants = _resolve_participants(enabled_worker_ids, delegate_master)
-    total_participants = max(1, len(participants))
-    participant_id = str(participant_id)
-
-    if participant_id in participants:
-        participant_index = participants.index(participant_id)
-    else:
-        participant_index = 0
-
-    for node_id in prompt_index.nodes_for_class("DistributedListSplitter"):
-        node = prompt_copy.get(node_id)
-        if not isinstance(node, dict):
-            continue
-        inputs = node.setdefault("inputs", {})
-        inputs["participant_index"] = participant_index
-        inputs["total_participants"] = total_participants
-        inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
-        inputs["is_worker"] = not is_master
-        if is_master:
-            inputs.pop("master_url", None)
-            inputs["worker_id"] = "master"
-        else:
-            inputs["master_url"] = master_url
-            inputs["worker_id"] = participant_id
-
-
-def _override_list_collector_nodes(
-    prompt_copy,
-    prompt_index,
-    is_master,
-    participant_id,
-    job_id_map,
-    master_url,
-    enabled_json,
-    delegate_master,
-):
-    """Configure DistributedListCollector nodes for master/worker role."""
-    for node_id in prompt_index.nodes_for_class("DistributedListCollector"):
-        node = prompt_copy.get(node_id)
-        if not isinstance(node, dict):
-            continue
-
-        inputs = node.setdefault("inputs", {})
-        inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
-        inputs["is_worker"] = not is_master
-        inputs["enabled_worker_ids"] = enabled_json
-        if is_master:
-            inputs["delegate_only"] = bool(delegate_master)
-            inputs.pop("master_url", None)
-            inputs.pop("worker_id", None)
-        else:
-            inputs["master_url"] = master_url
             inputs["worker_id"] = str(participant_id)
-            inputs["delegate_only"] = False
 
 
 def _override_branch_nodes(
@@ -740,32 +670,11 @@ def apply_participant_overrides(
 ) -> dict[str, Any]:
     """Return a prompt copy with hidden inputs configured for master/worker."""
     is_master = participant_id == "master"
-    worker_index_map = {wid: idx for idx, wid in enumerate(enabled_worker_ids)}
     enabled_json = json.dumps(enabled_worker_ids)
 
-    _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map)
-    _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map)
-    _override_list_splitter_nodes(
-        prompt_copy,
-        prompt_index,
-        is_master,
-        participant_id,
-        enabled_worker_ids,
-        job_id_map,
-        master_url,
-        delegate_master,
-    )
+    _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id)
+    _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id)
     _override_collector_nodes(
-        prompt_copy,
-        prompt_index,
-        is_master,
-        participant_id,
-        job_id_map,
-        master_url,
-        enabled_json,
-        delegate_master,
-    )
-    _override_list_collector_nodes(
         prompt_copy,
         prompt_index,
         is_master,

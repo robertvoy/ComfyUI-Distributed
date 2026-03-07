@@ -158,7 +158,7 @@ Accelerate Ultimate SD Upscaler by distributing video tiles across multiple work
 Control your distributed cluster programmatically without opening the browser.
 
 * **Endpoint:** `POST /distributed/queue`
-* **Functionality:** Accepts a standard ComfyUI workflow JSON, automatically distributes it to available workers, and returns the execution ID.
+* **Functionality:** Accepts a distributed queue payload (`prompt`, `client_id`, `enabled_worker_ids`, optional `workflow`/`delegate_master`/`trace_execution_id`), dispatches to healthy workers, and returns `{prompt_id, worker_count}`.
 * **Documentation:** [See API Examples & Scripts](https://github.com/robertvoy/ComfyUI-Distributed/blob/main/docs/comfyui-distributed-api.md)
 
 > **⚠️ Security Warning:** Do not expose your ComfyUI port to the public internet. If you need remote access, run ComfyUI behind a secure proxy (like Cloudflare or a VPN).

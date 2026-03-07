@@ -4,6 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -166,6 +167,16 @@ def _load_static_mode_module():
     sys.modules[tile_processing_spec.name] = tile_processing_module
     tile_processing_spec.loader.exec_module(tile_processing_module)
 
+    mode_contexts_path = Path(__file__).resolve().parents[3] / "upscale" / "mode_contexts.py"
+    mode_contexts_spec = importlib.util.spec_from_file_location(
+        f"{package_name}.upscale.mode_contexts",
+        mode_contexts_path,
+    )
+    mode_contexts_module = importlib.util.module_from_spec(mode_contexts_spec)
+    assert mode_contexts_spec is not None and mode_contexts_spec.loader is not None
+    sys.modules[mode_contexts_spec.name] = mode_contexts_module
+    mode_contexts_spec.loader.exec_module(mode_contexts_module)
+
     spec = importlib.util.spec_from_file_location(f"{package_name}.upscale.modes.static", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
@@ -198,14 +209,20 @@ class _FakeStaticWorker(static_mode.StaticModeMixin):
     def _poll_job_ready(self, *_args, **_kwargs):
         return self.job_ready
 
-    async def _request_tile_from_master(self, *_args, **_kwargs):
+    async def request_assignment(self, *_args, **_kwargs):
         self.request_calls += 1
-        return self.tile_sequence.pop(0)
+        tile_idx, estimated_remaining, batched_static = self.tile_sequence.pop(0)
+        return SimpleNamespace(
+            kind="tile" if tile_idx is not None else "none",
+            task_idx=tile_idx,
+            estimated_remaining=estimated_remaining,
+            batched_static=batched_static,
+        )
 
-    async def _send_heartbeat_to_master(self, *_args, **_kwargs):
+    async def send_heartbeat(self, *_args, **_kwargs):
         self.heartbeat_calls += 1
 
-    async def send_tiles_batch_to_master(
+    async def send_tiles_batch(
         self,
         processed_tiles,
         _multi_job_id,

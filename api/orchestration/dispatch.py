@@ -5,26 +5,12 @@ from typing import Any
 
 import aiohttp
 
+from ...utils.auth import distributed_auth_headers
+from ...utils.config import load_config
 from ...utils.logging import debug_log, log
 from ...utils.network import build_worker_url, get_client_session, probe_worker
-try:
-    from ...utils.trace_logger import trace_debug, trace_info
-except ImportError:
-    def _trace_fallback(_execution_id: str, message: str) -> None:
-        debug_log(message)
-
-    trace_debug = _trace_fallback
-    trace_info = _trace_fallback
-
-try:
-    from ..schemas import parse_positive_int
-except ImportError:
-    def parse_positive_int(value, default):
-        try:
-            parsed = int(value)
-            return parsed if parsed > 0 else default
-        except (TypeError, ValueError):
-            return default
+from ...utils.trace_logger import trace_debug, trace_info
+from ..schemas import coerce_positive_int
 
 _least_busy_rr_index = 0
 
@@ -39,8 +25,9 @@ async def worker_ws_is_active(worker: dict[str, Any]) -> bool:
     """Ping worker's websocket endpoint to confirm it's reachable."""
     session = await get_client_session()
     url = build_worker_url(worker, "/distributed/worker_ws")
+    headers = distributed_auth_headers(load_config())
     try:
-        ws = await session.ws_connect(url, heartbeat=20, timeout=3)
+        ws = await session.ws_connect(url, heartbeat=20, timeout=3, headers=headers)
         await ws.close()
         return True
     except asyncio.TimeoutError:
@@ -60,7 +47,13 @@ async def _probe_worker_active(worker, use_websocket, semaphore):
         return worker, is_active
 
 
-async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
+async def _dispatch_via_websocket(
+    worker_url,
+    payload,
+    client_id,
+    headers: dict[str, str],
+    timeout=60.0,
+):
     """Open a fresh worker websocket, dispatch one prompt, wait for ack, then close."""
     request_id = uuid.uuid4().hex
     ws_payload = {
@@ -74,7 +67,12 @@ async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
     ws_url = f"{ws_url}/distributed/worker_ws"
     session = await get_client_session()
 
-    async with session.ws_connect(ws_url, heartbeat=20, timeout=timeout) as ws:
+    async with session.ws_connect(
+        ws_url,
+        heartbeat=20,
+        timeout=timeout,
+        headers=headers,
+    ) as ws:
         await ws.send_json(ws_payload)
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
@@ -115,6 +113,7 @@ async def dispatch_worker_prompt(
         payload["extra_data"] = extra_data
 
     if use_websocket:
+        ws_headers = distributed_auth_headers(load_config())
         try:
             await _dispatch_via_websocket(
                 worker_url,
@@ -123,6 +122,7 @@ async def dispatch_worker_prompt(
                     "workflow": workflow_meta,
                 },
                 client_id,
+                ws_headers,
             )
             return
         except Exception as exc:
@@ -150,7 +150,7 @@ async def select_active_workers(
     probe_concurrency: int = 8,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Probe workers and return (active_workers, updated_delegate_master)."""
-    probe_limit = parse_positive_int(probe_concurrency, 8)
+    probe_limit = coerce_positive_int(probe_concurrency, 8)
     probe_semaphore = asyncio.Semaphore(probe_limit)
 
     if trace_execution_id and workers:
@@ -233,7 +233,7 @@ async def select_least_busy_worker(
     if not workers:
         return None
 
-    probe_limit = parse_positive_int(probe_concurrency, 8)
+    probe_limit = coerce_positive_int(probe_concurrency, 8)
     probe_semaphore = asyncio.Semaphore(probe_limit)
     statuses = await asyncio.gather(
         *[
@@ -279,7 +279,7 @@ async def rank_workers_by_load(
     if not workers:
         return []
 
-    probe_limit = parse_positive_int(probe_concurrency, 8)
+    probe_limit = coerce_positive_int(probe_concurrency, 8)
     probe_semaphore = asyncio.Semaphore(probe_limit)
     statuses = await asyncio.gather(
         *[

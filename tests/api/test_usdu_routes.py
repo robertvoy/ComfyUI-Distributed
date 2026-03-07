@@ -9,6 +9,14 @@ from pathlib import Path
 
 from PIL import Image
 
+from tests.api.harness import (
+    bootstrap_test_package,
+    cleanup_optional_module,
+    install_aiohttp_stub,
+    install_request_guards_stub,
+    install_server_stub,
+)
+
 
 class _FakeResponse:
     def __init__(self, payload, status=200):
@@ -30,43 +38,30 @@ class _FakeRequest:
         return self._post_payload
 
 
-class _Routes:
-    def post(self, _path):
-        def _decorator(fn):
-            return fn
-
-        return _decorator
-
-    def get(self, _path):
-        def _decorator(fn):
-            return fn
-
-        return _decorator
-
-
 def _load_usdu_routes_module():
     module_path = Path(__file__).resolve().parents[2] / "api" / "usdu_routes.py"
     package_name = "dist_api_usdu_testpkg"
 
-    for mod_name in list(sys.modules):
-        if mod_name == package_name or mod_name.startswith(f"{package_name}."):
-            del sys.modules[mod_name]
+    bootstrap_test_package(package_name, with_api=True, with_utils=True, with_upscale=True)
 
-    root_pkg = types.ModuleType(package_name)
-    root_pkg.__path__ = []
-    sys.modules[package_name] = root_pkg
+    schemas_module = types.ModuleType(f"{package_name}.api.schemas")
 
-    api_pkg = types.ModuleType(f"{package_name}.api")
-    api_pkg.__path__ = []
-    sys.modules[f"{package_name}.api"] = api_pkg
+    def _require_bool_literal(value, field_name: str = "value"):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == "true":
+                return True
+            if normalized == "false":
+                return False
+        raise ValueError(f"Field '{field_name}' must be a boolean literal.")
 
-    upscale_pkg = types.ModuleType(f"{package_name}.upscale")
-    upscale_pkg.__path__ = []
-    sys.modules[f"{package_name}.upscale"] = upscale_pkg
+    schemas_module.require_bool_literal = _require_bool_literal
+    schemas_module.is_authorized_request = lambda _request, _config: True
+    sys.modules[f"{package_name}.api.schemas"] = schemas_module
 
-    utils_pkg = types.ModuleType(f"{package_name}.utils")
-    utils_pkg.__path__ = []
-    sys.modules[f"{package_name}.utils"] = utils_pkg
+    install_request_guards_stub(package_name)
 
     prompt_server_holder = {
         "value": types.SimpleNamespace(
@@ -75,22 +70,22 @@ def _load_usdu_routes_module():
         )
     }
 
-    created_aiohttp_stub = False
-    if "aiohttp" not in sys.modules:
-        created_aiohttp_stub = True
-        aiohttp_module = types.ModuleType("aiohttp")
-        aiohttp_module.web = types.SimpleNamespace(
-            json_response=lambda payload, status=200: _FakeResponse(payload, status=status)
-        )
-        sys.modules["aiohttp"] = aiohttp_module
-
-    server_module = types.ModuleType("server")
-    server_module.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(routes=_Routes()))
-    sys.modules["server"] = server_module
+    created_aiohttp_stub = install_aiohttp_stub(
+        lambda payload, status=200: _FakeResponse(payload, status=status)
+    )
+    install_server_stub()
 
     logging_module = types.ModuleType(f"{package_name}.utils.logging")
     logging_module.debug_log = lambda *_args, **_kwargs: None
     sys.modules[f"{package_name}.utils.logging"] = logging_module
+
+    config_module = types.ModuleType(f"{package_name}.utils.config")
+    config_module.load_config = lambda: {"settings": {}}
+    sys.modules[f"{package_name}.utils.config"] = config_module
+
+    usdu_management_module = types.ModuleType(f"{package_name}.utils.usdu_management")
+    usdu_management_module.MAX_PAYLOAD_SIZE = 1024
+    sys.modules[f"{package_name}.utils.usdu_management"] = usdu_management_module
 
     network_module = types.ModuleType(f"{package_name}.utils.network")
 
@@ -174,8 +169,7 @@ def _load_usdu_routes_module():
     assert spec is not None and spec.loader is not None
     spec.loader.exec_module(module)
 
-    if created_aiohttp_stub:
-        sys.modules.pop("aiohttp", None)
+    cleanup_optional_module("aiohttp", created_aiohttp_stub)
 
     module.web = types.SimpleNamespace(
         json_response=lambda payload, status=200: _FakeResponse(payload, status=status)
@@ -238,7 +232,8 @@ class USDURoutesTests(unittest.IsolatedAsyncioTestCase):
         response = await usdu_routes.request_image_endpoint(request)
 
         self.assertEqual(response.status, 200)
-        self.assertEqual(response.payload.get("image_idx"), 7)
+        self.assertEqual(response.payload.get("kind"), "image")
+        self.assertEqual(response.payload.get("task_idx"), 7)
         self.assertEqual(response.payload.get("estimated_remaining"), 0)
         self.assertEqual(job_data.assigned_to_workers["worker-a"], [7])
         self.assertIn("worker-a", job_data.worker_status)
@@ -254,37 +249,10 @@ class USDURoutesTests(unittest.IsolatedAsyncioTestCase):
         response = await usdu_routes.request_image_endpoint(request)
 
         self.assertEqual(response.status, 200)
-        self.assertEqual(response.payload.get("tile_idx"), 4)
+        self.assertEqual(response.payload.get("kind"), "tile")
+        self.assertEqual(response.payload.get("task_idx"), 4)
         self.assertTrue(response.payload.get("batched_static"))
         self.assertEqual(job_data.assigned_to_workers["worker-a"], [4])
-
-    async def test_init_list_queue_initializes_pending_items(self):
-        request = _FakeRequest(
-            json_payload={
-                "multi_job_id": "list-job-1",
-                "list_size": 3,
-                "enabled_workers": ["worker-a", "worker-b"],
-            }
-        )
-        response = await usdu_routes.init_list_queue_endpoint(request)
-
-        self.assertEqual(response.status, 200)
-        self.assertEqual(response.payload.get("status"), "success")
-        self.assertEqual(response.payload.get("remaining"), 3)
-
-    async def test_request_list_item_assigns_next_index(self):
-        prompt_server = usdu_routes._prompt_server_holder["value"]
-        job_data = usdu_routes._ImageJobState("list-job-2")
-        await job_data.pending_images.put(11)
-        prompt_server.distributed_pending_tile_jobs["list-job-2"] = job_data
-
-        request = _FakeRequest(json_payload={"worker_id": "worker-a", "multi_job_id": "list-job-2"})
-        response = await usdu_routes.request_list_item_endpoint(request)
-
-        self.assertEqual(response.status, 200)
-        self.assertEqual(response.payload.get("item_idx"), 11)
-        self.assertEqual(response.payload.get("estimated_remaining"), 0)
-        self.assertEqual(job_data.assigned_to_workers["worker-a"], [11])
 
     async def test_submit_tiles_completion_signal_enqueues_last_marker(self):
         prompt_server = usdu_routes._prompt_server_holder["value"]

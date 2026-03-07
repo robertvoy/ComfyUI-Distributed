@@ -126,13 +126,23 @@ def is_process_alive(pid: int) -> bool:
 
 def terminate_process(process, timeout=5):
     """Gracefully terminate a process with timeout."""
-    if process.poll() is None:  # Still running
-        process.terminate()
+    wait_timeout = max(float(timeout), 0.1)
+    if process.poll() is not None:
+        return True
+
+    process.terminate()
+    try:
+        process.wait(timeout=wait_timeout)
+        return True
+    except (subprocess.TimeoutExpired, TimeoutError):
+        process.kill()
         try:
-            process.wait(timeout=timeout)
-        except (subprocess.TimeoutExpired, TimeoutError):
-            process.kill()
-            process.wait()
+            process.wait(timeout=wait_timeout)
+            return True
+        except (subprocess.TimeoutExpired, TimeoutError) as exc:
+            raise TimeoutError(
+                f"Process did not terminate within {wait_timeout} seconds after kill."
+            ) from exc
 
 def get_python_executable():
     """Get the Python executable path."""

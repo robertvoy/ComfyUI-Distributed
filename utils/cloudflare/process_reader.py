@@ -62,7 +62,10 @@ class ProcessReader:
             return
 
         loop = self._loop
-        for raw_line in iter(process.stdout.readline, ""):
+        while True:
+            raw_line = process.stdout.readline()
+            if not raw_line:
+                break
             line = self._normalize_line(raw_line)
             if not line:
                 continue

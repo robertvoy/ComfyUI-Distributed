@@ -4,9 +4,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import server
-
 from ..utils.logging import debug_log
+from ..utils.runtime_state import ensure_distributed_runtime_state, get_prompt_server_instance
 from .job_models import BaseJobState, ImageJobState, TileJobState
 
 # Configure maximum payload size (50MB default, configurable via environment variable)
@@ -25,20 +24,21 @@ class JobQueueInitConfig:
 
 def ensure_tile_jobs_initialized() -> Any:
     """Ensure tile job storage is initialized on the server instance."""
-    prompt_server = server.PromptServer.instance
-    if not hasattr(prompt_server, 'distributed_pending_tile_jobs'):
-        debug_log("Initializing persistent tile job queue on server instance.")
-        prompt_server.distributed_pending_tile_jobs = {}
-        prompt_server.distributed_tile_jobs_lock = asyncio.Lock()
-    else:
-        invalid_job_ids = [
-            job_id
-            for job_id, job_data in prompt_server.distributed_pending_tile_jobs.items()
-            if not isinstance(job_data, BaseJobState)
-        ]
-        for job_id in invalid_job_ids:
-            debug_log(f"Removing invalid job state for {job_id}")
-            del prompt_server.distributed_pending_tile_jobs[job_id]
+    prompt_server = get_prompt_server_instance()
+    state = ensure_distributed_runtime_state(prompt_server)
+    if not isinstance(state.distributed_pending_tile_jobs, dict):
+        debug_log("Resetting invalid distributed_pending_tile_jobs state to empty dict.")
+        state.distributed_pending_tile_jobs = {}
+        ensure_distributed_runtime_state(prompt_server)
+
+    invalid_job_ids = [
+        job_id
+        for job_id, job_data in state.distributed_pending_tile_jobs.items()
+        if not isinstance(job_data, BaseJobState)
+    ]
+    for job_id in invalid_job_ids:
+        debug_log(f"Removing invalid job state for {job_id}")
+        del state.distributed_pending_tile_jobs[job_id]
     return prompt_server
 
 

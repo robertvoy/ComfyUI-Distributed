@@ -47,7 +47,7 @@ def auto_launch_workers() -> None:
                     # Check if already running
                     if str(worker_id) in wm.processes:
                         proc_info = wm.processes[str(worker_id)]
-                        if wm._is_process_running(proc_info['pid']):
+                        if wm.is_process_running(proc_info['pid']):
                             debug_log(f"Worker {worker_name} already running, skipping")
                             continue
                     

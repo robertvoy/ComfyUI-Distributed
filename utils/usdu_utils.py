@@ -2,29 +2,15 @@ import numpy as np
 from PIL import Image, ImageFilter
 import torch
 import torch.nn.functional as F
-from torchvision.transforms import GaussianBlur
 import math
 from typing import Any
+
+from .image import pil_to_tensor, tensor_to_pil
 
 if (not hasattr(Image, 'Resampling')):  # For older versions of Pillow
     Image.Resampling = Image
 
 BLUR_KERNEL_SIZE = 15
-
-
-def tensor_to_pil(img_tensor: torch.Tensor, batch_index: int = 0) -> Image.Image:
-    # Takes a batch of images in the form of a tensor of shape [batch_size, height, width, channels]
-    # and returns an RGB PIL Image. Assumes channels=3
-    return Image.fromarray((255 * img_tensor[batch_index].cpu().numpy()).astype(np.uint8))
-
-
-def pil_to_tensor(image: Image.Image) -> torch.Tensor:
-    # Takes a PIL image and returns a tensor of shape [1, height, width, channels]
-    image = np.array(image).astype(np.float32) / 255.0
-    image = torch.from_numpy(image).unsqueeze(0)
-    if len(image.shape) == 3:  # If the image is grayscale, add a channel dimension
-        image = image.unsqueeze(-1)
-    return image
 
 
 def controlnet_hint_to_pil(tensor: torch.Tensor, batch_index: int = 0) -> Image.Image:

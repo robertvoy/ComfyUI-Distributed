@@ -371,6 +371,10 @@ class TileOpsMixin:
         
         return positive_sliced, negative_sliced
 
+    def slice_conditioning(self, positive, negative, batch_idx):
+        """Public conditioning-slice API."""
+        return self._slice_conditioning(positive, negative, batch_idx)
+
     def _process_and_blend_tile(self, tile_idx, tile_pos, upscaled_image, result_image,
                                model, positive, negative, vae, seed, steps, cfg,
                                sampler_name, scheduler, denoise, tile_width, tile_height,
@@ -398,6 +402,59 @@ class TileOpsMixin:
                                      x1, y1, (ew, eh), tile_mask, padding)
         
         return result_image
+
+    def process_and_blend_tile(
+        self,
+        tile_idx,
+        tile_pos,
+        upscaled_image,
+        result_image,
+        model,
+        positive,
+        negative,
+        vae,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        denoise,
+        tile_width,
+        tile_height,
+        padding,
+        mask_blur,
+        image_width,
+        image_height,
+        force_uniform_tiles,
+        tiled_decode,
+        batch_idx: int = 0,
+    ):
+        """Public tile-processing API."""
+        return self._process_and_blend_tile(
+            tile_idx,
+            tile_pos,
+            upscaled_image,
+            result_image,
+            model,
+            positive,
+            negative,
+            vae,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            denoise,
+            tile_width,
+            tile_height,
+            padding,
+            mask_blur,
+            image_width,
+            image_height,
+            force_uniform_tiles,
+            tiled_decode,
+            batch_idx=batch_idx,
+        )
 
     def _process_single_tile(self, global_idx, num_tiles_per_image, upscaled_image, all_tiles,
                                   model, positive, negative, vae, seed, steps, cfg, sampler_name,

@@ -1,16 +1,17 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
 import torch
 
+from ..utils.auth import distributed_auth_headers
 from ..utils.async_helpers import run_async_in_server_loop
-from ..utils.config import is_master_delegate_only
+from ..utils.config import is_master_delegate_only, load_config
 from ..utils.image import encode_tensor_png_data_url, ensure_contiguous
 from ..utils.logging import log
 from ..utils.network import get_client_session
-from ..utils.worker_ids import parse_enabled_worker_ids
+from ..utils.worker_ids import coerce_enabled_worker_ids
 from .context_kwargs import parse_distributed_hidden_context
 from .hidden_inputs import build_distributed_hidden_inputs
 from .queue_wait import collect_worker_queue_results
@@ -29,7 +30,7 @@ class BranchRunContext:
     multi_job_id: str = ""
     is_worker: bool = False
     master_url: str = ""
-    enabled_worker_ids: str = "[]"
+    enabled_worker_ids: list[str] = field(default_factory=list)
     worker_id: str = ""
     assigned_branch: int = -1
     delegate_only: bool = False
@@ -190,6 +191,7 @@ class DistributedBranchCollector:
         async with session.post(
             url,
             json=payload,
+            headers=distributed_auth_headers(load_config()),
             timeout=aiohttp.ClientTimeout(total=60),
         ) as response:
             response.raise_for_status()
@@ -236,7 +238,7 @@ class DistributedBranchCollector:
             return tuple(outputs)
 
         delegate_mode = bool(run_context.delegate_only or is_master_delegate_only())
-        enabled_workers = parse_enabled_worker_ids(run_context.enabled_worker_ids)
+        enabled_workers = coerce_enabled_worker_ids(run_context.enabled_worker_ids)
         slots_by_participant = self._participant_branch_slots(enabled_workers, delegate_mode, branch_count)
         expected_worker_ids = self._expected_worker_ids_for_branches(enabled_workers, delegate_mode, branch_count)
         expected_workers = set(expected_worker_ids)
@@ -282,6 +284,8 @@ class DistributedBranchCollector:
         finally:
             async with prompt_server.distributed_jobs_lock:
                 prompt_server.distributed_pending_jobs.pop(run_context.multi_job_id, None)
+                if hasattr(prompt_server, "distributed_job_allowed_workers"):
+                    prompt_server.distributed_job_allowed_workers.pop(run_context.multi_job_id, None)
 
         missing_workers = sorted(expected_workers - workers_done)
         if missing_workers:

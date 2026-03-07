@@ -11,6 +11,14 @@ from unittest.mock import AsyncMock, patch
 import numpy as np
 import torch
 
+from tests.api.harness import (
+    bootstrap_test_package,
+    cleanup_optional_module,
+    install_aiohttp_stub,
+    install_request_guards_stub,
+    install_server_stub,
+)
+
 
 class _FakeResponse:
     def __init__(self, payload, status=200):
@@ -19,8 +27,9 @@ class _FakeResponse:
 
 
 class _FakeRequest:
-    def __init__(self, payload):
+    def __init__(self, payload, headers=None):
         self._payload = payload
+        self.headers = headers or {}
 
     async def json(self):
         return self._payload
@@ -30,53 +39,19 @@ def _load_job_routes_module():
     module_path = Path(__file__).resolve().parents[2] / "api" / "job_routes.py"
     package_name = "dist_api_queue_testpkg"
 
-    # Reset package namespace to avoid stale module state across test runs.
-    for mod_name in list(sys.modules):
-        if mod_name == package_name or mod_name.startswith(f"{package_name}."):
-            del sys.modules[mod_name]
-
-    root_pkg = types.ModuleType(package_name)
-    root_pkg.__path__ = []
-    sys.modules[package_name] = root_pkg
-
-    api_pkg = types.ModuleType(f"{package_name}.api")
-    api_pkg.__path__ = []
-    sys.modules[f"{package_name}.api"] = api_pkg
-
-    utils_pkg = types.ModuleType(f"{package_name}.utils")
-    utils_pkg.__path__ = []
-    sys.modules[f"{package_name}.utils"] = utils_pkg
+    bootstrap_test_package(package_name, with_api=True, with_utils=True)
 
     # aiohttp.web stub
-    created_aiohttp_stub = False
-    if "aiohttp" not in sys.modules:
-        created_aiohttp_stub = True
-        aiohttp_module = types.ModuleType("aiohttp")
-        aiohttp_module.web = types.SimpleNamespace(
-            json_response=lambda payload, status=200: _FakeResponse(payload, status=status)
-        )
-        sys.modules["aiohttp"] = aiohttp_module
+    created_aiohttp_stub = install_aiohttp_stub(
+        lambda payload, status=200: _FakeResponse(payload, status=status)
+    )
 
     # server module stub with route decorators
-    class _Routes:
-        def get(self, _path):
-            def _decorator(fn):
-                return fn
-            return _decorator
-
-        def post(self, _path):
-            def _decorator(fn):
-                return fn
-            return _decorator
-
     prompt_server_instance = types.SimpleNamespace(
-        routes=_Routes(),
         distributed_jobs_lock=None,
         distributed_pending_jobs={},
     )
-    server_module = types.ModuleType("server")
-    server_module.PromptServer = types.SimpleNamespace(instance=prompt_server_instance)
-    sys.modules["server"] = server_module
+    install_server_stub(prompt_server_instance)
 
     # torch stub (only needed to satisfy import)
     created_torch_stub = False
@@ -157,6 +132,47 @@ def _load_job_routes_module():
     constants_module.JOB_INIT_GRACE_PERIOD = 10.0
     sys.modules[f"{package_name}.utils.constants"] = constants_module
 
+    config_module = types.ModuleType(f"{package_name}.utils.config")
+    config_module.load_config = lambda: {"settings": {}}
+    sys.modules[f"{package_name}.utils.config"] = config_module
+
+    runtime_state_module = types.ModuleType(f"{package_name}.utils.runtime_state")
+
+    def _ensure_distributed_runtime_state(server_instance=None):
+        ps = server_instance or prompt_server_instance
+        if not hasattr(ps, "distributed_pending_jobs"):
+            ps.distributed_pending_jobs = {}
+        if not hasattr(ps, "distributed_jobs_lock") or ps.distributed_jobs_lock is None:
+            ps.distributed_jobs_lock = asyncio.Lock()
+        if not hasattr(ps, "distributed_job_allowed_workers"):
+            ps.distributed_job_allowed_workers = {}
+        if not hasattr(ps, "distributed_pending_tile_jobs"):
+            ps.distributed_pending_tile_jobs = {}
+        if not hasattr(ps, "distributed_tile_jobs_lock"):
+            ps.distributed_tile_jobs_lock = asyncio.Lock()
+        return types.SimpleNamespace(
+            distributed_pending_jobs=ps.distributed_pending_jobs,
+            distributed_jobs_lock=ps.distributed_jobs_lock,
+            distributed_job_allowed_workers=ps.distributed_job_allowed_workers,
+            distributed_pending_tile_jobs=ps.distributed_pending_tile_jobs,
+            distributed_tile_jobs_lock=ps.distributed_tile_jobs_lock,
+        )
+
+    runtime_state_module.ensure_distributed_runtime_state = _ensure_distributed_runtime_state
+    runtime_state_module.get_prompt_server_instance = lambda: prompt_server_instance
+    sys.modules[f"{package_name}.utils.runtime_state"] = runtime_state_module
+
+    schemas_module = types.ModuleType(f"{package_name}.api.schemas")
+    schemas_module.is_authorized_request = lambda _request, _config: True
+    schemas_module.require_bool_literal = (
+        lambda value, field_name="value": value
+        if isinstance(value, bool)
+        else (_ for _ in ()).throw(ValueError(f"Field '{field_name}' must be a boolean literal."))
+    )
+    sys.modules[f"{package_name}.api.schemas"] = schemas_module
+
+    install_request_guards_stub(package_name)
+
     async_helpers_module = types.ModuleType(f"{package_name}.utils.async_helpers")
     async_helpers_module.queue_prompt_payload = AsyncMock(return_value="prompt_local")
     sys.modules[f"{package_name}.utils.async_helpers"] = async_helpers_module
@@ -172,7 +188,6 @@ def _load_job_routes_module():
         client_id: str
         delegate_master: object
         enabled_worker_ids: list
-        auto_prepare: bool
         trace_execution_id: object
 
     def _parse_queue_request_payload(data):
@@ -193,7 +208,6 @@ def _load_job_routes_module():
             client_id=client_id,
             delegate_master=data.get("delegate_master"),
             enabled_worker_ids=enabled,
-            auto_prepare=bool(data.get("auto_prepare", True)),
             trace_execution_id=data.get("trace_execution_id"),
         )
 
@@ -206,13 +220,11 @@ def _load_job_routes_module():
     assert spec is not None and spec.loader is not None
     spec.loader.exec_module(module)
 
-    if created_aiohttp_stub:
-        sys.modules.pop("aiohttp", None)
-    if created_torch_stub:
-        sys.modules.pop("torch", None)
+    cleanup_optional_module("aiohttp", created_aiohttp_stub)
+    cleanup_optional_module("torch", created_torch_stub)
     if created_pil_stub:
-        sys.modules.pop("PIL.Image", None)
-        sys.modules.pop("PIL", None)
+        cleanup_optional_module("PIL.Image", True)
+        cleanup_optional_module("PIL", True)
 
     return module
 
@@ -239,7 +251,6 @@ class DistributedQueueEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 200)
         self.assertEqual(response.payload.get("prompt_id"), "prompt_123")
-        self.assertTrue(response.payload.get("auto_prepare_supported"))
 
     async def test_distributed_queue_missing_prompt_returns_400(self):
         request = _FakeRequest(
@@ -276,8 +287,10 @@ class JobCompleteAudioPayloadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_job_complete_accepts_audio_payload(self):
         queue = asyncio.Queue()
-        job_routes.prompt_server.distributed_jobs_lock = asyncio.Lock()
-        job_routes.prompt_server.distributed_pending_jobs = {"job-1": queue}
+        prompt_server = job_routes.server.PromptServer.instance
+        prompt_server.distributed_jobs_lock = asyncio.Lock()
+        prompt_server.distributed_pending_jobs = {"job-1": queue}
+        prompt_server.distributed_job_allowed_workers = {"job-1": {"worker-1"}}
         request = _FakeRequest(
             {
                 "job_id": "job-1",
@@ -299,6 +312,28 @@ class JobCompleteAudioPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(queued["audio"])
         self.assertEqual(queued["audio"]["sample_rate"], 44100)
         self.assertEqual(tuple(queued["audio"]["waveform"].shape), (1, 2, 4))
+
+    async def test_job_complete_rejects_worker_not_in_job_allowlist(self):
+        queue = asyncio.Queue()
+        prompt_server = job_routes.server.PromptServer.instance
+        prompt_server.distributed_jobs_lock = asyncio.Lock()
+        prompt_server.distributed_pending_jobs = {"job-allow": queue}
+        prompt_server.distributed_job_allowed_workers = {"job-allow": {"worker-expected"}}
+        request = _FakeRequest(
+            {
+                "job_id": "job-allow",
+                "worker_id": "worker-unexpected",
+                "batch_idx": 0,
+                "image": "data:image/png;base64,AAAA",
+                "is_last": True,
+            }
+        )
+
+        with patch.object(job_routes, "_decode_canonical_png_tensor", return_value="tensor-data"):
+            response = await job_routes.job_complete_endpoint(request)
+
+        self.assertEqual(response.status, 403)
+        self.assertIn("unauthorized", response.payload.get("message", "").lower())
 
     def test_decode_audio_payload_rejects_bad_shape(self):
         bad = {

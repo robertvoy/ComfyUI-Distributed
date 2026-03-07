@@ -6,7 +6,6 @@ import threading
 import time
 import uuid
 import execution
-import server
 from typing import Optional, Any, Coroutine
 from .network import get_server_loop
 
@@ -43,10 +42,11 @@ def run_async_in_server_loop(coro: Coroutine, timeout: Optional[float] = None) -
     
     # Schedule on server's event loop
     loop = get_server_loop()
-    asyncio.run_coroutine_threadsafe(wrapper(), loop)
+    task_future = asyncio.run_coroutine_threadsafe(wrapper(), loop)
     
     # Wait for completion
     if not event.wait(timeout):
+        task_future.cancel()
         raise TimeoutError(f"Async operation timed out after {timeout} seconds")
     
     if error:
@@ -54,7 +54,10 @@ def run_async_in_server_loop(coro: Coroutine, timeout: Optional[float] = None) -
     return result
 
 
-prompt_server = server.PromptServer.instance
+def _prompt_server_instance():
+    import server
+
+    return server.PromptServer.instance
 
 
 def _summarize_node_errors(node_errors: dict) -> str:
@@ -111,6 +114,7 @@ async def queue_prompt_payload(
     client_id: str | None = None,
 ) -> str:
     """Validate and queue a prompt via ComfyUI's prompt queue."""
+    prompt_server = _prompt_server_instance()
     payload = {"prompt": prompt_obj}
     payload = prompt_server.trigger_on_prompt(payload)
     prompt = payload["prompt"]

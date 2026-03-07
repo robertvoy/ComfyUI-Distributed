@@ -1,25 +1,45 @@
 import asyncio, io, json, time
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 import aiohttp
 from PIL import Image
 from ..utils.logging import debug_log, log
+from ..utils.auth import distributed_auth_headers
+from ..utils.config import load_config
 from ..utils.network import get_client_session
 from ..utils.constants import TILE_SEND_TIMEOUT
-from ..utils.usdu_managment import MAX_PAYLOAD_SIZE, send_heartbeat_to_master
+from ..utils.usdu_management import MAX_PAYLOAD_SIZE, send_heartbeat_to_master
 from ..utils.image import tensor_to_pil
 
 
+WorkAssignmentKind = Literal["image", "tile", "none"]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkAssignment:
+    """Canonical typed representation of a single work-item assignment."""
+
+    kind: WorkAssignmentKind
+    task_idx: int | None
+    estimated_remaining: int = 0
+    batched_static: bool = False
+
+
 class WorkerCommsMixin:
-    async def _send_heartbeat_to_master(
+    @staticmethod
+    def _master_auth_headers() -> dict[str, str]:
+        return distributed_auth_headers(load_config())
+
+    async def send_heartbeat(
         self,
         multi_job_id: str,
         master_url: str,
         worker_id: str,
     ) -> None:
-        """Proxy heartbeat helper used by worker processing mixins."""
+        """Send worker heartbeat to the master."""
         await send_heartbeat_to_master(multi_job_id, master_url, worker_id)
 
-    async def send_tiles_batch_to_master(
+    async def send_tiles_batch(
         self,
         processed_tiles: list[dict[str, Any]],
         multi_job_id: str,
@@ -63,12 +83,8 @@ class WorkerCommsMixin:
         i = 0
         chunk_index = 0
         while i < total_tiles:
-            data = aiohttp.FormData()
-            data.add_field('multi_job_id', multi_job_id)
-            data.add_field('worker_id', str(worker_id))
-            data.add_field('padding', str(padding))
-
             metadata = []
+            chunk_images: list[tuple[int, int, bytes]] = []
             used = 0
             j = i
             while j < total_tiles:
@@ -80,7 +96,7 @@ class WorkerCommsMixin:
                     break
                 # Accept this tile in this chunk
                 metadata.append(meta)
-                data.add_field(f'tile_{j - i}', io.BytesIO(img_bytes), filename=f'tile_{j}.png', content_type='image/png')
+                chunk_images.append((j - i, j, img_bytes))
                 used += len(img_bytes) + overhead
                 j += 1
 
@@ -89,14 +105,28 @@ class WorkerCommsMixin:
                 # Single oversized tile, send anyway
                 meta = encoded[j]['meta']
                 metadata.append(meta)
-                data.add_field('tile_0', io.BytesIO(encoded[j]['bytes']), filename=f'tile_{j}.png', content_type='image/png')
+                chunk_images.append((0, j, encoded[j]['bytes']))
                 j += 1
 
             chunk_size = j - i
             is_chunk_last = (j >= total_tiles)
-            data.add_field('is_last', str(bool(is_final_flush and is_chunk_last)))
-            data.add_field('batch_size', str(chunk_size))
-            data.add_field('tiles_metadata', json.dumps(metadata), content_type='application/json')
+
+            def _build_chunk_form() -> aiohttp.FormData:
+                data = aiohttp.FormData()
+                data.add_field('multi_job_id', multi_job_id)
+                data.add_field('worker_id', str(worker_id))
+                data.add_field('padding', str(padding))
+                data.add_field('is_last', str(bool(is_final_flush and is_chunk_last)))
+                data.add_field('batch_size', str(chunk_size))
+                data.add_field('tiles_metadata', json.dumps(metadata), content_type='application/json')
+                for relative_idx, source_idx, img_bytes in chunk_images:
+                    data.add_field(
+                        f'tile_{relative_idx}',
+                        io.BytesIO(img_bytes),
+                        filename=f'tile_{source_idx}.png',
+                        content_type='image/png',
+                    )
+                return data
 
             # Retry logic with exponential backoff
             max_retries = 5
@@ -105,7 +135,11 @@ class WorkerCommsMixin:
                 try:
                     session = await get_client_session()
                     url = f"{master_url}/distributed/submit_tiles"
-                    async with session.post(url, data=data) as response:
+                    async with session.post(
+                        url,
+                        data=_build_chunk_form(),
+                        headers=self._master_auth_headers(),
+                    ) as response:
                         response.raise_for_status()
                         break
                 except Exception as e:
@@ -130,7 +164,7 @@ class WorkerCommsMixin:
 
         session = await get_client_session()
         url = f"{master_url}/distributed/submit_tiles"
-        async with session.post(url, data=data) as response:
+        async with session.post(url, data=data, headers=self._master_auth_headers()) as response:
             response.raise_for_status()
             debug_log(f"Worker {worker_id} sent static completion signal")
 
@@ -157,7 +191,7 @@ class WorkerCommsMixin:
                 async with session.post(url, json={
                     'worker_id': str(worker_id),
                     'multi_job_id': multi_job_id
-                }) as response:
+                }, headers=self._master_auth_headers()) as response:
                     if response.status == 200:
                         return await response.json()
                     if response.status == 404:
@@ -181,41 +215,83 @@ class WorkerCommsMixin:
 
         return None
 
-    async def _request_image_from_master(self, multi_job_id, master_url, worker_id):
-        """Request an image index to process from master in dynamic mode."""
-        data = await self._request_work_item_from_master(multi_job_id, master_url, worker_id)
+    @staticmethod
+    def _parse_work_assignment(data: dict[str, Any] | None) -> WorkAssignment:
+        """Normalize assignment payloads into a single discriminated contract."""
         if not data:
-            return None, 0
-        image_idx = data.get('image_idx')
-        estimated_remaining = data.get('estimated_remaining', 0)
-        return image_idx, estimated_remaining
+            return WorkAssignment(kind="none", task_idx=None)
 
-    async def _request_tile_from_master(self, multi_job_id, master_url, worker_id):
-        """Request a tile index to process from master in static mode (reusing dynamic infrastructure)."""
+        kind_value = data.get("kind")
+        if kind_value is None:
+            # Backward-compatible parsing for older masters.
+            if "image_idx" in data:
+                kind_value = "image"
+                data = {
+                    "kind": "image",
+                    "task_idx": data.get("image_idx"),
+                    "estimated_remaining": data.get("estimated_remaining", 0),
+                }
+            elif "tile_idx" in data:
+                kind_value = "tile"
+                data = {
+                    "kind": "tile",
+                    "task_idx": data.get("tile_idx"),
+                    "estimated_remaining": data.get("estimated_remaining", 0),
+                    "batched_static": data.get("batched_static", False),
+                }
+            else:
+                kind_value = "none"
+
+        if kind_value not in {"image", "tile", "none"}:
+            return WorkAssignment(kind="none", task_idx=None)
+
+        task_idx_raw = data.get("task_idx")
+        if task_idx_raw is None:
+            task_idx = None
+        else:
+            try:
+                task_idx = int(task_idx_raw)
+            except (TypeError, ValueError):
+                task_idx = None
+
+        try:
+            estimated_remaining = int(data.get("estimated_remaining", 0) or 0)
+        except (TypeError, ValueError):
+            estimated_remaining = 0
+
+        return WorkAssignment(
+            kind=kind_value,
+            task_idx=task_idx,
+            estimated_remaining=estimated_remaining,
+            batched_static=bool(data.get("batched_static", False)),
+        )
+
+    async def request_assignment(self, multi_job_id, master_url, worker_id) -> WorkAssignment:
+        """Request one assignment and parse into the canonical discriminated contract."""
         data = await self._request_work_item_from_master(multi_job_id, master_url, worker_id)
-        if not data:
-            return None, 0, False
-        tile_idx = data.get('tile_idx')
-        estimated_remaining = data.get('estimated_remaining', 0)
-        batched_static = data.get('batched_static', False)
-        return tile_idx, estimated_remaining, batched_static
+        return self._parse_work_assignment(data)
 
-    async def _send_full_image_to_master(self, image_pil, image_idx, multi_job_id, 
-                                        master_url, worker_id, is_last):
+    async def send_full_image(self, image_pil, image_idx, multi_job_id, 
+                              master_url, worker_id, is_last):
         """Send a processed full image back to master in dynamic mode."""
         # Serialize image to PNG
         byte_io = io.BytesIO()
         image_pil.save(byte_io, format='PNG', compress_level=0)
-        byte_io.seek(0)
-        
-        # Prepare form data
-        data = aiohttp.FormData()
-        data.add_field('multi_job_id', multi_job_id)
-        data.add_field('worker_id', str(worker_id))
-        data.add_field('image_idx', str(image_idx))
-        data.add_field('is_last', str(is_last))
-        data.add_field('full_image', byte_io, filename=f'image_{image_idx}.png', 
-                      content_type='image/png')
+        image_bytes = byte_io.getvalue()
+
+        def _build_image_form() -> aiohttp.FormData:
+            data = aiohttp.FormData()
+            data.add_field('multi_job_id', multi_job_id)
+            data.add_field('worker_id', str(worker_id))
+            data.add_field('image_idx', str(image_idx))
+            data.add_field('is_last', str(is_last))
+            data.add_field(
+                'full_image',
+                io.BytesIO(image_bytes),
+                filename=f'image_{image_idx}.png',
+                content_type='image/png',
+            )
+            return data
         
         # Retry logic
         max_retries = 5
@@ -226,7 +302,11 @@ class WorkerCommsMixin:
                 session = await get_client_session()
                 url = f"{master_url}/distributed/submit_image"
                 
-                async with session.post(url, data=data) as response:
+                async with session.post(
+                    url,
+                    data=_build_image_form(),
+                    headers=self._master_auth_headers(),
+                ) as response:
                     response.raise_for_status()
                     debug_log(f"Successfully sent image {image_idx} to master")
                     return
@@ -240,7 +320,7 @@ class WorkerCommsMixin:
                     log(f"Failed to send image {image_idx} after {max_retries} attempts: {e}")
                     raise
 
-    async def _send_worker_complete_signal(self, multi_job_id, master_url, worker_id):
+    async def send_worker_complete_signal(self, multi_job_id, master_url, worker_id):
         """Send completion signal to master in dynamic mode."""
         # Send a dummy request with is_last=True
         data = aiohttp.FormData()
@@ -252,16 +332,16 @@ class WorkerCommsMixin:
         session = await get_client_session()
         url = f"{master_url}/distributed/submit_image"
         
-        async with session.post(url, data=data) as response:
+        async with session.post(url, data=data, headers=self._master_auth_headers()) as response:
             response.raise_for_status()
             debug_log(f"Worker {worker_id} sent completion signal")
 
-    async def _check_job_status(self, multi_job_id, master_url):
+    async def check_job_status(self, multi_job_id, master_url):
         """Check if job is ready on the master."""
         try:
             session = await get_client_session()
             url = f"{master_url}/distributed/job_status?multi_job_id={multi_job_id}"
-            async with session.get(url) as response:
+            async with session.get(url, headers=self._master_auth_headers()) as response:
                 if response.status == 200:
                     data = await response.json()
                     return data.get('ready', False)
@@ -270,6 +350,6 @@ class WorkerCommsMixin:
             debug_log(f"Job status check failed: {e}")
             return False
 
-    async def _async_yield(self):
+    async def async_yield(self):
         """Simple async yield to allow event loop processing."""
         await asyncio.sleep(0)

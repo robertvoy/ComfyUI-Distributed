@@ -74,6 +74,13 @@ class ProcessLifecycle:
                     os.path.dirname(os.path.dirname(__file__)),
                     "worker_monitor.py",
                 )
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                existing_pythonpath = env.get("PYTHONPATH", "")
+                env["PYTHONPATH"] = (
+                    f"{project_root}{os.pathsep}{existing_pythonpath}"
+                    if existing_pythonpath
+                    else project_root
+                )
                 monitored_cmd = [get_python_executable(), monitor_script] + cmd
                 log_handle.write(f"[Worker Monitor] Monitoring master PID: {env['COMFYUI_MASTER_PID']}\n")
                 log_handle.flush()

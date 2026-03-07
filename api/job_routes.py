@@ -18,23 +18,18 @@ from ..utils.logging import debug_log
 from ..utils.image import pil_to_tensor, ensure_contiguous
 from ..utils.network import handle_api_error
 from ..utils.constants import JOB_INIT_GRACE_PERIOD, MEMORY_CLEAR_DELAY
-try:
-    from .queue_orchestration import ensure_distributed_state, orchestrate_distributed_execution
-except ImportError:
-    from .queue_orchestration import orchestrate_distributed_execution
-
-    def ensure_distributed_state() -> None:
-        prompt_server_instance = server.PromptServer.instance
-        if not hasattr(prompt_server_instance, "distributed_jobs_lock"):
-            prompt_server_instance.distributed_jobs_lock = asyncio.Lock()
-        if not hasattr(prompt_server_instance, "distributed_pending_jobs"):
-            prompt_server_instance.distributed_pending_jobs = {}
+from ..utils.runtime_state import ensure_distributed_runtime_state
+from .request_guards import authorization_error_or_none
+from .schemas import require_bool_literal
+from .queue_orchestration import orchestrate_distributed_execution
 from .queue_request import parse_queue_request_payload
-
-prompt_server = server.PromptServer.instance
 
 # Canonical worker result envelope accepted by POST /distributed/job_complete:
 # { "job_id": str, "worker_id": str, "batch_idx": int, "image": <base64 PNG>, "is_last": bool }
+
+
+def _runtime_state():
+    return ensure_distributed_runtime_state()
 
 
 def _decode_image_sync(image_path: str) -> dict[str, Any]:
@@ -148,16 +143,19 @@ def _decode_audio_payload(audio_payload: dict[str, Any]) -> dict[str, Any]:
 
 @server.PromptServer.instance.routes.post("/distributed/prepare_job")
 async def prepare_job_endpoint(request: web.Request) -> web.StreamResponse:
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         data = await request.json()
         multi_job_id = data.get('multi_job_id')
         if not multi_job_id:
             return await handle_api_error(request, "Missing multi_job_id", 400)
 
-        ensure_distributed_state()
-        async with prompt_server.distributed_jobs_lock:
-            if multi_job_id not in prompt_server.distributed_pending_jobs:
-                prompt_server.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
+        runtime_state = _runtime_state()
+        async with runtime_state.distributed_jobs_lock:
+            if multi_job_id not in runtime_state.distributed_pending_jobs:
+                runtime_state.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
         
         debug_log(f"Prepared queue for job {multi_job_id}")
         return web.json_response({"status": "success"})
@@ -167,7 +165,11 @@ async def prepare_job_endpoint(request: web.Request) -> web.StreamResponse:
 @server.PromptServer.instance.routes.post("/distributed/clear_memory")
 async def clear_memory_endpoint(request: web.Request) -> web.StreamResponse:
     debug_log("Received request to clear VRAM.")
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
+        warnings: list[str] = []
         # Use ComfyUI's prompt server queue system like the /free endpoint does
         if hasattr(server.PromptServer.instance, 'prompt_queue'):
             server.PromptServer.instance.prompt_queue.set_flag("unload_models", True)
@@ -184,12 +186,16 @@ async def clear_memory_endpoint(request: web.Request) -> web.StreamResponse:
         try:
             mm.unload_all_models()
         except AttributeError as e:
-            debug_log(f"Warning during model unload: {e}")
+            warning = f"Model unload warning: {e}"
+            warnings.append(warning)
+            debug_log(warning)
         
         try:
             mm.soft_empty_cache()
         except Exception as e:
-            debug_log(f"Warning during cache clear: {e}")
+            warning = f"Cache clear warning: {e}"
+            warnings.append(warning)
+            debug_log(warning)
         
         for _ in range(3):
             gc.collect()
@@ -198,6 +204,16 @@ async def clear_memory_endpoint(request: web.Request) -> web.StreamResponse:
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
         
+        if warnings:
+            debug_log("VRAM cleared with warnings.")
+            return web.json_response(
+                {
+                    "status": "partial",
+                    "message": "GPU memory cleared with warnings.",
+                    "warnings": warnings,
+                }
+            )
+
         debug_log("VRAM cleared successfully.")
         return web.json_response({"status": "success", "message": "GPU memory cleared."})
     except Exception as e:
@@ -206,13 +222,16 @@ async def clear_memory_endpoint(request: web.Request) -> web.StreamResponse:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        debug_log(f"Partial VRAM clear completed with warning: {e}")
-        return web.json_response({"status": "success", "message": "GPU memory cleared (with warnings)"})
+        debug_log(f"VRAM clear failed: {e}")
+        return await handle_api_error(request, f"GPU memory clear failed: {e}", 500)
 
 
 @server.PromptServer.instance.routes.post("/distributed/queue")
 async def distributed_queue_endpoint(request: web.Request) -> web.StreamResponse:
     """Queue a distributed workflow, mirroring the UI orchestration pipeline."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         raw_payload = await request.json()
     except Exception as exc:
@@ -235,7 +254,6 @@ async def distributed_queue_endpoint(request: web.Request) -> web.StreamResponse
         return web.json_response({
             "prompt_id": prompt_id,
             "worker_count": worker_count,
-            "auto_prepare_supported": True,
         })
     except Exception as exc:
         return await handle_api_error(request, exc, 500)
@@ -243,6 +261,9 @@ async def distributed_queue_endpoint(request: web.Request) -> web.StreamResponse
 @server.PromptServer.instance.routes.post("/distributed/load_image")
 async def load_image_endpoint(request: web.Request) -> web.StreamResponse:
     """Load an image or video file and return it as base64 data with hash."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         data = await request.json()
         image_path = data.get("image_path")
@@ -260,6 +281,9 @@ async def load_image_endpoint(request: web.Request) -> web.StreamResponse:
 @server.PromptServer.instance.routes.post("/distributed/check_file")
 async def check_file_endpoint(request: web.Request) -> web.StreamResponse:
     """Check if a file exists and matches the given hash."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         data = await request.json()
         filename = data.get("filename")
@@ -277,6 +301,9 @@ async def check_file_endpoint(request: web.Request) -> web.StreamResponse:
 
 @server.PromptServer.instance.routes.post("/distributed/job_complete")
 async def job_complete_endpoint(request: web.Request) -> web.StreamResponse:
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         data = await request.json()
     except Exception as exc:
@@ -291,7 +318,7 @@ async def job_complete_endpoint(request: web.Request) -> web.StreamResponse:
         batch_idx = data.get("batch_idx")
         image_payload = data.get("image")
         audio_payload = data.get("audio")
-        is_last = data.get("is_last")
+        is_last_raw = data.get("is_last")
 
         errors = []
         if not isinstance(job_id, str) or not job_id.strip():
@@ -304,8 +331,12 @@ async def job_complete_endpoint(request: web.Request) -> web.StreamResponse:
             errors.append("image: expected non-empty base64 PNG string")
         if audio_payload is not None and not isinstance(audio_payload, dict):
             errors.append("audio: expected object when provided")
-        if not isinstance(is_last, bool):
-            errors.append("is_last: expected boolean")
+
+        try:
+            is_last = require_bool_literal(is_last_raw, field_name="is_last")
+        except ValueError as exc:
+            errors.append(str(exc))
+            is_last = False
         if errors:
             return await handle_api_error(request, errors, 400)
 
@@ -314,12 +345,21 @@ async def job_complete_endpoint(request: web.Request) -> web.StreamResponse:
         multi_job_id = job_id.strip()
         worker_id = worker_id.strip()
 
+        runtime_state = _runtime_state()
+        allowed_workers = runtime_state.distributed_job_allowed_workers.get(multi_job_id)
+        if allowed_workers is not None and worker_id not in allowed_workers:
+            return await handle_api_error(
+                request,
+                f"Unauthorized worker_id for job {multi_job_id}",
+                403,
+            )
+
         pending = None
         queue_size = 0
         deadline = time.monotonic() + float(JOB_INIT_GRACE_PERIOD)
         while pending is None:
-            async with prompt_server.distributed_jobs_lock:
-                pending = prompt_server.distributed_pending_jobs.get(multi_job_id)
+            async with runtime_state.distributed_jobs_lock:
+                pending = runtime_state.distributed_pending_jobs.get(multi_job_id)
                 if pending is not None:
                     queue_item = {
                         "tensor": tensor,

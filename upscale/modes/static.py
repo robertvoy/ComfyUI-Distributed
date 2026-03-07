@@ -18,6 +18,12 @@ from ..job_store import (
     cleanup_job, drain_results_queue, get_completed_count, mark_task_completed,
 )
 from ..job_models import TileJobState
+from ..mode_contexts import (
+    JobStateCollaborator,
+    StaticModeContext,
+    TileOpsCollaborator,
+    WorkerCommsCollaborator,
+)
 from ..processing_args import UpscaleCoreArgs
 from ..tile_processing import TileBatchArgs, extract_and_process_tile_batch
 
@@ -29,14 +35,30 @@ class StaticModeMixin:
     Expected co-mixins on `self`:
     - TileOpsMixin (`calculate_tiles`, tile extract/blend helpers).
     - JobStateMixin (`_get_next_tile_index`, `_get_all_completed_tasks`, requeue checks).
-    - WorkerCommsMixin (`send_tiles_batch_to_master`, `_request_tile_from_master`, `_send_heartbeat_to_master`).
+    - WorkerCommsMixin (`send_tiles_batch`, `request_assignment`, `send_heartbeat`).
     """
 
-    def _poll_job_ready(self, multi_job_id, master_url, worker_id=None, max_attempts=JOB_POLL_MAX_ATTEMPTS):
+    def _build_static_mode_context(self) -> StaticModeContext:
+        """Build explicit collaborators for static mode execution."""
+        return StaticModeContext(
+            tile_ops=TileOpsCollaborator(self),
+            job_state=JobStateCollaborator(self),
+            worker_comms=WorkerCommsCollaborator(self),
+        )
+
+    def _poll_job_ready(
+        self,
+        multi_job_id,
+        master_url,
+        worker_id=None,
+        max_attempts=JOB_POLL_MAX_ATTEMPTS,
+        mode_context: StaticModeContext | None = None,
+    ):
         """Poll master for job readiness to avoid worker/master initialization race."""
+        context = mode_context or self._build_static_mode_context()
         for attempt in range(max_attempts):
             ready = run_async_in_server_loop(
-                self._check_job_status(multi_job_id, master_url),
+                context.worker_comms.check_job_status(multi_job_id, master_url),
                 timeout=5.0
             )
             if ready:
@@ -111,12 +133,14 @@ class StaticModeMixin:
         padding,
         worker_id,
         is_final_flush=False,
+        mode_context: StaticModeContext | None = None,
     ):
         """Send accumulated tile payloads to master and return a fresh accumulator."""
+        context = mode_context or self._build_static_mode_context()
         if not processed_tiles:
             if is_final_flush:
                 run_async_in_server_loop(
-                    self.send_tiles_batch_to_master(
+                    context.worker_comms.send_tiles_batch(
                         [],
                         multi_job_id,
                         master_url,
@@ -128,7 +152,7 @@ class StaticModeMixin:
                 )
             return processed_tiles
         run_async_in_server_loop(
-            self.send_tiles_batch_to_master(
+            context.worker_comms.send_tiles_batch(
                 processed_tiles,
                 multi_job_id,
                 master_url,
@@ -167,8 +191,10 @@ class StaticModeMixin:
         tiled_decode,
         width,
         height,
+        mode_context: StaticModeContext | None = None,
     ):
         """Process one tile_id across the batch and blend into result_images."""
+        context = mode_context or self._build_static_mode_context()
         source_batch = torch.cat([pil_to_tensor(img) for img in result_images], dim=0)
         if upscaled_image.is_cuda:
             source_batch = source_batch.cuda()
@@ -202,7 +228,7 @@ class StaticModeMixin:
                 result_images,
                 processed_batch,
                 b,
-                self.blend_tile,
+                context.tile_ops.blend_tile,
                 x1,
                 y1,
                 ew,
@@ -221,15 +247,17 @@ class StaticModeMixin:
                                     seed, steps, cfg, sampler_name, scheduler, denoise,
                                     tile_width, tile_height, padding, mask_blur,
                                     force_uniform_tiles, tiled_decode, multi_job_id, master_url,
-                                    worker_id, enabled_workers):
+                                    worker_id, enabled_workers,
+                                    mode_context: StaticModeContext | None = None):
         """Worker static mode processing with optional dynamic queue pulling."""
+        context = mode_context or self._build_static_mode_context()
         # Round tile dimensions
-        tile_width = self.round_to_multiple(tile_width)
-        tile_height = self.round_to_multiple(tile_height)
+        tile_width = context.tile_ops.round_to_multiple(tile_width)
+        tile_height = context.tile_ops.round_to_multiple(tile_height)
         
         # Get dimensions and calculate tiles
         _, height, width, _ = upscaled_image.shape
-        all_tiles = self.calculate_tiles(width, height, tile_width, tile_height, force_uniform_tiles)
+        all_tiles = context.tile_ops.calculate_tiles(width, height, tile_width, tile_height, force_uniform_tiles)
         num_tiles_per_image = len(all_tiles)
         batch_size = upscaled_image.shape[0]
         total_tiles = batch_size * num_tiles_per_image
@@ -241,24 +269,31 @@ class StaticModeMixin:
             working_images.append(image_pil.copy())
         tile_masks = []
         for tx, ty in all_tiles:
-            tile_masks.append(self.create_tile_mask(width, height, tx, ty, tile_width, tile_height, mask_blur))
+            tile_masks.append(context.tile_ops.create_tile_mask(width, height, tx, ty, tile_width, tile_height, mask_blur))
         
         # Dynamic queue mode (static processing): process batched-per-tile
         log(f"USDU Dist Worker[{worker_id[:8]}]: Canvas {width}x{height} | Tile {tile_width}x{tile_height} | Tiles/image {num_tiles_per_image} | Batch {batch_size}")
         processed_count = 0
 
         max_poll_attempts = JOB_POLL_MAX_ATTEMPTS
-        if not self._poll_job_ready(multi_job_id, master_url, worker_id=worker_id, max_attempts=max_poll_attempts):
+        if not self._poll_job_ready(
+            multi_job_id,
+            master_url,
+            worker_id=worker_id,
+            max_attempts=max_poll_attempts,
+            mode_context=context,
+        ):
             log(f"Job {multi_job_id} not ready after {max_poll_attempts} attempts, aborting")
             return (upscaled_image,)
 
         # Main processing loop - pull tile ids from queue
         while True:
             # Request a tile to process
-            tile_idx, estimated_remaining, batched_static = run_async_in_server_loop(
-                self._request_tile_from_master(multi_job_id, master_url, worker_id),
-                timeout=TILE_WAIT_TIMEOUT
+            assignment = run_async_in_server_loop(
+                context.worker_comms.request_assignment(multi_job_id, master_url, worker_id),
+                timeout=TILE_WAIT_TIMEOUT,
             )
+            tile_idx = assignment.task_idx if assignment.kind == "tile" else None
 
             if tile_idx is None:
                 debug_log(f"Worker[{worker_id[:8]}] - No more tiles to process")
@@ -298,7 +333,7 @@ class StaticModeMixin:
                 tile_pil = tensor_to_pil(processed_batch, b)
                 if tile_pil.size != (ew, eh):
                     tile_pil = tile_pil.resize((ew, eh), Image.LANCZOS)
-                working_images[b] = self.blend_tile(
+                working_images[b] = context.tile_ops.blend_tile(
                     working_images[b],
                     tile_pil,
                     x1,
@@ -322,7 +357,7 @@ class StaticModeMixin:
             # Send heartbeat
             try:
                 run_async_in_server_loop(
-                    self._send_heartbeat_to_master(multi_job_id, master_url, worker_id),
+                    context.worker_comms.send_heartbeat(multi_job_id, master_url, worker_id),
                     timeout=5.0
                 )
             except Exception as e:
@@ -331,20 +366,39 @@ class StaticModeMixin:
             # Send tiles in batches within loop
             if len(processed_tiles) >= MAX_BATCH:
                 processed_tiles = self._flush_tiles_to_master(
-                    processed_tiles, multi_job_id, master_url, padding, worker_id, is_final_flush=False
+                    processed_tiles,
+                    multi_job_id,
+                    master_url,
+                    padding,
+                    worker_id,
+                    is_final_flush=False,
+                    mode_context=context,
                 )
 
         # Send any remaining tiles
         processed_tiles = self._flush_tiles_to_master(
-            processed_tiles, multi_job_id, master_url, padding, worker_id, is_final_flush=True
+            processed_tiles,
+            multi_job_id,
+            master_url,
+            padding,
+            worker_id,
+            is_final_flush=True,
+            mode_context=context,
         )
         
         debug_log(f"Worker {worker_id} completed all assigned and requeued tiles")
         return (upscaled_image,)
 
-    async def _async_collect_and_monitor_static(self, multi_job_id, total_tiles, expected_total):
+    async def _async_collect_and_monitor_static(
+        self,
+        multi_job_id,
+        total_tiles,
+        expected_total,
+        mode_context: StaticModeContext | None = None,
+    ):
         """Async helper for collection and monitoring in static mode.
         Returns collected tasks dict. Caller should check if all tasks are complete."""
+        context = mode_context or self._build_static_mode_context()
         last_progress_log = time.time()
         progress_interval = 5.0
         last_heartbeat_check = time.time()
@@ -362,7 +416,7 @@ class StaticModeMixin:
             # Check and requeue timed-out workers periodically
             current_time = time.time()
             if current_time - last_heartbeat_check >= HEARTBEAT_INTERVAL:
-                requeued_count = await self._check_and_requeue_timed_out_workers(multi_job_id, expected_total)
+                requeued_count = await context.job_state.check_and_requeue_timed_out_workers(multi_job_id, expected_total)
                 if requeued_count > 0:
                     log(f"Requeued {requeued_count} tasks from timed-out workers")
                 last_heartbeat_check = current_time
@@ -395,7 +449,7 @@ class StaticModeMixin:
             await asyncio.sleep(0.1)
         
         # Get all completed tasks for return
-        return await self._get_all_completed_tasks(multi_job_id)
+        return await context.job_state.all_completed_tasks(multi_job_id)
 
     def _init_master_static_state(
         self,
@@ -408,7 +462,9 @@ class StaticModeMixin:
         tile_width,
         tile_height,
         mask_blur,
+        mode_context: StaticModeContext | None = None,
     ):
+        context = mode_context or self._build_static_mode_context()
         _, height, width, _ = upscaled_image.shape
         result_images = [tensor_to_pil(upscaled_image[b:b + 1], 0).copy() for b in range(batch_size)]
 
@@ -420,7 +476,7 @@ class StaticModeMixin:
         debug_log(f"Initialized tile-id queue with {num_tiles_per_image} ids for batch {batch_size}")
 
         tile_masks = [
-            self.create_tile_mask(width, height, tx, ty, tile_width, tile_height, mask_blur)
+            context.tile_ops.create_tile_mask(width, height, tx, ty, tile_width, tile_height, mask_blur)
             for tx, ty in all_tiles
         ]
         return result_images, tile_masks, width, height
@@ -452,14 +508,16 @@ class StaticModeMixin:
         tiled_decode,
         width,
         height,
+        mode_context: StaticModeContext | None = None,
     ):
+        context = mode_context or self._build_static_mode_context()
         processed_count = 0
         consecutive_no_tile = 0
         max_consecutive_no_tile = 2
 
         while processed_count < total_tiles:
             comfy.model_management.throw_exception_if_processing_interrupted()
-            tile_id = run_async_in_server_loop(self._get_next_tile_index(multi_job_id), timeout=5.0)
+            tile_id = run_async_in_server_loop(context.job_state.next_tile_index(multi_job_id), timeout=5.0)
             if tile_id is None:
                 consecutive_no_tile += 1
                 if consecutive_no_tile >= max_consecutive_no_tile:
@@ -495,6 +553,7 @@ class StaticModeMixin:
                 tiled_decode,
                 width,
                 height,
+                mode_context=context,
             )
             log(f"USDU Dist: Tiles progress {processed_count}/{total_tiles} (tile {tile_id})")
         return processed_count
@@ -527,14 +586,21 @@ class StaticModeMixin:
         tiled_decode,
         width,
         height,
+        mode_context: StaticModeContext | None = None,
     ):
+        context = mode_context or self._build_static_mode_context()
         remaining_tiles = total_tiles - master_processed_count
         if remaining_tiles <= 0:
-            return run_async_in_server_loop(self._get_all_completed_tasks(multi_job_id), timeout=5.0)
+            return run_async_in_server_loop(context.job_state.all_completed_tasks(multi_job_id), timeout=5.0)
 
         debug_log(f"Master waiting for {remaining_tiles} tiles from workers")
         collected_tasks = run_async_in_server_loop(
-            self._async_collect_and_monitor_static(multi_job_id, total_tiles, expected_total=total_tiles),
+            self._async_collect_and_monitor_static(
+                multi_job_id,
+                total_tiles,
+                expected_total=total_tiles,
+                mode_context=context,
+            ),
             timeout=None,
         )
 
@@ -545,7 +611,7 @@ class StaticModeMixin:
         log(f"Processing remaining {total_tiles - completed_count} tasks locally after worker failures")
         while True:
             comfy.model_management.throw_exception_if_processing_interrupted()
-            tile_id = run_async_in_server_loop(self._get_next_tile_index(multi_job_id), timeout=5.0)
+            tile_id = run_async_in_server_loop(context.job_state.next_tile_index(multi_job_id), timeout=5.0)
             if tile_id is None:
                 break
             self._master_process_one_tile(
@@ -574,6 +640,7 @@ class StaticModeMixin:
                 tiled_decode,
                 width,
                 height,
+                mode_context=context,
             )
         return collected_tasks
 
@@ -588,7 +655,9 @@ class StaticModeMixin:
         tile_width,
         tile_height,
         padding,
+        mode_context: StaticModeContext | None = None,
     ):
+        context = mode_context or self._build_static_mode_context()
         def _sort_key(item):
             global_idx, tile_data = item
             batch_idx = tile_data.get('batch_idx', global_idx // num_tiles_per_image)
@@ -609,7 +678,7 @@ class StaticModeMixin:
             tile_mask = tile_masks[tile_idx]
             extracted_width = tile_data.get('extracted_width', tile_width + 2 * padding)
             extracted_height = tile_data.get('extracted_height', tile_height + 2 * padding)
-            result_images[batch_idx] = self.blend_tile(
+            result_images[batch_idx] = context.tile_ops.blend_tile(
                 result_images[batch_idx],
                 tile_pil,
                 x,
@@ -632,8 +701,10 @@ class StaticModeMixin:
                                     seed, steps, cfg, sampler_name, scheduler, denoise,
                                     tile_width, tile_height, padding, mask_blur,
                                     force_uniform_tiles, tiled_decode, multi_job_id, enabled_workers,
-                                    all_tiles, num_tiles_per_image):
+                                    all_tiles, num_tiles_per_image,
+                                    mode_context: StaticModeContext | None = None):
         """Static mode master processing with optional dynamic queue pulling."""
+        context = mode_context or self._build_static_mode_context()
         batch_size = upscaled_image.shape[0]
         total_tiles = batch_size * num_tiles_per_image
         result_images, tile_masks, width, height = self._init_master_static_state(
@@ -646,6 +717,7 @@ class StaticModeMixin:
             tile_width=tile_width,
             tile_height=tile_height,
             mask_blur=mask_blur,
+            mode_context=context,
         )
 
         try:
@@ -675,6 +747,7 @@ class StaticModeMixin:
                 tiled_decode=tiled_decode,
                 width=width,
                 height=height,
+                mode_context=context,
             )
 
             collected_tasks = self._collect_remaining_static_tiles(
@@ -704,6 +777,7 @@ class StaticModeMixin:
                 tiled_decode=tiled_decode,
                 width=width,
                 height=height,
+                mode_context=context,
             )
 
             self._blend_static_collected_tiles(
@@ -716,6 +790,7 @@ class StaticModeMixin:
                 tile_width=tile_width,
                 tile_height=tile_height,
                 padding=padding,
+                mode_context=context,
             )
 
             result_tensor = self._result_images_to_tensor(result_images, batch_size, upscaled_image)

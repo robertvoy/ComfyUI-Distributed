@@ -37,6 +37,14 @@ def _bootstrap_package(package_name):
     logging_module.log = lambda *_args, **_kwargs: None
     sys.modules[f"{package_name}.utils.logging"] = logging_module
 
+    worker_ids_module = types.ModuleType(f"{package_name}.utils.worker_ids")
+    worker_ids_module.coerce_enabled_worker_ids = lambda value: (
+        [str(v) for v in value]
+        if isinstance(value, list)
+        else []
+    )
+    sys.modules[f"{package_name}.utils.worker_ids"] = worker_ids_module
+
     async_helpers_module = types.ModuleType(f"{package_name}.utils.async_helpers")
     async_helpers_module.run_async_in_server_loop = lambda coro, timeout=None: (_ for _ in ()).throw(
         RuntimeError(f"run_async_in_server_loop should not be used in these tests (timeout={timeout})")
@@ -139,6 +147,7 @@ def _load_distributed_upscale_module():
     package_name = "dist_distributed_upscale_testpkg"
     _bootstrap_package(package_name)
     _load_module(package_name, "nodes/hidden_inputs.py", "nodes.hidden_inputs")
+    _load_module(package_name, "upscale/mode_contexts.py", "upscale.mode_contexts")
     _load_module(package_name, "upscale/processing_args.py", "upscale.processing_args")
     return _load_module(package_name, "nodes/distributed_upscale.py", "nodes.distributed_upscale")
 

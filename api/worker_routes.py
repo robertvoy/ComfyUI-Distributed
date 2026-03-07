@@ -25,27 +25,27 @@ from ..utils.network import (
 )
 from ..utils.constants import CHUNK_SIZE
 from ..workers import get_worker_manager
-from .schemas import require_fields, validate_worker_id
+from .request_guards import authorization_error_or_none
+from .schemas import (
+    distributed_auth_headers,
+    require_fields,
+    require_worker_id,
+)
 from ..workers.detection import (
     get_machine_id,
     is_docker_environment,
     is_runpod_environment,
 )
-try:
-    from ..utils.async_helpers import PromptValidationError, queue_prompt_payload
-except ImportError:
-    from ..utils.async_helpers import queue_prompt_payload
-
-    class PromptValidationError(RuntimeError):
-        def __init__(self, message, validation_error=None, node_errors=None):
-            super().__init__(str(message))
-            self.validation_error = validation_error if isinstance(validation_error, dict) else {}
-            self.node_errors = node_errors if isinstance(node_errors, dict) else {}
+from ..utils.async_helpers import PromptValidationError, queue_prompt_payload
 
 
 @server.PromptServer.instance.routes.get("/distributed/worker_ws")
-async def worker_ws_endpoint(request: web.Request) -> web.WebSocketResponse:
+async def worker_ws_endpoint(request: web.Request) -> web.StreamResponse:
     """WebSocket endpoint for worker prompt dispatch."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
+
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
 
@@ -118,6 +118,9 @@ async def worker_ws_endpoint(request: web.Request) -> web.WebSocketResponse:
 @server.PromptServer.instance.routes.post("/distributed/worker/clear_launching")
 async def clear_launching_state(request: web.Request) -> web.StreamResponse:
     """Clear the launching flag when worker is confirmed running."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         wm = get_worker_manager()
         data = await request.json()
@@ -127,8 +130,10 @@ async def clear_launching_state(request: web.Request) -> web.StreamResponse:
 
         worker_id = str(data.get("worker_id")).strip()
         config = load_config()
-        if not validate_worker_id(worker_id, config):
-            return await handle_api_error(request, f"Worker {worker_id} not found", 404)
+        try:
+            worker_id = require_worker_id(worker_id, config)
+        except ValueError as exc:
+            return await handle_api_error(request, exc, 404)
         
         # Clear launching flag in managed processes
         if worker_id in wm.processes:
@@ -372,6 +377,9 @@ def _find_worker_by_id(config: dict[str, Any], worker_id: str) -> dict[str, Any]
 @server.PromptServer.instance.routes.get("/distributed/local_log")
 async def get_local_log_endpoint(request: web.Request) -> web.StreamResponse:
     """Return this instance's in-memory ComfyUI log buffer."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         from app.logger import get_logs
     except Exception as e:
@@ -417,6 +425,9 @@ async def get_local_log_endpoint(request: web.Request) -> web.StreamResponse:
 @server.PromptServer.instance.routes.get("/distributed/network_info")
 async def get_network_info_endpoint(request: web.Request) -> web.StreamResponse:
     """Get network interfaces and recommend best IP for master."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         loop = asyncio.get_running_loop()
         info = await loop.run_in_executor(None, _collect_network_info_sync)
@@ -432,6 +443,9 @@ async def get_network_info_endpoint(request: web.Request) -> web.StreamResponse:
 @server.PromptServer.instance.routes.get("/distributed/system_info")
 async def get_system_info_endpoint(request: web.Request) -> web.StreamResponse:
     """Get system information including machine ID for local worker detection."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         import socket
         
@@ -456,6 +470,9 @@ async def get_system_info_endpoint(request: web.Request) -> web.StreamResponse:
 @server.PromptServer.instance.routes.post("/distributed/launch_worker")
 async def launch_worker_endpoint(request: web.Request) -> web.StreamResponse:
     """Launch a worker process from the UI."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         wm = get_worker_manager()
         data = await request.json()
@@ -467,8 +484,10 @@ async def launch_worker_endpoint(request: web.Request) -> web.StreamResponse:
         
         # Find worker config
         config = load_config()
-        if not validate_worker_id(worker_id, config):
-            return await handle_api_error(request, f"Worker {worker_id} not found", 404)
+        try:
+            worker_id = require_worker_id(worker_id, config)
+        except ValueError as exc:
+            return await handle_api_error(request, exc, 404)
         worker = next((w for w in config.get("workers", []) if str(w.get("id")) == worker_id), None)
         if not worker:
             return await handle_api_error(request, f"Worker {worker_id} not found", 404)
@@ -487,7 +506,7 @@ async def launch_worker_endpoint(request: web.Request) -> web.StreamResponse:
                 is_running = process.poll() is None
             else:
                 # Restored process without subprocess object
-                is_running = wm._is_process_running(proc_info['pid'])
+                is_running = wm.is_process_running(proc_info['pid'])
             
             if is_running:
                 return await handle_api_error(request, "Worker already running (managed by UI)", 409)
@@ -517,6 +536,9 @@ async def launch_worker_endpoint(request: web.Request) -> web.StreamResponse:
 @server.PromptServer.instance.routes.post("/distributed/stop_worker")
 async def stop_worker_endpoint(request: web.Request) -> web.StreamResponse:
     """Stop a worker process that was launched from the UI."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         wm = get_worker_manager()
         data = await request.json()
@@ -526,8 +548,10 @@ async def stop_worker_endpoint(request: web.Request) -> web.StreamResponse:
 
         worker_id = str(data.get("worker_id")).strip()
         config = load_config()
-        if not validate_worker_id(worker_id, config):
-            return await handle_api_error(request, f"Worker {worker_id} not found", 404)
+        try:
+            worker_id = require_worker_id(worker_id, config)
+        except ValueError as exc:
+            return await handle_api_error(request, exc, 404)
 
         success, message = wm.stop_worker(worker_id)
         
@@ -547,6 +571,9 @@ async def stop_worker_endpoint(request: web.Request) -> web.StreamResponse:
 @server.PromptServer.instance.routes.get("/distributed/managed_workers")
 async def get_managed_workers_endpoint(request: web.Request) -> web.StreamResponse:
     """Get list of workers managed by this UI instance."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         managed = get_worker_manager().get_managed_workers()
         return web.json_response({
@@ -560,6 +587,9 @@ async def get_managed_workers_endpoint(request: web.Request) -> web.StreamRespon
 @server.PromptServer.instance.routes.get("/distributed/local-worker-status")
 async def get_local_worker_status_endpoint(request: web.Request) -> web.StreamResponse:
     """Check status of all local workers (localhost/no host specified)."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         config = load_config()
         worker_statuses = {}
@@ -630,6 +660,9 @@ async def get_local_worker_status_endpoint(request: web.Request) -> web.StreamRe
 @server.PromptServer.instance.routes.get("/distributed/worker_log/{worker_id}")
 async def get_worker_log_endpoint(request: web.Request) -> web.StreamResponse:
     """Get log content for a specific worker."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         wm = get_worker_manager()
         worker_id = request.match_info['worker_id']
@@ -673,6 +706,9 @@ async def get_worker_log_endpoint(request: web.Request) -> web.StreamResponse:
 @server.PromptServer.instance.routes.get("/distributed/remote_worker_log/{worker_id}")
 async def get_remote_worker_log_endpoint(request: web.Request) -> web.StreamResponse:
     """Proxy a remote worker log request to the worker's local in-memory log endpoint."""
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
     try:
         worker_id = str(request.match_info["worker_id"]).strip()
         config = load_config()
@@ -695,6 +731,7 @@ async def get_remote_worker_log_endpoint(request: web.Request) -> web.StreamResp
         async with session.get(
             worker_url,
             params={"lines": str(lines_to_read)},
+            headers=distributed_auth_headers(config),
             timeout=aiohttp.ClientTimeout(total=5),
         ) as resp:
             if resp.status >= 400:

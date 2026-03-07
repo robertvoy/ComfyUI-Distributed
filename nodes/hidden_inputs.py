@@ -1,6 +1,15 @@
 from typing import Any
 
 
+def build_worker_identity_hidden_inputs() -> dict[str, tuple[str, dict[str, Any]]]:
+    """Hidden-input contract for worker identity context."""
+    return {
+        "is_worker": ("BOOLEAN", {"default": False}),
+        "enabled_worker_ids": ("STRING", {"default": "[]"}),
+        "worker_id": ("STRING", {"default": ""}),
+    }
+
+
 def build_distributed_hidden_inputs(
     *,
     include_assigned_branch: bool = False,
@@ -10,12 +19,10 @@ def build_distributed_hidden_inputs(
 ) -> dict[str, tuple[str, dict[str, Any]]]:
     hidden_inputs: dict[str, tuple[str, dict[str, Any]]] = {
         "multi_job_id": ("STRING", {"default": ""}),
-        "is_worker": ("BOOLEAN", {"default": False}),
         "master_url": ("STRING", {"default": ""}),
-        "enabled_worker_ids": ("STRING", {"default": "[]"}),
-        "worker_id": ("STRING", {"default": ""}),
         "delegate_only": ("BOOLEAN", {"default": False}),
     }
+    hidden_inputs.update(build_worker_identity_hidden_inputs())
     if include_assigned_branch:
         hidden_inputs["assigned_branch"] = (
             "INT",

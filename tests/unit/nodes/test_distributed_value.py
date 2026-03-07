@@ -28,6 +28,18 @@ class DistributedValueTests(unittest.TestCase):
         root_pkg.__path__ = []
         sys.modules[pkg_name] = root_pkg
 
+        nodes_pkg = types.ModuleType(f"{pkg_name}.nodes")
+        nodes_pkg.__path__ = []
+        sys.modules[f"{pkg_name}.nodes"] = nodes_pkg
+
+        hidden_inputs_mod = types.ModuleType(f"{pkg_name}.nodes.hidden_inputs")
+        hidden_inputs_mod.build_worker_identity_hidden_inputs = lambda: {
+            "is_worker": ("BOOLEAN", {"default": False}),
+            "enabled_worker_ids": ("STRING", {"default": "[]"}),
+            "worker_id": ("STRING", {"default": ""}),
+        }
+        sys.modules[f"{pkg_name}.nodes.hidden_inputs"] = hidden_inputs_mod
+
         utils_pkg = types.ModuleType(f"{pkg_name}.utils")
         utils_pkg.__path__ = []
         sys.modules[f"{pkg_name}.utils"] = utils_pkg
@@ -36,6 +48,16 @@ class DistributedValueTests(unittest.TestCase):
         logging_mod.debug_log = lambda *_a, **_k: None
         logging_mod.log = lambda *_a, **_k: None
         sys.modules[f"{pkg_name}.utils.logging"] = logging_mod
+
+        worker_ids_path = Path(__file__).resolve().parents[3] / "utils" / "worker_ids.py"
+        worker_ids_spec = importlib.util.spec_from_file_location(
+            f"{pkg_name}.utils.worker_ids",
+            worker_ids_path,
+        )
+        worker_ids_mod = importlib.util.module_from_spec(worker_ids_spec)
+        assert worker_ids_spec is not None and worker_ids_spec.loader is not None
+        worker_ids_spec.loader.exec_module(worker_ids_mod)
+        sys.modules[f"{pkg_name}.utils.worker_ids"] = worker_ids_mod
 
         spec = importlib.util.spec_from_file_location(
             f"{pkg_name}.nodes.utilities", module_path

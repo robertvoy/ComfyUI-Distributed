@@ -22,6 +22,10 @@ class JobStateMixin:
             return dict(job_data.completed_images)
         return {}
 
+    async def all_completed_tasks(self, multi_job_id):
+        """Public completed-task accessor."""
+        return await self._get_all_completed_tasks(multi_job_id)
+
     async def _get_next_image_index(self, multi_job_id):
         """Get next image index from pending queue for master."""
         prompt_server = ensure_tile_jobs_initialized()
@@ -38,6 +42,10 @@ class JobStateMixin:
             return await asyncio.wait_for(pending_queue.get(), timeout=1.0)
         except asyncio.TimeoutError:
             return None
+
+    async def next_image_index(self, multi_job_id):
+        """Public next-image accessor."""
+        return await self._get_next_image_index(multi_job_id)
 
     async def _get_next_tile_index(self, multi_job_id):
         """Get next tile index from pending queue for master in static mode."""
@@ -56,6 +64,10 @@ class JobStateMixin:
         except asyncio.TimeoutError:
             return None
 
+    async def next_tile_index(self, multi_job_id):
+        """Public next-tile accessor."""
+        return await self._get_next_tile_index(multi_job_id)
+
     async def _get_total_completed_count(self, multi_job_id):
         """Get total count of all completed images (master + workers)."""
         prompt_server = ensure_tile_jobs_initialized()
@@ -67,6 +79,10 @@ class JobStateMixin:
                 return len(job_data.completed_tasks)
             return 0
 
+    async def total_completed_count(self, multi_job_id):
+        """Public completed-count accessor."""
+        return await self._get_total_completed_count(multi_job_id)
+
     async def _get_all_completed_images(self, multi_job_id):
         """Get all completed images."""
         prompt_server = ensure_tile_jobs_initialized()
@@ -75,6 +91,10 @@ class JobStateMixin:
             if isinstance(job_data, ImageJobState):
                 return job_data.completed_images.copy()
             return {}
+
+    async def all_completed_images(self, multi_job_id):
+        """Public completed-image accessor."""
+        return await self._get_all_completed_images(multi_job_id)
 
     async def _get_pending_count(self, multi_job_id):
         """Get count of pending images in the queue."""
@@ -86,6 +106,10 @@ class JobStateMixin:
             if isinstance(job_data, TileJobState):
                 return job_data.pending_tasks.qsize()
             return 0
+
+    async def pending_count(self, multi_job_id):
+        """Public pending-count accessor."""
+        return await self._get_pending_count(multi_job_id)
 
     async def _drain_worker_results_queue(self, multi_job_id):
         """Drain pending worker results from queue and update completed images."""
@@ -130,6 +154,14 @@ class JobStateMixin:
 
         return collected
 
+    async def drain_worker_results_queue(self, multi_job_id):
+        """Public worker-result drain API."""
+        return await self._drain_worker_results_queue(multi_job_id)
+
     async def _check_and_requeue_timed_out_workers(self, multi_job_id, batch_size):
         """Check for timed out workers and requeue their assigned images."""
         return await check_and_requeue_timed_out_workers(multi_job_id, batch_size)
+
+    async def check_and_requeue_timed_out_workers(self, multi_job_id, batch_size):
+        """Public timeout-requeue API."""
+        return await self._check_and_requeue_timed_out_workers(multi_job_id, batch_size)

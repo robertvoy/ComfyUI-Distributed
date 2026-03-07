@@ -1,14 +1,26 @@
 from __future__ import annotations
 
-import asyncio, torch
+import asyncio, time, torch
 from typing import Any
 from PIL import Image
 from ...utils.logging import debug_log, log
 from ...utils.image import tensor_to_pil, pil_to_tensor
 from ...utils.async_helpers import run_async_in_server_loop
 from ...utils.config import get_worker_timeout_seconds
-from ...utils.constants import TILE_WAIT_TIMEOUT, TILE_SEND_TIMEOUT
+from ...utils.constants import (
+    JOB_POLL_INTERVAL,
+    JOB_POLL_MAX_ATTEMPTS,
+    TILE_WAIT_TIMEOUT,
+    TILE_SEND_TIMEOUT,
+)
 from ..job_store import ensure_tile_jobs_initialized, init_dynamic_job
+from ..mode_contexts import (
+    DynamicModeContext,
+    JobStateCollaborator,
+    ResultCollectorCollaborator,
+    TileOpsCollaborator,
+    WorkerCommsCollaborator,
+)
 from ..processing_args import UpscaleCoreArgs
 
 
@@ -17,10 +29,43 @@ class DynamicModeMixin:
     Dynamic (per-image queue) USDU mode behaviors for master and worker roles.
 
     Expected co-mixins on `self`:
-    - TileOpsMixin (`calculate_tiles`, `_slice_conditioning`, `_process_and_blend_tile`).
+    - TileOpsMixin (`calculate_tiles`, `slice_conditioning`, `process_and_blend_tile`).
     - JobStateMixin (image queue/task completion helpers).
-    - WorkerCommsMixin (`_request_image_from_master`, `_send_full_image_to_master`, `_send_heartbeat_to_master`).
+    - WorkerCommsMixin (`request_assignment`, `send_full_image`, `send_heartbeat`).
     """
+
+    def _build_dynamic_mode_context(self) -> DynamicModeContext:
+        """Build explicit collaborators for dynamic mode execution."""
+        return DynamicModeContext(
+            tile_ops=TileOpsCollaborator(self),
+            job_state=JobStateCollaborator(self),
+            worker_comms=WorkerCommsCollaborator(self),
+            result_collector=ResultCollectorCollaborator(self),
+        )
+
+    def _poll_job_ready_dynamic(
+        self,
+        multi_job_id: str,
+        master_url: str,
+        worker_id: str | None = None,
+        max_attempts: int = JOB_POLL_MAX_ATTEMPTS,
+        mode_context: DynamicModeContext | None = None,
+    ) -> bool:
+        """Poll master for job readiness using explicit worker-comms collaborator."""
+        context = mode_context or self._build_dynamic_mode_context()
+        for attempt in range(max_attempts):
+            ready = run_async_in_server_loop(
+                context.worker_comms.check_job_status(multi_job_id, master_url),
+                timeout=5.0,
+            )
+            if ready:
+                if worker_id:
+                    debug_log(f"Worker[{worker_id[:8]}] job {multi_job_id} ready after {attempt} attempts")
+                else:
+                    debug_log(f"Job {multi_job_id} ready after {attempt} attempts")
+                return True
+            time.sleep(JOB_POLL_INTERVAL)
+        return False
 
     def _handle_master_dynamic_idle_state(
         self,
@@ -28,36 +73,38 @@ class DynamicModeMixin:
         batch_size,
         consecutive_retries,
         max_consecutive_retries,
+        mode_context: DynamicModeContext | None = None,
     ):
         """Handle queue-empty state while master waits for worker progress."""
+        context = mode_context or self._build_dynamic_mode_context()
         drained_count = run_async_in_server_loop(
-            self._drain_worker_results_queue(multi_job_id),
+            context.job_state.drain_worker_results_queue(multi_job_id),
             timeout=5.0,
         )
-        run_async_in_server_loop(self._async_yield(), timeout=0.1)
+        run_async_in_server_loop(context.worker_comms.async_yield(), timeout=0.1)
 
         requeued_count = run_async_in_server_loop(
-            self._check_and_requeue_timed_out_workers(multi_job_id, batch_size),
+            context.job_state.check_and_requeue_timed_out_workers(multi_job_id, batch_size),
             timeout=5.0,
         )
-        run_async_in_server_loop(self._async_yield(), timeout=0.1)
+        run_async_in_server_loop(context.worker_comms.async_yield(), timeout=0.1)
 
         if requeued_count > 0:
             log(f"Requeued {requeued_count} images from timed out workers")
             return False, True, 0
 
         completed_now = run_async_in_server_loop(
-            self._get_total_completed_count(multi_job_id),
+            context.job_state.total_completed_count(multi_job_id),
             timeout=1.0,
         )
         log(f"USDU Dist: Images progress {completed_now}/{batch_size}")
         if completed_now >= batch_size:
             return True, False, consecutive_retries
 
-        run_async_in_server_loop(self._async_yield(), timeout=0.1)
+        run_async_in_server_loop(context.worker_comms.async_yield(), timeout=0.1)
 
         pending_count = run_async_in_server_loop(
-            self._get_pending_count(multi_job_id),
+            context.job_state.pending_count(multi_job_id),
             timeout=1.0,
         )
         if pending_count > 0:
@@ -82,10 +129,12 @@ class DynamicModeMixin:
         processed_count,
         result_images,
         upscaled_image,
+        mode_context: DynamicModeContext | None = None,
     ):
         """Collect remaining worker outputs and convert final images back to tensor."""
+        context = mode_context or self._build_dynamic_mode_context()
         all_completed = run_async_in_server_loop(
-            self._get_all_completed_images(multi_job_id),
+            context.job_state.all_completed_images(multi_job_id),
             timeout=5.0,
         )
         remaining_to_collect = batch_size - len(all_completed)
@@ -93,7 +142,7 @@ class DynamicModeMixin:
             debug_log(f"Waiting for {remaining_to_collect} more images from workers")
             collection_timeout = float(get_worker_timeout_seconds())
             collected_images = run_async_in_server_loop(
-                self._async_collect_dynamic_images(
+                context.result_collector.collect_dynamic_images(
                     multi_job_id,
                     remaining_to_collect,
                     num_workers,
@@ -128,8 +177,10 @@ class DynamicModeMixin:
         force_uniform_tiles: bool,
         multi_job_id: str,
         enabled_workers: list[str],
+        mode_context: DynamicModeContext | None = None,
     ) -> tuple[torch.Tensor]:
         """Dynamic mode for large batches - assigns whole images to workers dynamically, including master."""
+        context = mode_context or self._build_dynamic_mode_context()
         # Get batch size and dimensions
         batch_size, height, width, _ = upscaled_image.shape
         num_workers = len(enabled_workers)
@@ -142,7 +193,7 @@ class DynamicModeMixin:
         debug_log(f"Processing {batch_size} images dynamically across master + {num_workers} workers.")
         
         # Calculate tiles for processing
-        all_tiles = self.calculate_tiles(width, height, tile_width, tile_height, force_uniform_tiles)
+        all_tiles = context.tile_ops.calculate_tiles(width, height, tile_width, tile_height, force_uniform_tiles)
         
         # Initialize job queue for communication
         try:
@@ -167,7 +218,7 @@ class DynamicModeMixin:
         while processed_count < batch_size:
             # Try to get an image to process
             image_idx = run_async_in_server_loop(
-                self._get_next_image_index(multi_job_id),
+                context.job_state.next_image_index(multi_job_id),
                 timeout=5.0  # Short timeout to allow frequent checks
             )
 
@@ -183,7 +234,7 @@ class DynamicModeMixin:
                 image_seed = core_args.seed
                 
                 # Pre-slice conditioning once per image (not per tile)
-                positive_sliced, negative_sliced = self._slice_conditioning(
+                positive_sliced, negative_sliced = context.tile_ops.slice_conditioning(
                     core_args.positive,
                     core_args.negative,
                     image_idx,
@@ -193,7 +244,7 @@ class DynamicModeMixin:
                     source_tensor = pil_to_tensor(local_image)
                     if single_tensor.is_cuda:
                         source_tensor = source_tensor.cuda()
-                    local_image = self._process_and_blend_tile(
+                    local_image = context.tile_ops.process_and_blend_tile(
                         tile_idx, pos, source_tensor, local_image,
                         core_args.model,
                         positive_sliced,
@@ -213,20 +264,20 @@ class DynamicModeMixin:
                     )
                     
                     # Yield after each tile to minimize worker downtime
-                    run_async_in_server_loop(self._async_yield(), timeout=0.1)
+                    run_async_in_server_loop(context.worker_comms.async_yield(), timeout=0.1)
                     # Note: No per-tile drain here – that's what makes this "per-image"
                 
                 result_images[image_idx] = local_image
                 
                 # Mark as completed
                 run_async_in_server_loop(
-                    self._mark_image_completed(multi_job_id, image_idx, local_image),
+                    context.result_collector.mark_image_completed(multi_job_id, image_idx, local_image),
                     timeout=5.0
                 )
                 
                 # NEW: Drain after the full image is marked complete (catches workers who finished during master's processing)
                 drained_count = run_async_in_server_loop(
-                    self._drain_worker_results_queue(multi_job_id),
+                    context.job_state.drain_worker_results_queue(multi_job_id),
                     timeout=5.0
                 )
                 
@@ -235,19 +286,20 @@ class DynamicModeMixin:
                 
                 # NEW: Log overall progress (includes master's image + any drained workers)
                 completed_now = run_async_in_server_loop(
-                    self._get_total_completed_count(multi_job_id),
+                    context.job_state.total_completed_count(multi_job_id),
                     timeout=1.0
                 )
                 log(f"USDU Dist: Images progress {completed_now}/{batch_size}")
                 
                 # Yield to allow workers to get new images after completing one
-                run_async_in_server_loop(self._async_yield(), timeout=0.1)
+                run_async_in_server_loop(context.worker_comms.async_yield(), timeout=0.1)
             else:
                 should_break, should_continue, consecutive_retries = self._handle_master_dynamic_idle_state(
                     multi_job_id=multi_job_id,
                     batch_size=batch_size,
                     consecutive_retries=consecutive_retries,
                     max_consecutive_retries=max_consecutive_retries,
+                    mode_context=context,
                 )
                 if should_break:
                     break
@@ -262,6 +314,7 @@ class DynamicModeMixin:
             processed_count=processed_count,
             result_images=result_images,
             upscaled_image=upscaled_image,
+            mode_context=context,
         )
         
         debug_log(f"UltimateSDUpscale Master - Job {multi_job_id} complete")
@@ -282,33 +335,43 @@ class DynamicModeMixin:
         worker_id: str,
         enabled_worker_ids: list[str] | str,
         dynamic_threshold: int,
+        mode_context: DynamicModeContext | None = None,
     ) -> tuple[torch.Tensor]:
         """Worker processing in dynamic mode - processes whole images."""
+        context = mode_context or self._build_dynamic_mode_context()
         # Round tile dimensions
-        tile_width = self.round_to_multiple(tile_width)
-        tile_height = self.round_to_multiple(tile_height)
+        tile_width = context.tile_ops.round_to_multiple(tile_width)
+        tile_height = context.tile_ops.round_to_multiple(tile_height)
 
         # Get dimensions and tile grid
         batch_size, height, width, _ = upscaled_image.shape
-        all_tiles = self.calculate_tiles(width, height, tile_width, tile_height, force_uniform_tiles)
+        all_tiles = context.tile_ops.calculate_tiles(width, height, tile_width, tile_height, force_uniform_tiles)
         log(f"USDU Dist Worker[{worker_id[:8]}]: Processing image queue | Batch {batch_size}")
 
         # Keep track of processed images for is_last detection
         processed_count = 0
 
         # Poll for job readiness to avoid races during master init
-        max_poll_attempts = 20  # ~20s at 1s sleep
-        if not self._poll_job_ready(multi_job_id, master_url, worker_id=worker_id, max_attempts=max_poll_attempts):
+        max_poll_attempts = JOB_POLL_MAX_ATTEMPTS
+        if not self._poll_job_ready_dynamic(
+            multi_job_id,
+            master_url,
+            worker_id=worker_id,
+            max_attempts=max_poll_attempts,
+            mode_context=context,
+        ):
             log(f"Job {multi_job_id} not ready after {max_poll_attempts} attempts, aborting")
             return (upscaled_image,)
 
         # Loop to request and process images
         while True:
             # Request an image to process
-            image_idx, estimated_remaining = run_async_in_server_loop(
-                self._request_image_from_master(multi_job_id, master_url, worker_id),
-                timeout=TILE_WAIT_TIMEOUT
+            assignment = run_async_in_server_loop(
+                context.worker_comms.request_assignment(multi_job_id, master_url, worker_id),
+                timeout=TILE_WAIT_TIMEOUT,
             )
+            image_idx = assignment.task_idx if assignment.kind == "image" else None
+            estimated_remaining = assignment.estimated_remaining
 
             if image_idx is None:
                 debug_log(f"USDU Dist Worker - No more images to process")
@@ -330,7 +393,7 @@ class DynamicModeMixin:
             image_seed = core_args.seed
 
             # Pre-slice conditioning once per image (not per tile)
-            positive_sliced, negative_sliced = self._slice_conditioning(
+            positive_sliced, negative_sliced = context.tile_ops.slice_conditioning(
                 core_args.positive,
                 core_args.negative,
                 image_idx,
@@ -340,7 +403,7 @@ class DynamicModeMixin:
                 source_tensor = pil_to_tensor(local_image)
                 if single_tensor.is_cuda:
                     source_tensor = source_tensor.cuda()
-                local_image = self._process_and_blend_tile(
+                local_image = context.tile_ops.process_and_blend_tile(
                     tile_idx, pos, source_tensor, local_image,
                     core_args.model,
                     positive_sliced,
@@ -359,7 +422,7 @@ class DynamicModeMixin:
                     batch_idx=image_idx,
                 )
                 run_async_in_server_loop(
-                    self._send_heartbeat_to_master(multi_job_id, master_url, worker_id),
+                    context.worker_comms.send_heartbeat(multi_job_id, master_url, worker_id),
                     timeout=5.0
                 )
 
@@ -368,13 +431,19 @@ class DynamicModeMixin:
                 # Use the estimated remaining to determine if this is the last image
                 is_last = is_last_for_worker
                 run_async_in_server_loop(
-                    self._send_full_image_to_master(local_image, image_idx, multi_job_id,
-                                                    master_url, worker_id, is_last),
+                    context.worker_comms.send_full_image(
+                        local_image,
+                        image_idx,
+                        multi_job_id,
+                        master_url,
+                        worker_id,
+                        is_last,
+                    ),
                     timeout=TILE_SEND_TIMEOUT
                 )
                 # Send heartbeat after processing
                 run_async_in_server_loop(
-                    self._send_heartbeat_to_master(multi_job_id, master_url, worker_id),
+                    context.worker_comms.send_heartbeat(multi_job_id, master_url, worker_id),
                     timeout=5.0
                 )
                 if is_last:
@@ -387,7 +456,7 @@ class DynamicModeMixin:
         debug_log(f"Worker[{worker_id[:8]}] processed {processed_count} images, sending completion signal")
         try:
             run_async_in_server_loop(
-                self._send_worker_complete_signal(multi_job_id, master_url, worker_id),
+                context.worker_comms.send_worker_complete_signal(multi_job_id, master_url, worker_id),
                 timeout=TILE_SEND_TIMEOUT
             )
         except Exception as e:

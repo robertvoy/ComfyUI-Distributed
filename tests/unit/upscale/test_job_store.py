@@ -27,9 +27,33 @@ def _bootstrap_package(package_name):
     logging_module.debug_log = lambda *_args, **_kwargs: None
     sys.modules[f"{package_name}.utils.logging"] = logging_module
 
-    server_module = types.ModuleType("server")
-    server_module.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace())
-    sys.modules["server"] = server_module
+    prompt_server = types.SimpleNamespace()
+
+    runtime_state_module = types.ModuleType(f"{package_name}.utils.runtime_state")
+
+    def _ensure_distributed_runtime_state(server_instance=None):
+        ps = server_instance or prompt_server
+        if not hasattr(ps, "distributed_pending_jobs"):
+            ps.distributed_pending_jobs = {}
+        if not hasattr(ps, "distributed_jobs_lock"):
+            ps.distributed_jobs_lock = asyncio.Lock()
+        if not hasattr(ps, "distributed_job_allowed_workers"):
+            ps.distributed_job_allowed_workers = {}
+        if not hasattr(ps, "distributed_pending_tile_jobs"):
+            ps.distributed_pending_tile_jobs = {}
+        if not hasattr(ps, "distributed_tile_jobs_lock"):
+            ps.distributed_tile_jobs_lock = asyncio.Lock()
+        return types.SimpleNamespace(
+            distributed_pending_jobs=ps.distributed_pending_jobs,
+            distributed_jobs_lock=ps.distributed_jobs_lock,
+            distributed_job_allowed_workers=ps.distributed_job_allowed_workers,
+            distributed_pending_tile_jobs=ps.distributed_pending_tile_jobs,
+            distributed_tile_jobs_lock=ps.distributed_tile_jobs_lock,
+        )
+
+    runtime_state_module.ensure_distributed_runtime_state = _ensure_distributed_runtime_state
+    runtime_state_module.get_prompt_server_instance = lambda: prompt_server
+    sys.modules[f"{package_name}.utils.runtime_state"] = runtime_state_module
 
 
 def _load_module(package_name, module_rel_path, module_name):
@@ -58,7 +82,7 @@ job_models_module, job_store_module = _load_job_store_modules()
 
 class JobStoreTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.prompt_server = job_store_module.server.PromptServer.instance
+        self.prompt_server = job_store_module.get_prompt_server_instance()
         self.prompt_server.distributed_pending_tile_jobs = {}
         self.prompt_server.distributed_tile_jobs_lock = asyncio.Lock()
 

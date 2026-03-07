@@ -53,7 +53,6 @@ Queue a workflow for distributed execution.
   "delegate_master": false,
   "enabled_worker_ids": ["1", "2"],
   "workers": ["1", "2"],
-  "auto_prepare": true,
   "trace_execution_id": "exec_1700000000_ab12cd"
 }
 ```
@@ -74,10 +73,6 @@ Queue a workflow for distributed execution.
   - The explicit worker IDs to consider for this run.
 - `workers` (optional, array of strings or objects with `id`)
   - Transitional alias for `enabled_worker_ids` used by older clients.
-- `auto_prepare` (optional, boolean)
-  - Kept for wire compatibility.
-  - Backend orchestration always runs with auto-prepare semantics.
-  - If top-level `prompt` is omitted, backend will attempt `workflow.prompt`.
 - `trace_execution_id` (optional, string)
   - Passed through to orchestration logs.
   - Server log lines include the marker as `[exec:<trace_execution_id>]`.
@@ -105,8 +100,7 @@ $cfg.workers | Select-Object id,name,enabled,host,port,type | Format-Table -Auto
 ```json
 {
   "prompt_id": "<uuid>",
-  "worker_count": 2,
-  "auto_prepare_supported": true
+  "worker_count": 2
 }
 ```
 

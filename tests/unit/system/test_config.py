@@ -21,14 +21,13 @@ def _load_config_module():
     root_pkg.__path__ = []
     sys.modules[package_name] = root_pkg
 
-    logging_module = types.ModuleType(f"{package_name}.logging")
-    logging_module.log = lambda *_args, **_kwargs: None
-    logging_module.debug_log = lambda *_args, **_kwargs: None
-    sys.modules[f"{package_name}.logging"] = logging_module
-
     constants_module = types.ModuleType(f"{package_name}.constants")
     constants_module.GPU_CONFIG_FILE = "gpu_config.json"
     constants_module.HEARTBEAT_TIMEOUT = 30
+    constants_module.ORCHESTRATION_WORKER_PROBE_CONCURRENCY = 8
+    constants_module.ORCHESTRATION_WORKER_PREP_CONCURRENCY = 4
+    constants_module.ORCHESTRATION_MEDIA_SYNC_CONCURRENCY = 2
+    constants_module.ORCHESTRATION_MEDIA_SYNC_TIMEOUT = 120
     sys.modules[f"{package_name}.constants"] = constants_module
 
     spec = importlib.util.spec_from_file_location(f"{package_name}.config", module_path)

@@ -7,6 +7,8 @@ from typing import Any
 
 import aiohttp
 
+from ...utils.auth import distributed_auth_headers
+from ...utils.config import load_config
 from ...utils.logging import debug_log, log
 from ...utils.network import build_worker_url, get_client_session
 from ...utils.trace_logger import trace_debug, trace_info
@@ -132,8 +134,9 @@ async def fetch_worker_path_separator(
     """Best-effort fetch of a worker's path separator from /distributed/system_info."""
     url = build_worker_url(worker, "/distributed/system_info")
     session = await get_client_session()
+    headers = distributed_auth_headers(load_config())
     try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status != 200:
                 return None
             payload = await resp.json()
@@ -150,6 +153,7 @@ async def fetch_worker_path_separator(
 async def _upload_media_to_worker(worker, filename, file_bytes, file_hash, mime_type, trace_execution_id=None):
     """Upload one media file to worker iff missing or hash-mismatched."""
     session = await get_client_session()
+    headers = distributed_auth_headers(load_config())
     normalized = filename.replace("\\", "/")
 
     check_url = build_worker_url(worker, "/distributed/check_file")
@@ -157,6 +161,7 @@ async def _upload_media_to_worker(worker, filename, file_bytes, file_hash, mime_
         async with session.post(
             check_url,
             json={"filename": normalized, "hash": file_hash},
+            headers=headers,
             timeout=aiohttp.ClientTimeout(total=6),
         ) as resp:
             if resp.status == 200:

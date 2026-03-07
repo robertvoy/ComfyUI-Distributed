@@ -3,7 +3,7 @@ import base64
 import io
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
@@ -12,12 +12,13 @@ import comfy.model_management
 import torch
 from comfy.utils import ProgressBar
 
+from ..utils.auth import distributed_auth_headers
 from ..utils.logging import debug_log, log
 from ..utils.config import get_worker_timeout_seconds, load_config, is_master_delegate_only
 from ..utils.constants import HEARTBEAT_INTERVAL
 from ..utils.image import tensor_to_pil, pil_to_tensor, ensure_contiguous
 from ..utils.network import build_worker_url, get_client_session, probe_worker
-from ..utils.worker_ids import parse_enabled_worker_ids
+from ..utils.worker_ids import coerce_enabled_worker_ids
 from ..utils.audio_payload import encode_audio_payload
 from ..utils.async_helpers import run_async_in_server_loop
 from .context_kwargs import parse_distributed_hidden_context
@@ -31,7 +32,7 @@ class CollectorRunContext:
     multi_job_id: str = ""
     is_worker: bool = False
     master_url: str = ""
-    enabled_worker_ids: str = "[]"
+    enabled_worker_ids: list[str] = field(default_factory=list)
     worker_batch_size: int = 1
     worker_id: str = ""
     pass_through: bool = False
@@ -142,6 +143,7 @@ class DistributedCollectorNode:
                 async with session.post(
                     url,
                     json=payload,
+                    headers=distributed_auth_headers(load_config()),
                     timeout=aiohttp.ClientTimeout(total=60),
                 ) as response:
                     response.raise_for_status()
@@ -280,6 +282,8 @@ class DistributedCollectorNode:
         async with prompt_server.distributed_jobs_lock:
             if multi_job_id in prompt_server.distributed_pending_jobs:
                 del prompt_server.distributed_pending_jobs[multi_job_id]
+            if hasattr(prompt_server, "distributed_job_allowed_workers"):
+                prompt_server.distributed_job_allowed_workers.pop(multi_job_id, None)
 
     def _build_master_inputs(self, images, audio, delegate_mode, multi_job_id, num_workers):
         if delegate_mode:
@@ -452,7 +456,7 @@ class DistributedCollectorNode:
         delegate_only,
     ):
         delegate_mode = delegate_only or is_master_delegate_only()
-        enabled_workers = parse_enabled_worker_ids(enabled_worker_ids)
+        enabled_workers = coerce_enabled_worker_ids(enabled_worker_ids)
         expected_workers = set(enabled_workers)
         num_workers = len(expected_workers)
         if num_workers == 0:

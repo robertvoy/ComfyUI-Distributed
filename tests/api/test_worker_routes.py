@@ -8,6 +8,14 @@ from collections import deque
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.api.harness import (
+    bootstrap_test_package,
+    cleanup_optional_module,
+    install_aiohttp_stub,
+    install_request_guards_stub,
+    install_server_stub,
+)
+
 
 class _FakeResponse:
     def __init__(self, payload, status=200):
@@ -16,10 +24,11 @@ class _FakeResponse:
 
 
 class _FakeRequest:
-    def __init__(self, payload=None, match_info=None, query=None):
+    def __init__(self, payload=None, match_info=None, query=None, headers=None):
         self._payload = payload
         self.match_info = match_info or {}
         self.query = query or {}
+        self.headers = headers or {}
 
     async def json(self):
         return self._payload
@@ -49,8 +58,8 @@ class _FakeHTTPClientSession:
         self._status = status
         self.calls = []
 
-    def get(self, url, params=None, timeout=None):
-        self.calls.append({"url": url, "params": params, "timeout": timeout})
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
         return _FakeHTTPClientResponse(self._payload, status=self._status)
 
 
@@ -67,7 +76,7 @@ class _DummyWorkerManager:
         }
         return 12345
 
-    def _is_process_running(self, _pid):
+    def is_process_running(self, _pid):
         return False
 
     def save_processes(self):
@@ -89,21 +98,7 @@ def _load_worker_routes_module():
     module_path = Path(__file__).resolve().parents[2] / "api" / "worker_routes.py"
     package_name = "dist_api_worker_testpkg"
 
-    for mod_name in list(sys.modules):
-        if mod_name == package_name or mod_name.startswith(f"{package_name}."):
-            del sys.modules[mod_name]
-
-    root_pkg = types.ModuleType(package_name)
-    root_pkg.__path__ = []
-    sys.modules[package_name] = root_pkg
-
-    api_pkg = types.ModuleType(f"{package_name}.api")
-    api_pkg.__path__ = []
-    sys.modules[f"{package_name}.api"] = api_pkg
-
-    utils_pkg = types.ModuleType(f"{package_name}.utils")
-    utils_pkg.__path__ = []
-    sys.modules[f"{package_name}.utils"] = utils_pkg
+    bootstrap_test_package(package_name, with_api=True, with_utils=True, with_workers=True)
 
     workers_pkg = types.ModuleType(f"{package_name}.workers")
     workers_pkg.__path__ = []
@@ -119,59 +114,10 @@ def _load_worker_routes_module():
     detection_module.get_comms_channel = lambda *_args, **_kwargs: "lan"
     sys.modules[f"{package_name}.workers.detection"] = detection_module
 
-    created_aiohttp_stub = False
-    if "aiohttp" not in sys.modules:
-        created_aiohttp_stub = True
-        aiohttp_module = types.ModuleType("aiohttp")
-
-        class _ClientTimeout:
-            def __init__(self, total=None):
-                self.total = total
-
-        class _WSMsgType:
-            TEXT = "TEXT"
-            ERROR = "ERROR"
-            CLOSED = "CLOSED"
-
-        class _WebSocketResponse:
-            def __init__(self, *args, **kwargs):
-                self.args = args
-                self.kwargs = kwargs
-
-            async def prepare(self, _request):
-                return None
-
-            async def send_json(self, _payload):
-                return None
-
-            def __aiter__(self):
-                async def _empty():
-                    if False:
-                        yield None
-                return _empty()
-
-        aiohttp_module.ClientTimeout = _ClientTimeout
-        aiohttp_module.WSMsgType = _WSMsgType
-        aiohttp_module.web = types.SimpleNamespace(
-            json_response=lambda payload, status=200: _FakeResponse(payload, status=status),
-            WebSocketResponse=_WebSocketResponse,
-        )
-        sys.modules["aiohttp"] = aiohttp_module
-
-    class _Routes:
-        def get(self, _path):
-            def _decorator(fn):
-                return fn
-            return _decorator
-
-        def post(self, _path):
-            def _decorator(fn):
-                return fn
-            return _decorator
-
-    server_module = types.ModuleType("server")
-    server_module.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(routes=_Routes()))
-    sys.modules["server"] = server_module
+    created_aiohttp_stub = install_aiohttp_stub(
+        lambda payload, status=200: _FakeResponse(payload, status=status)
+    )
+    install_server_stub()
 
     created_torch_stub = False
     if "torch" not in sys.modules:
@@ -248,19 +194,29 @@ def _load_worker_routes_module():
     def _validate_worker_id(worker_id, config):
         return any(str(worker.get("id")) == str(worker_id) for worker in config.get("workers", []))
 
+    def _require_worker_id(worker_id, config, field_name="worker_id"):
+        _ = field_name
+        worker_id_str = str(worker_id).strip()
+        if any(str(worker.get("id")) == worker_id_str for worker in config.get("workers", [])):
+            return worker_id_str
+        raise ValueError(f"Worker {worker_id_str} not found")
+
     schemas_module.require_fields = _require_fields
     schemas_module.validate_worker_id = _validate_worker_id
+    schemas_module.require_worker_id = _require_worker_id
+    schemas_module.is_authorized_request = lambda _request, _config: True
+    schemas_module.distributed_auth_headers = lambda _config: {}
     sys.modules[f"{package_name}.api.schemas"] = schemas_module
+
+    install_request_guards_stub(package_name)
 
     spec = importlib.util.spec_from_file_location(f"{package_name}.api.worker_routes", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
     spec.loader.exec_module(module)
 
-    if created_aiohttp_stub:
-        sys.modules.pop("aiohttp", None)
-    if created_torch_stub:
-        sys.modules.pop("torch", None)
+    cleanup_optional_module("aiohttp", created_aiohttp_stub)
+    cleanup_optional_module("torch", created_torch_stub)
 
     return module
 

@@ -5,7 +5,6 @@ Network and API utilities for ComfyUI-Distributed.
 """
 import asyncio
 import aiohttp
-import server
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -22,6 +21,12 @@ class _NetworkState:
 @lru_cache(maxsize=1)
 def _network_state() -> _NetworkState:
     return _NetworkState()
+
+
+def _prompt_server_instance() -> Any:
+    import server
+
+    return server.PromptServer.instance
 
 async def get_client_session() -> aiohttp.ClientSession:
     """Get or create a shared aiohttp client session."""
@@ -50,28 +55,45 @@ async def handle_api_error(request: web.Request, error: Any, status: int = 500) 
     if isinstance(error, list):
         messages = [str(item) for item in error]
         debug_log(f"API Error [{status}]: {messages}")
-        return web.json_response({"errors": messages}, status=status)
+        return web.json_response(
+            {
+                "status": "error",
+                "error": messages,
+                "message": "; ".join(messages),
+            },
+            status=status,
+        )
 
     if isinstance(error, DistributedError):
         debug_log(f"API Error [{status}] ({error.__class__.__name__}): {error}")
         return web.json_response(
-            {"error": str(error), "error_type": error.__class__.__name__},
+            {
+                "status": "error",
+                "error": str(error),
+                "message": str(error),
+                "error_type": error.__class__.__name__,
+            },
             status=status,
         )
 
     message = str(error)
     debug_log(f"API Error [{status}]: {message}")
-    return web.json_response({"error": message}, status=status)
+    return web.json_response(
+        {
+            "status": "error",
+            "error": message,
+            "message": message,
+        },
+        status=status,
+    )
 
 def get_server_port() -> int:
     """Get the ComfyUI server port."""
-    import server
-    return server.PromptServer.instance.port
+    return _prompt_server_instance().port
 
 def get_server_loop() -> asyncio.AbstractEventLoop:
     """Get the ComfyUI server event loop."""
-    import server
-    return server.PromptServer.instance.loop
+    return _prompt_server_instance().loop
 
 
 def normalize_host(value: Any) -> Any:
@@ -94,7 +116,7 @@ def build_worker_url(worker: dict[str, Any], endpoint: str = "") -> str:
     port = int(worker.get("port", worker.get("listen_port", 8188)) or 8188)
 
     if not host:
-        host = getattr(server.PromptServer.instance, "address", "127.0.0.1") or "127.0.0.1"
+        host = getattr(_prompt_server_instance(), "address", "127.0.0.1") or "127.0.0.1"
 
     if host.startswith(("http://", "https://")):
         base = host.rstrip("/")
@@ -148,7 +170,7 @@ def build_master_url(
         from .config import load_config
         config = load_config()
 
-    prompt_server_instance = prompt_server_instance or server.PromptServer.instance
+    prompt_server_instance = prompt_server_instance or _prompt_server_instance()
     master_cfg = (config or {}).get("master", {}) or {}
     configured_host = (master_cfg.get("host") or "").strip()
     configured_port = master_cfg.get("port")

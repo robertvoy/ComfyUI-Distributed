@@ -4,30 +4,29 @@ import types
 import unittest
 from pathlib import Path
 
+from tests.api.harness import (
+    bootstrap_test_package,
+    cleanup_optional_module,
+    install_aiohttp_stub,
+)
+
+
+class _AiohttpResponse:
+    def __init__(self, payload, status=200):
+        self.payload = payload
+        self.status = status
+
 
 def _load_media_sync_module():
     module_path = Path(__file__).resolve().parents[2] / "api" / "orchestration" / "media_sync.py"
     package_name = "dist_ms_testpkg"
 
-    for mod_name in list(sys.modules):
-        if mod_name == package_name or mod_name.startswith(f"{package_name}."):
-            del sys.modules[mod_name]
-
-    root_pkg = types.ModuleType(package_name)
-    root_pkg.__path__ = []
-    sys.modules[package_name] = root_pkg
-
-    api_pkg = types.ModuleType(f"{package_name}.api")
-    api_pkg.__path__ = []
-    sys.modules[f"{package_name}.api"] = api_pkg
-
-    orch_pkg = types.ModuleType(f"{package_name}.api.orchestration")
-    orch_pkg.__path__ = []
-    sys.modules[f"{package_name}.api.orchestration"] = orch_pkg
-
-    utils_pkg = types.ModuleType(f"{package_name}.utils")
-    utils_pkg.__path__ = []
-    sys.modules[f"{package_name}.utils"] = utils_pkg
+    bootstrap_test_package(
+        package_name,
+        with_api=True,
+        with_utils=True,
+        with_orchestration=True,
+    )
 
     logging_module = types.ModuleType(f"{package_name}.utils.logging")
     logging_module.debug_log = lambda *_args, **_kwargs: None
@@ -48,22 +47,17 @@ def _load_media_sync_module():
     trace_module.trace_info = lambda *_args, **_kwargs: None
     sys.modules[f"{package_name}.utils.trace_logger"] = trace_module
 
-    created_aiohttp_stub = False
-    if "aiohttp" not in sys.modules:
-        created_aiohttp_stub = True
-        aiohttp_module = types.ModuleType("aiohttp")
+    auth_module = types.ModuleType(f"{package_name}.utils.auth")
+    auth_module.distributed_auth_headers = lambda _config=None: {}
+    sys.modules[f"{package_name}.utils.auth"] = auth_module
 
-        class _ClientTimeout:
-            def __init__(self, total=None):
-                pass
+    config_module = types.ModuleType(f"{package_name}.utils.config")
+    config_module.load_config = lambda: {"settings": {}}
+    sys.modules[f"{package_name}.utils.config"] = config_module
 
-        class _FormData:
-            def add_field(self, *args, **kwargs):
-                pass
-
-        aiohttp_module.ClientTimeout = _ClientTimeout
-        aiohttp_module.FormData = _FormData
-        sys.modules["aiohttp"] = aiohttp_module
+    created_aiohttp_stub = install_aiohttp_stub(
+        lambda payload, status=200: _AiohttpResponse(payload, status=status)
+    )
 
     spec = importlib.util.spec_from_file_location(
         f"{package_name}.api.orchestration.media_sync",
@@ -73,8 +67,7 @@ def _load_media_sync_module():
     assert spec is not None and spec.loader is not None
     spec.loader.exec_module(module)
 
-    if created_aiohttp_stub:
-        sys.modules.pop("aiohttp", None)
+    cleanup_optional_module("aiohttp", created_aiohttp_stub)
 
     return module
 
@@ -260,3 +253,7 @@ class RewritePromptMediaInputsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    class _AiohttpResponse:
+        def __init__(self, payload, status=200):
+            self.payload = payload
+            self.status = status

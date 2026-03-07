@@ -81,16 +81,6 @@ def _delegate_prompt():
     }
 
 
-def _list_splitter_prompt():
-    """1(List source) → 2(DistributedListSplitter) → 3(DistributedListCollector) → 4(SaveImage)."""
-    return {
-        "1": {"class_type": "ImageListSource", "inputs": {}},
-        "2": {"class_type": "DistributedListSplitter", "inputs": {"images": ["1", 0]}},
-        "3": {"class_type": "DistributedListCollector", "inputs": {"images": ["2", 0]}},
-        "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0]}},
-    }
-
-
 def _branch_prompt():
     """1 → 2(DistributedBranch) -> slot0:3->4, slot1:5->6."""
     return {
@@ -285,14 +275,6 @@ class PrunePromptForWorkerTests(unittest.TestCase):
         self.assertIn("2", result)
         self.assertNotIn("3", result)
 
-    def test_list_collector_is_treated_as_distributed_anchor(self):
-        prompt = _list_splitter_prompt()
-        result = pt.prune_prompt_for_worker(prompt)
-        self.assertIn("1", result)
-        self.assertIn("2", result)
-        self.assertIn("3", result)
-        self.assertNotIn("4", result)
-
     def test_branch_anchor_keeps_downstream_for_later_branch_pruning(self):
         prompt = _branch_prompt()
         result = pt.prune_prompt_for_worker(prompt)
@@ -384,22 +366,6 @@ class GenerateJobIdMapTests(unittest.TestCase):
         idx = pt.PromptIndex(prompt)
         job_map = pt.generate_job_id_map(idx, "run")
         self.assertEqual(job_map["5"], "run_5")
-
-    def test_maps_list_collector_nodes(self):
-        prompt = {
-            "8": {"class_type": "DistributedListCollector", "inputs": {}},
-        }
-        idx = pt.PromptIndex(prompt)
-        job_map = pt.generate_job_id_map(idx, "run")
-        self.assertEqual(job_map["8"], "run_8")
-
-    def test_maps_list_splitter_nodes(self):
-        prompt = {
-            "7": {"class_type": "DistributedListSplitter", "inputs": {}},
-        }
-        idx = pt.PromptIndex(prompt)
-        job_map = pt.generate_job_id_map(idx, "run")
-        self.assertEqual(job_map["7"], "run_7")
 
     def test_maps_branch_collector_nodes(self):
         prompt = {
@@ -508,9 +474,9 @@ class ApplyOverridesSeedTests(unittest.TestCase):
         result = _apply(self._seed_prompt(), "worker-a")
         self.assertTrue(result["1"]["inputs"]["is_worker"])
 
-    def test_worker_id_reflects_index_in_enabled_list(self):
+    def test_worker_id_uses_canonical_worker_id(self):
         result = _apply(self._seed_prompt(), "worker-b", enabled_worker_ids=["worker-a", "worker-b"])
-        self.assertEqual(result["1"]["inputs"]["worker_id"], "worker_1")
+        self.assertEqual(result["1"]["inputs"]["worker_id"], "worker-b")
 
     def test_master_sets_is_worker_false(self):
         result = _apply(self._seed_prompt(), "master")
@@ -566,9 +532,9 @@ class ApplyOverridesValueTests(unittest.TestCase):
         result = _apply(self._value_prompt(), "worker-a")
         self.assertTrue(result["1"]["inputs"]["is_worker"])
 
-    def test_worker_id_reflects_index_in_enabled_list(self):
+    def test_worker_id_uses_canonical_worker_id(self):
         result = _apply(self._value_prompt(), "worker-b", enabled_worker_ids=["worker-a", "worker-b"])
-        self.assertEqual(result["1"]["inputs"]["worker_id"], "worker_1")
+        self.assertEqual(result["1"]["inputs"]["worker_id"], "worker-b")
 
     def test_master_sets_is_worker_false(self):
         result = _apply(self._value_prompt(), "master")
@@ -577,62 +543,6 @@ class ApplyOverridesValueTests(unittest.TestCase):
     def test_master_sets_empty_worker_id(self):
         result = _apply(self._value_prompt(), "master")
         self.assertEqual(result["1"]["inputs"]["worker_id"], "")
-
-
-class ApplyOverridesListSplitterTests(unittest.TestCase):
-    def _splitter_prompt(self):
-        return {"1": {"class_type": "DistributedListSplitter", "inputs": {}}}
-
-    def test_master_gets_participant_index_zero(self):
-        result = _apply(self._splitter_prompt(), "master", enabled_worker_ids=["worker-a", "worker-b"])
-        self.assertEqual(result["1"]["inputs"]["participant_index"], 0)
-        self.assertEqual(result["1"]["inputs"]["total_participants"], 3)
-        self.assertFalse(result["1"]["inputs"]["is_worker"])
-        self.assertNotIn("master_url", result["1"]["inputs"])
-        self.assertEqual(result["1"]["inputs"]["worker_id"], "master")
-        self.assertEqual(result["1"]["inputs"]["multi_job_id"], "run_1")
-
-    def test_worker_gets_incremented_participant_index(self):
-        result = _apply(self._splitter_prompt(), "worker-a", enabled_worker_ids=["worker-a", "worker-b"])
-        self.assertEqual(result["1"]["inputs"]["participant_index"], 1)
-        self.assertEqual(result["1"]["inputs"]["total_participants"], 3)
-        self.assertTrue(result["1"]["inputs"]["is_worker"])
-        self.assertEqual(result["1"]["inputs"]["worker_id"], "worker-a")
-        self.assertEqual(result["1"]["inputs"]["master_url"], "http://master.example.com")
-
-    def test_delegate_mode_shifts_worker_to_index_zero(self):
-        result = _apply(
-            self._splitter_prompt(),
-            "worker-a",
-            enabled_worker_ids=["worker-a", "worker-b"],
-            delegate_master=True,
-        )
-        self.assertEqual(result["1"]["inputs"]["participant_index"], 0)
-        self.assertEqual(result["1"]["inputs"]["total_participants"], 2)
-
-
-class ApplyOverridesListCollectorTests(unittest.TestCase):
-    def _collector_prompt(self):
-        return {"1": {"class_type": "DistributedListCollector", "inputs": {}}}
-
-    def test_worker_sets_master_url_and_worker_id(self):
-        result = _apply(self._collector_prompt(), "worker-a", enabled_worker_ids=["worker-a"])
-        self.assertTrue(result["1"]["inputs"]["is_worker"])
-        self.assertEqual(result["1"]["inputs"]["master_url"], "http://master.example.com")
-        self.assertEqual(result["1"]["inputs"]["worker_id"], "worker-a")
-
-    def test_master_sets_delegate_only_and_clears_worker_fields(self):
-        prompt = {
-            "1": {
-                "class_type": "DistributedListCollector",
-                "inputs": {"master_url": "stale", "worker_id": "stale"},
-            }
-        }
-        result = _apply(prompt, "master", enabled_worker_ids=["worker-a"], delegate_master=True)
-        self.assertFalse(result["1"]["inputs"]["is_worker"])
-        self.assertTrue(result["1"]["inputs"]["delegate_only"])
-        self.assertNotIn("master_url", result["1"]["inputs"])
-        self.assertNotIn("worker_id", result["1"]["inputs"])
 
 
 class ApplyOverridesBranchTests(unittest.TestCase):

@@ -105,6 +105,7 @@ def _load_single_gpu_mode_module():
     _bootstrap_package(package_name)
     _load_module(package_name, "upscale/processing_args.py", "upscale.processing_args")
     _load_module(package_name, "upscale/tile_processing.py", "upscale.tile_processing")
+    _load_module(package_name, "upscale/mode_contexts.py", "upscale.mode_contexts")
     return _load_module(package_name, "upscale/modes/single_gpu.py", "upscale.modes.single_gpu")
 
 

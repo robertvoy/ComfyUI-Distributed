@@ -15,7 +15,7 @@ class ProcessPersistence:
 
         for worker_id, proc_info in managed_processes.items():
             pid = proc_info.get("pid")
-            if pid and self._manager._is_process_running(pid):
+            if pid and self._manager.is_process_running(pid):
                 self._manager.processes[worker_id] = {
                     "pid": pid,
                     "process": None,
@@ -33,7 +33,7 @@ class ProcessPersistence:
         managed_processes = {}
 
         for worker_id, proc_info in self._manager.processes.items():
-            is_running, _ = self._manager._check_worker_process(worker_id, proc_info)
+            is_running, _ = self._manager.check_worker_process(worker_id, proc_info)
             if not is_running:
                 continue
             managed_processes[worker_id] = {

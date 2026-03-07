@@ -26,27 +26,26 @@ class QueueRequestPayloadTests(unittest.TestCase):
 
     def test_normalizes_enabled_worker_ids(self):
         payload_data = self._base_payload()
-        payload_data["enabled_worker_ids"] = ["a", 2, 3]
+        payload_data["enabled_worker_ids"] = [" worker-a ", "worker-b", "worker-a"]
         payload_data["delegate_master"] = True
         payload = parse_queue_request_payload(
             payload_data
         )
-        self.assertEqual(payload.enabled_worker_ids, ["a", "2", "3"])
+        self.assertEqual(payload.enabled_worker_ids, ["worker-a", "worker-b"])
         self.assertTrue(payload.delegate_master)
 
     def test_supports_legacy_workers_field(self):
         payload_data = self._base_payload()
         payload_data.pop("enabled_worker_ids", None)
-        payload_data["workers"] = [{"id": "w1"}, "w2", {"id": 3}, {"name": "no-id"}]
+        payload_data["workers"] = [{"id": "w1"}, "w2", {"id": "w3"}, {"name": "no-id"}]
         payload = parse_queue_request_payload(
             payload_data
         )
-        self.assertEqual(payload.enabled_worker_ids, ["w1", "w2", "3"])
+        self.assertEqual(payload.enabled_worker_ids, ["w1", "w2", "w3"])
 
-    def test_supports_auto_prepare_prompt_fallback(self):
+    def test_supports_workflow_prompt_fallback(self):
         payload_data = self._base_payload()
         payload_data.pop("prompt", None)
-        payload_data["auto_prepare"] = True
         payload_data["workflow"] = {
             "prompt": {
                 "10": {"class_type": "DistributedCollector"},
@@ -56,7 +55,6 @@ class QueueRequestPayloadTests(unittest.TestCase):
             payload_data
         )
         self.assertIn("10", payload.prompt)
-        self.assertTrue(payload.auto_prepare)
 
     def test_normalizes_trace_execution_id(self):
         payload_data = self._base_payload()
@@ -74,10 +72,6 @@ class QueueRequestPayloadTests(unittest.TestCase):
         )
         self.assertIsNone(payload.trace_execution_id)
 
-    def test_auto_prepare_defaults_true(self):
-        payload = parse_queue_request_payload(self._base_payload())
-        self.assertTrue(payload.auto_prepare)
-
     def test_workers_field_must_be_list(self):
         payload_data = self._base_payload()
         payload_data.pop("enabled_worker_ids", None)
@@ -91,7 +85,7 @@ class QueueRequestPayloadTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "trace_execution_id must be a string"):
             parse_queue_request_payload(payload_data)
 
-    def test_auto_prepare_false_still_falls_back_to_workflow_prompt(self):
+    def test_auto_prepare_is_ignored_for_backward_compat(self):
         payload_data = self._base_payload()
         payload_data.pop("prompt", None)
         payload_data["auto_prepare"] = False
@@ -100,13 +94,6 @@ class QueueRequestPayloadTests(unittest.TestCase):
         }
         payload = parse_queue_request_payload(payload_data)
         self.assertIn("10", payload.prompt)
-        self.assertFalse(payload.auto_prepare)
-
-    def test_auto_prepare_must_be_boolean(self):
-        payload_data = self._base_payload()
-        payload_data["auto_prepare"] = "true"
-        with self.assertRaisesRegex(ValueError, "auto_prepare must be a boolean"):
-            parse_queue_request_payload(payload_data)
 
     def test_invalid_delegate_master_type_raises(self):
         payload_data = self._base_payload()
@@ -118,6 +105,12 @@ class QueueRequestPayloadTests(unittest.TestCase):
         payload_data = self._base_payload()
         payload_data["enabled_worker_ids"] = "worker-a"
         with self.assertRaisesRegex(ValueError, "enabled_worker_ids must be a list"):
+            parse_queue_request_payload(payload_data)
+
+    def test_legacy_index_worker_tokens_are_rejected(self):
+        payload_data = self._base_payload()
+        payload_data["enabled_worker_ids"] = ["worker-a", "0", "worker_1"]
+        with self.assertRaisesRegex(ValueError, "legacy index token"):
             parse_queue_request_payload(payload_data)
 
     def test_invalid_top_level_payload_raises(self):

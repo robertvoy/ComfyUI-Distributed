@@ -1,23 +1,19 @@
 from __future__ import annotations
 
 import math, torch
-from typing import Any, Protocol, cast
+from typing import Any
 from ...utils.logging import log
 from ...utils.image import blend_processed_batch_item, pil_to_tensor, tensor_to_pil
+from ..mode_contexts import SingleGpuModeContext, TileOpsCollaborator
 from ..processing_args import UpscaleCoreArgs
 from ..tile_processing import TileBatchArgs, extract_and_process_tile_batch
 
 
-class _SingleGpuOps(Protocol):
-    def round_to_multiple(self, value: int) -> int: ...
-    def calculate_tiles(self, width: int, height: int, tile_width: int, tile_height: int, force_uniform_tiles: bool): ...
-    def create_tile_mask(self, width: int, height: int, tx: int, ty: int, tile_width: int, tile_height: int, mask_blur: int): ...
-    def blend_tile(self, base_image: Any, tile_pil: Any, x1: int, y1: int, size: tuple[int, int], tile_mask: Any, padding: int): ...
-    def extract_batch_tile_with_padding(self, source_batch: Any, tx: int, ty: int, tile_width: int, tile_height: int, padding: int, force_uniform_tiles: bool): ...
-    def process_tiles_batch(self, *args: Any, **kwargs: Any): ...
-
-
 class SingleGpuModeMixin:
+    def _build_single_gpu_mode_context(self) -> SingleGpuModeContext:
+        """Build explicit collaborators for single-GPU mode execution."""
+        return SingleGpuModeContext(tile_ops=TileOpsCollaborator(self))
+
     def process_single_gpu(
         self,
         upscaled_image: torch.Tensor,
@@ -27,9 +23,11 @@ class SingleGpuModeMixin:
         padding: int,
         mask_blur: int,
         force_uniform_tiles: bool,
+        mode_context: SingleGpuModeContext | None = None,
     ) -> tuple[torch.Tensor]:
         """Process all tiles on a single GPU (no distribution), batching per tile like USDU."""
-        ops = cast(_SingleGpuOps, self)
+        context = mode_context or self._build_single_gpu_mode_context()
+        ops = context.tile_ops
         # Round tile dimensions
         tile_width = ops.round_to_multiple(tile_width)
         tile_height = ops.round_to_multiple(tile_height)

@@ -3,7 +3,10 @@ name = "ComfyUI-Distributed"
 description = "ComfyUI extension that enables multi-GPU processing locally, remotely and in the cloud"
 version = "1.4.1"
 license = {file = "LICENSE"}
-dependencies  = []
+dependencies = [
+    "aiohttp>=3.9,<4",
+    "Pillow>=10,<12",
+]
 
 [project.urls]
 Repository = "https://github.com/robertvoy/ComfyUI-Distributed"
