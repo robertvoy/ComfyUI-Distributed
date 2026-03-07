@@ -39,6 +39,7 @@ class ProcessLifecycle:
         env["CUDA_VISIBLE_DEVICES"] = str(worker_config.get("cuda_device", 0))
         env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         env["COMFYUI_MASTER_PID"] = str(os.getpid())
+        env["COMFYUI_IS_WORKER"] = "1"
 
         cmd = self._manager.build_launch_command(worker_config, comfy_root)
         cwd = comfy_root
