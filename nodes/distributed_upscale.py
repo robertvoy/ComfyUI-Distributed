@@ -276,10 +276,9 @@ class UltimateSDUpscaleDistributed(
             )
         
         # Static mode - enhanced with health monitoring and retry logic
-        return self._process_worker_static_sync(upscaled_image, model, positive, negative, vae,
-                                               seed, steps, cfg, sampler_name, scheduler, denoise,
+        return self._process_worker_static_sync(upscaled_image, core_args,
                                                tile_width, tile_height, padding, mask_blur,
-                                               force_uniform_tiles, tiled_decode, multi_job_id, master_url,
+                                               force_uniform_tiles, multi_job_id, master_url,
                                                worker_id, enabled_workers)
 
     def process_master(
@@ -352,10 +351,9 @@ class UltimateSDUpscaleDistributed(
             )
         
         # Static mode - enhanced with unified job management
-        return self._process_master_static_sync(upscaled_image, core_args.model, core_args.positive, core_args.negative, core_args.vae,
-                                               core_args.seed, core_args.steps, core_args.cfg, core_args.sampler_name, core_args.scheduler, core_args.denoise,
+        return self._process_master_static_sync(upscaled_image, core_args,
                                                tile_width, tile_height, padding, mask_blur,
-                                               force_uniform_tiles, core_args.tiled_decode, multi_job_id, enabled_workers,
+                                               force_uniform_tiles, multi_job_id, enabled_workers,
                                                all_tiles, num_tiles_per_image)
 
     def _determine_processing_mode(self, batch_size: int, num_workers: int, dynamic_threshold: int) -> str:

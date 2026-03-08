@@ -30,6 +30,37 @@ class WorkerCommsMixin:
     def _master_auth_headers() -> dict[str, str]:
         return distributed_auth_headers(load_config())
 
+    async def _post_with_retry(
+        self,
+        url: str,
+        *,
+        build_form: callable,
+        max_retries: int = 5,
+        initial_delay: float = 0.5,
+        max_delay: float = 5.0,
+        error_context: str = "",
+    ) -> None:
+        """POST form data with exponential backoff. build_form is called fresh each attempt."""
+        retry_delay = initial_delay
+        for attempt in range(max_retries):
+            try:
+                session = await get_client_session()
+                async with session.post(
+                    url,
+                    data=build_form(),
+                    headers=self._master_auth_headers(),
+                ) as response:
+                    response.raise_for_status()
+                    return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    debug_log(f"Retry {attempt + 1}/{max_retries} after error: {e}")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, max_delay)
+                else:
+                    log(f"{error_context}: {e}")
+                    raise
+
     async def send_heartbeat(
         self,
         multi_job_id: str,
@@ -128,27 +159,11 @@ class WorkerCommsMixin:
                     )
                 return data
 
-            # Retry logic with exponential backoff
-            max_retries = 5
-            retry_delay = 0.5
-            for attempt in range(max_retries):
-                try:
-                    session = await get_client_session()
-                    url = f"{master_url}/distributed/submit_tiles"
-                    async with session.post(
-                        url,
-                        data=_build_chunk_form(),
-                        headers=self._master_auth_headers(),
-                    ) as response:
-                        response.raise_for_status()
-                        break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 2, 5.0)
-                    else:
-                        log(f"UltimateSDUpscale Worker - Failed to send chunk {chunk_index} after {max_retries} attempts: {e}")
-                        raise
+            await self._post_with_retry(
+                f"{master_url}/distributed/submit_tiles",
+                build_form=_build_chunk_form,
+                error_context=f"UltimateSDUpscale Worker - Failed to send chunk {chunk_index}",
+            )
 
             debug_log(f"Worker[{worker_id[:8]}] - Sent chunk {chunk_index} ({chunk_size} tiles, ~{used/1e6:.2f} MB)")
             chunk_index += 1
@@ -293,32 +308,12 @@ class WorkerCommsMixin:
             )
             return data
         
-        # Retry logic
-        max_retries = 5
-        retry_delay = 0.5
-        
-        for attempt in range(max_retries):
-            try:
-                session = await get_client_session()
-                url = f"{master_url}/distributed/submit_image"
-                
-                async with session.post(
-                    url,
-                    data=_build_image_form(),
-                    headers=self._master_auth_headers(),
-                ) as response:
-                    response.raise_for_status()
-                    debug_log(f"Successfully sent image {image_idx} to master")
-                    return
-                    
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    debug_log(f"Retry {attempt + 1}/{max_retries} after error: {e}")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    log(f"Failed to send image {image_idx} after {max_retries} attempts: {e}")
-                    raise
+        await self._post_with_retry(
+            f"{master_url}/distributed/submit_image",
+            build_form=_build_image_form,
+            error_context=f"Failed to send image {image_idx}",
+        )
+        debug_log(f"Successfully sent image {image_idx} to master")
 
     async def send_worker_complete_signal(self, multi_job_id, master_url, worker_id):
         """Send completion signal to master in dynamic mode."""

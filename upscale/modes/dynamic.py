@@ -67,6 +67,53 @@ class DynamicModeMixin:
             time.sleep(JOB_POLL_INTERVAL)
         return False
 
+    def _process_image_tiles(
+        self,
+        image_idx: int,
+        local_image: Image.Image,
+        single_tensor: torch.Tensor,
+        core_args: UpscaleCoreArgs,
+        all_tiles: list,
+        tile_width: int,
+        tile_height: int,
+        padding: int,
+        mask_blur: int,
+        width: int,
+        height: int,
+        force_uniform_tiles: bool,
+        context: DynamicModeContext,
+        per_tile_callback: Any | None = None,
+    ) -> Image.Image:
+        """Process all tiles for a single image. Returns the processed PIL image."""
+        positive_sliced, negative_sliced = context.tile_ops.slice_conditioning(
+            core_args.positive, core_args.negative, image_idx,
+        )
+        for tile_idx, pos in enumerate(all_tiles):
+            source_tensor = pil_to_tensor(local_image)
+            if single_tensor.is_cuda:
+                source_tensor = source_tensor.cuda()
+            local_image = context.tile_ops.process_and_blend_tile(
+                tile_idx, pos, source_tensor, local_image,
+                core_args.model,
+                positive_sliced,
+                negative_sliced,
+                core_args.vae,
+                core_args.seed,
+                core_args.steps,
+                core_args.cfg,
+                core_args.sampler_name,
+                core_args.scheduler,
+                core_args.denoise,
+                tile_width,
+                tile_height,
+                padding, mask_blur, width, height, force_uniform_tiles,
+                core_args.tiled_decode,
+                batch_idx=image_idx,
+            )
+            if per_tile_callback:
+                per_tile_callback()
+        return local_image
+
     def _handle_master_dynamic_idle_state(
         self,
         multi_job_id,
@@ -231,42 +278,14 @@ class DynamicModeMixin:
                 # Process locally
                 single_tensor = upscaled_image[image_idx:image_idx+1]
                 local_image = result_images[image_idx]
-                image_seed = core_args.seed
-                
-                # Pre-slice conditioning once per image (not per tile)
-                positive_sliced, negative_sliced = context.tile_ops.slice_conditioning(
-                    core_args.positive,
-                    core_args.negative,
-                    image_idx,
+
+                local_image = self._process_image_tiles(
+                    image_idx, local_image, single_tensor, core_args, all_tiles,
+                    tile_width, tile_height, padding, mask_blur, width, height,
+                    force_uniform_tiles, context,
+                    per_tile_callback=lambda: run_async_in_server_loop(context.worker_comms.async_yield(), timeout=0.1),
                 )
-                
-                for tile_idx, pos in enumerate(all_tiles):
-                    source_tensor = pil_to_tensor(local_image)
-                    if single_tensor.is_cuda:
-                        source_tensor = source_tensor.cuda()
-                    local_image = context.tile_ops.process_and_blend_tile(
-                        tile_idx, pos, source_tensor, local_image,
-                        core_args.model,
-                        positive_sliced,
-                        negative_sliced,
-                        core_args.vae,
-                        image_seed,
-                        core_args.steps,
-                        core_args.cfg,
-                        core_args.sampler_name,
-                        core_args.scheduler,
-                        core_args.denoise,
-                        tile_width,
-                        tile_height,
-                        padding, mask_blur, width, height, force_uniform_tiles,
-                        core_args.tiled_decode,
-                        batch_idx=image_idx,
-                    )
-                    
-                    # Yield after each tile to minimize worker downtime
-                    run_async_in_server_loop(context.worker_comms.async_yield(), timeout=0.1)
-                    # Note: No per-tile drain here – that's what makes this "per-image"
-                
+
                 result_images[image_idx] = local_image
                 
                 # Mark as completed
@@ -404,41 +423,15 @@ class DynamicModeMixin:
             local_image = tensor_to_pil(single_tensor, 0).copy()
 
             # Process all tiles for this image
-            image_seed = core_args.seed
-
-            # Pre-slice conditioning once per image (not per tile)
-            positive_sliced, negative_sliced = context.tile_ops.slice_conditioning(
-                core_args.positive,
-                core_args.negative,
-                image_idx,
-            )
-
-            for tile_idx, pos in enumerate(all_tiles):
-                source_tensor = pil_to_tensor(local_image)
-                if single_tensor.is_cuda:
-                    source_tensor = source_tensor.cuda()
-                local_image = context.tile_ops.process_and_blend_tile(
-                    tile_idx, pos, source_tensor, local_image,
-                    core_args.model,
-                    positive_sliced,
-                    negative_sliced,
-                    core_args.vae,
-                    image_seed,
-                    core_args.steps,
-                    core_args.cfg,
-                    core_args.sampler_name,
-                    core_args.scheduler,
-                    core_args.denoise,
-                    tile_width,
-                    tile_height,
-                    padding, mask_blur, width, height, force_uniform_tiles,
-                    core_args.tiled_decode,
-                    batch_idx=image_idx,
-                )
-                run_async_in_server_loop(
+            local_image = self._process_image_tiles(
+                image_idx, local_image, single_tensor, core_args, all_tiles,
+                tile_width, tile_height, padding, mask_blur, width, height,
+                force_uniform_tiles, context,
+                per_tile_callback=lambda: run_async_in_server_loop(
                     context.worker_comms.send_heartbeat(multi_job_id, master_url, worker_id),
-                    timeout=5.0
-                )
+                    timeout=5.0,
+                ),
+            )
 
             # Send processed image back to master
             try:

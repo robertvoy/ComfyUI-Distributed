@@ -133,10 +133,6 @@ def _load_static_mode_module():
     job_store_module.cleanup_job = _noop
     job_store_module.drain_results_queue = _noop
     job_store_module.get_completed_count = _noop
-    job_store_module._mark_task_completed = _noop
-    job_store_module._cleanup_job = _noop
-    job_store_module._drain_results_queue = _noop
-    job_store_module._get_completed_count = _noop
     sys.modules[f"{package_name}.upscale.job_store"] = job_store_module
 
     job_models_module = types.ModuleType(f"{package_name}.upscale.job_models")

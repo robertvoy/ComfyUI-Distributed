@@ -454,97 +454,47 @@ def generate_job_id_map(prompt_index: PromptIndex, prefix: str) -> dict[str, str
     return job_map
 
 
-def _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, enabled_json):
-    """Configure DistributedSeed nodes for master or worker role."""
-    for node_id in prompt_index.nodes_for_class("DistributedSeed"):
-        node = prompt_copy.get(node_id)
-        if not isinstance(node, dict):
-            continue
-        inputs = node.setdefault("inputs", {})
-        inputs["is_worker"] = not is_master
-        inputs["enabled_worker_ids"] = enabled_json
-        if is_master:
-            inputs["worker_id"] = ""
-        else:
-            inputs["worker_id"] = str(participant_id)
+def _override_simple_nodes(prompt_copy, prompt_index, is_master, participant_id, enabled_json, class_names):
+    """Configure simple distributed nodes (DistributedSeed, DistributedValue)."""
+    for class_name in class_names:
+        for node_id in prompt_index.nodes_for_class(class_name):
+            node = prompt_copy.get(node_id)
+            if not isinstance(node, dict):
+                continue
+            inputs = node.setdefault("inputs", {})
+            inputs["is_worker"] = not is_master
+            inputs["enabled_worker_ids"] = enabled_json
+            inputs["worker_id"] = "" if is_master else str(participant_id)
 
 
-def _override_collector_nodes(
-    prompt_copy,
-    prompt_index,
-    is_master,
-    participant_id,
-    job_id_map,
-    master_url,
-    enabled_json,
-    delegate_master,
+def _override_job_nodes(
+    prompt_copy, prompt_index, is_master, participant_id,
+    job_id_map, master_url, enabled_json, delegate_master,
+    class_names, skip_if_upstream=None,
 ):
-    """Configure DistributedCollector nodes for master or worker role."""
-    for node_id in prompt_index.nodes_for_class("DistributedCollector"):
-        node = prompt_copy.get(node_id)
-        if not isinstance(node, dict):
-            continue
+    """Configure job-aware distributed nodes (collector, upscale)."""
+    for class_name in class_names:
+        for node_id in prompt_index.nodes_for_class(class_name):
+            node = prompt_copy.get(node_id)
+            if not isinstance(node, dict):
+                continue
 
-        if prompt_index.has_upstream(node_id, "UltimateSDUpscaleDistributed"):
-            node.setdefault("inputs", {})["pass_through"] = True
-            continue
+            if skip_if_upstream and prompt_index.has_upstream(node_id, skip_if_upstream):
+                node.setdefault("inputs", {})["pass_through"] = True
+                continue
 
-        inputs = node.setdefault("inputs", {})
-        inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
-        inputs["is_worker"] = not is_master
-        inputs["enabled_worker_ids"] = enabled_json
-        if is_master:
-            inputs["delegate_only"] = bool(delegate_master)
-            inputs.pop("master_url", None)
-            inputs.pop("worker_id", None)
-        else:
-            inputs["master_url"] = master_url
-            inputs["worker_id"] = participant_id
-            inputs["delegate_only"] = False
-
-
-def _override_upscale_nodes(
-    prompt_copy,
-    prompt_index,
-    is_master,
-    participant_id,
-    job_id_map,
-    master_url,
-    enabled_json,
-    delegate_master=False,
-):
-    """Configure UltimateSDUpscaleDistributed nodes for master or worker role."""
-    for node_id in prompt_index.nodes_for_class("UltimateSDUpscaleDistributed"):
-        node = prompt_copy.get(node_id)
-        if not isinstance(node, dict):
-            continue
-        inputs = node.setdefault("inputs", {})
-        inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
-        inputs["is_worker"] = not is_master
-        inputs["enabled_worker_ids"] = enabled_json
-        if is_master:
-            inputs.pop("master_url", None)
-            inputs.pop("worker_id", None)
-            inputs["delegate_only"] = bool(delegate_master)
-        else:
-            inputs["master_url"] = master_url
-            inputs["worker_id"] = participant_id
-            inputs["delegate_only"] = False
-
-
-def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, enabled_json):
-    """Configure DistributedValue nodes for master or worker role."""
-    for node_id in prompt_index.nodes_for_class("DistributedValue"):
-        node = prompt_copy.get(node_id)
-        if not isinstance(node, dict):
-            continue
-        inputs = node.setdefault("inputs", {})
-        inputs["is_worker"] = not is_master
-        inputs["enabled_worker_ids"] = enabled_json
-        if is_master:
-            inputs["worker_id"] = ""
-        else:
-            inputs["worker_id"] = str(participant_id)
+            inputs = node.setdefault("inputs", {})
+            inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
+            inputs["is_worker"] = not is_master
+            inputs["enabled_worker_ids"] = enabled_json
+            if is_master:
+                inputs["delegate_only"] = bool(delegate_master)
+                inputs.pop("master_url", None)
+                inputs.pop("worker_id", None)
+            else:
+                inputs["master_url"] = master_url
+                inputs["worker_id"] = participant_id
+                inputs["delegate_only"] = False
 
 
 def _override_branch_nodes(
@@ -684,27 +634,20 @@ def apply_participant_overrides(
     is_master = participant_id == "master"
     enabled_json = json.dumps(enabled_worker_ids)
 
-    _override_seed_nodes(prompt_copy, prompt_index, is_master, participant_id, enabled_json)
-    _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, enabled_json)
-    _override_collector_nodes(
-        prompt_copy,
-        prompt_index,
-        is_master,
-        participant_id,
-        job_id_map,
-        master_url,
-        enabled_json,
-        delegate_master,
+    _override_simple_nodes(
+        prompt_copy, prompt_index, is_master, participant_id, enabled_json,
+        ["DistributedSeed", "DistributedValue"],
     )
-    _override_upscale_nodes(
-        prompt_copy,
-        prompt_index,
-        is_master,
-        participant_id,
-        job_id_map,
-        master_url,
-        enabled_json,
-        delegate_master,
+    _override_job_nodes(
+        prompt_copy, prompt_index, is_master, participant_id,
+        job_id_map, master_url, enabled_json, delegate_master,
+        ["DistributedCollector"],
+        skip_if_upstream="UltimateSDUpscaleDistributed",
+    )
+    _override_job_nodes(
+        prompt_copy, prompt_index, is_master, participant_id,
+        job_id_map, master_url, enabled_json, delegate_master,
+        ["UltimateSDUpscaleDistributed"],
     )
     prompt_copy = _override_branch_nodes(
         prompt_copy,

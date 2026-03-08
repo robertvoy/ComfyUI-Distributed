@@ -107,24 +107,6 @@ class _Node(result_collector_module.ResultCollectorMixin):
         return 1
 
 
-class _WrapperNode(result_collector_module.ResultCollectorMixin):
-    def __init__(self):
-        self.calls = []
-
-    async def _async_collect_results(
-        self,
-        multi_job_id,
-        num_workers,
-        mode="static",
-        remaining_to_collect=None,
-        batch_size=None,
-    ):
-        self.calls.append(
-            (multi_job_id, num_workers, mode, remaining_to_collect, batch_size)
-        )
-        return {"mode": mode}
-
-
 class ResultCollectorMixinTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.prompt_server = job_store_module.server.PromptServer.instance
@@ -156,10 +138,9 @@ class ResultCollectorMixinTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        collected = await self.node._async_collect_results(
+        collected = await self.node._async_collect_worker_tiles(
             "job-static",
             num_workers=1,
-            mode="static",
         )
 
         self.assertEqual(list(collected.keys()), [9])
@@ -179,12 +160,12 @@ class ResultCollectorMixinTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        completed = await self.node._async_collect_results(
+        completed = await self.node.collect_dynamic_images(
             "job-dynamic",
-            num_workers=2,
-            mode="dynamic",
             remaining_to_collect=1,
+            num_workers=2,
             batch_size=3,
+            master_processed_count=0,
         )
 
         self.assertEqual(completed[2], "img-2")
@@ -198,11 +179,12 @@ class ResultCollectorMixinTests(unittest.IsolatedAsyncioTestCase):
         old_timeout = result_collector_module.get_worker_timeout_seconds
         result_collector_module.get_worker_timeout_seconds = lambda: 0.01
         try:
-            completed = await self.node._async_collect_results(
+            completed = await self.node.collect_dynamic_images(
                 "job-timeout",
+                remaining_to_collect=None,
                 num_workers=1,
-                mode="dynamic",
                 batch_size=4,
+                master_processed_count=0,
             )
         finally:
             result_collector_module.get_worker_timeout_seconds = old_timeout
@@ -230,57 +212,36 @@ class ResultCollectorMixinTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(worker_ids, ["worker-a"])
 
-    async def test_mode_mismatch_and_unsupported_mode_raise(self):
+    async def test_static_mode_mismatch_raises(self):
+        self.prompt_server.distributed_pending_tile_jobs["job-mismatch"] = (
+            job_models_module.ImageJobState("job-mismatch")
+        )
+        with self.assertRaises(RuntimeError):
+            await self.node._async_collect_worker_tiles(
+                "job-mismatch",
+                num_workers=1,
+            )
+
+    async def test_dynamic_mode_mismatch_raises(self):
         self.prompt_server.distributed_pending_tile_jobs["job-mismatch"] = (
             job_models_module.TileJobState("job-mismatch")
         )
         with self.assertRaises(RuntimeError):
-            await self.node._async_collect_results(
+            await self.node.collect_dynamic_images(
                 "job-mismatch",
+                remaining_to_collect=1,
                 num_workers=1,
-                mode="dynamic",
                 batch_size=1,
-            )
-
-        self.prompt_server.distributed_pending_tile_jobs["job-unsupported"] = (
-            job_models_module.TileJobState("job-unsupported")
-        )
-        with self.assertRaises(RuntimeError):
-            await self.node._async_collect_results(
-                "job-unsupported",
-                num_workers=1,
-                mode="unsupported",
+                master_processed_count=0,
             )
 
     async def test_mark_image_completed_updates_job_state(self):
         job_data = job_models_module.ImageJobState("job-mark")
         self.prompt_server.distributed_pending_tile_jobs["job-mark"] = job_data
 
-        await self.node._mark_image_completed("job-mark", 7, "img-7")
+        await self.node.mark_image_completed("job-mark", 7, "img-7")
 
         self.assertEqual(job_data.completed_images[7], "img-7")
-
-    async def test_wrapper_methods_delegate_to_async_collect_results(self):
-        node = _WrapperNode()
-
-        tile_result = await node._async_collect_worker_tiles("job-wrap", 3)
-        image_result = await node._async_collect_dynamic_images(
-            "job-wrap",
-            remaining_to_collect=2,
-            num_workers=4,
-            batch_size=8,
-            master_processed_count=0,
-        )
-
-        self.assertEqual(tile_result["mode"], "static")
-        self.assertEqual(image_result["mode"], "dynamic")
-        self.assertEqual(
-            node.calls,
-            [
-                ("job-wrap", 3, "static", None, None),
-                ("job-wrap", 4, "dynamic", 2, 8),
-            ],
-        )
 
 
 if __name__ == "__main__":

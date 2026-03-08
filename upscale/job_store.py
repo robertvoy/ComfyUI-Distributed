@@ -125,7 +125,7 @@ async def init_static_job_batched(
     )
 
 
-async def _drain_results_queue(multi_job_id: str) -> int:
+async def drain_results_queue(multi_job_id: str) -> int:
     """Drain pending results from queue and update completed_tasks. Returns count drained."""
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
@@ -163,7 +163,7 @@ async def _drain_results_queue(multi_job_id: str) -> int:
         return collected
 
 
-async def _get_completed_count(multi_job_id: str) -> int:
+async def get_completed_count(multi_job_id: str) -> int:
     """Get count of completed tasks."""
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
@@ -173,7 +173,7 @@ async def _get_completed_count(multi_job_id: str) -> int:
         return 0
 
 
-async def _mark_task_completed(multi_job_id: str, task_id: int, result: Any) -> None:
+async def mark_task_completed(multi_job_id: str, task_id: int, result: Any) -> None:
     """Mark a task as completed."""
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
@@ -182,7 +182,7 @@ async def _mark_task_completed(multi_job_id: str, task_id: int, result: Any) -> 
             job_data.completed_tasks[task_id] = result
 
 
-async def _cleanup_job(multi_job_id: str) -> None:
+async def cleanup_job(multi_job_id: str) -> None:
     """Cleanup the job data."""
     prompt_server = ensure_tile_jobs_initialized()
     async with prompt_server.distributed_tile_jobs_lock:
@@ -195,25 +195,5 @@ async def init_job_queue(
     multi_job_id: str,
     config: JobQueueInitConfig,
 ) -> None:
-    """Public wrapper for unified job queue initialization."""
+    """Public entry point for unified job queue initialization."""
     await _init_job_queue(multi_job_id, config)
-
-
-async def drain_results_queue(multi_job_id: str) -> int:
-    """Public wrapper for draining queued worker results."""
-    return await _drain_results_queue(multi_job_id)
-
-
-async def get_completed_count(multi_job_id: str) -> int:
-    """Public wrapper for counting completed tasks in a job."""
-    return await _get_completed_count(multi_job_id)
-
-
-async def mark_task_completed(multi_job_id: str, task_id: int, result: Any) -> None:
-    """Public wrapper for marking a task complete."""
-    await _mark_task_completed(multi_job_id, task_id, result)
-
-
-async def cleanup_job(multi_job_id: str) -> None:
-    """Public wrapper for deleting finished job state."""
-    await _cleanup_job(multi_job_id)

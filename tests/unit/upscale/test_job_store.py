@@ -150,7 +150,7 @@ class JobStoreTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        drained = await job_store_module._drain_results_queue("job-drain")
+        drained = await job_store_module.drain_results_queue("job-drain")
 
         self.assertEqual(drained, 3)
         self.assertEqual(job_data.completed_tasks[5], "img-5")
