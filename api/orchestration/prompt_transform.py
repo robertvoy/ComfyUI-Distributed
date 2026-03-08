@@ -413,6 +413,13 @@ def prepare_delegate_master_prompt(
         if collector_class == "DistributedBranchCollector":
             # Branch collector does not require an image input in delegate-only mode.
             continue
+        if collector_class == "UltimateSDUpscaleDistributed":
+            # Swap to lightweight delegate collector — no model inputs needed.
+            collector_entry["class_type"] = "USDUDelegateCollector"
+            debug_log(
+                f"Swapped USDU node {collector_id} to USDUDelegateCollector for delegate-only master prompt."
+            )
+            continue
         placeholder_id = next_id()
         pruned_prompt[placeholder_id] = {
             "class_type": "DistributedEmptyImage",
@@ -504,6 +511,7 @@ def _override_upscale_nodes(
     job_id_map,
     master_url,
     enabled_json,
+    delegate_master=False,
 ):
     """Configure UltimateSDUpscaleDistributed nodes for master or worker role."""
     for node_id in prompt_index.nodes_for_class("UltimateSDUpscaleDistributed"):
@@ -517,9 +525,11 @@ def _override_upscale_nodes(
         if is_master:
             inputs.pop("master_url", None)
             inputs.pop("worker_id", None)
+            inputs["delegate_only"] = bool(delegate_master)
         else:
             inputs["master_url"] = master_url
             inputs["worker_id"] = participant_id
+            inputs["delegate_only"] = False
 
 
 def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, enabled_json):
@@ -694,6 +704,7 @@ def apply_participant_overrides(
         job_id_map,
         master_url,
         enabled_json,
+        delegate_master,
     )
     prompt_copy = _override_branch_nodes(
         prompt_copy,

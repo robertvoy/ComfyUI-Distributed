@@ -47,6 +47,34 @@ def _is_worker_allowed(job_data: BaseJobState, worker_id: str) -> bool:
     return str(worker_id) in known_workers
 
 
+@server.PromptServer.instance.routes.post("/distributed/init_dynamic_job")
+async def init_dynamic_job_endpoint(request: web.Request) -> web.StreamResponse:
+    """Allow workers to initialize a dynamic job queue on the master.
+
+    Called by the first worker to reach the USDU node in delegate-only mode.
+    Idempotent — subsequent calls are no-ops if the queue already exists.
+    """
+    auth_error = await authorization_error_or_none(request)
+    if auth_error is not None:
+        return auth_error
+    try:
+        data = await request.json()
+        multi_job_id = data.get("multi_job_id")
+        if not multi_job_id:
+            return await handle_api_error(request, "Missing multi_job_id", 400)
+
+        batch_size = _parse_int_field(data.get("batch_size"), "batch_size", minimum=1)
+        enabled_workers = data.get("enabled_workers") or []
+        if isinstance(enabled_workers, str):
+            import json as _json
+            enabled_workers = _json.loads(enabled_workers)
+
+        await init_dynamic_job(multi_job_id, batch_size, enabled_workers)
+        return web.json_response({"status": "success"})
+    except Exception as e:
+        return await handle_api_error(request, e, 500)
+
+
 @server.PromptServer.instance.routes.post("/distributed/heartbeat")
 async def heartbeat_endpoint(request: web.Request) -> web.StreamResponse:
     auth_error = await authorization_error_or_none(request)

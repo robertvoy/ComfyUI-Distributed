@@ -350,6 +350,36 @@ class WorkerCommsMixin:
             debug_log(f"Job status check failed: {e}")
             return False
 
+    async def init_dynamic_job_on_master(
+        self,
+        multi_job_id: str,
+        master_url: str,
+        batch_size: int,
+        enabled_workers: list[str],
+    ) -> bool:
+        """Tell the master to create the dynamic job queue (idempotent)."""
+        try:
+            session = await get_client_session()
+            url = f"{master_url}/distributed/init_dynamic_job"
+            async with session.post(
+                url,
+                json={
+                    "multi_job_id": multi_job_id,
+                    "batch_size": batch_size,
+                    "enabled_workers": enabled_workers,
+                },
+                headers=self._master_auth_headers(),
+            ) as response:
+                if response.status == 200:
+                    debug_log(f"Worker initialized dynamic job {multi_job_id} on master (batch_size={batch_size})")
+                    return True
+                text = await response.text()
+                debug_log(f"init_dynamic_job failed ({response.status}): {text}")
+                return False
+        except Exception as e:
+            debug_log(f"init_dynamic_job request failed: {e}")
+            return False
+
     async def async_yield(self):
         """Simple async yield to allow event loop processing."""
         await asyncio.sleep(0)

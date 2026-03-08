@@ -351,6 +351,20 @@ class DynamicModeMixin:
         # Keep track of processed images for is_last detection
         processed_count = 0
 
+        # Ensure the dynamic job queue exists on the master.  In delegate-only
+        # mode the master's USDU node is replaced with a lightweight collector
+        # that cannot initialise the queue itself, so workers do it instead.
+        # The call is idempotent — if the master already created the queue this
+        # is a no-op.
+        from ...utils.worker_ids import coerce_enabled_worker_ids as _coerce
+        _enabled = _coerce(enabled_worker_ids)
+        run_async_in_server_loop(
+            context.worker_comms.init_dynamic_job_on_master(
+                multi_job_id, master_url, batch_size, _enabled,
+            ),
+            timeout=10.0,
+        )
+
         # Poll for job readiness to avoid races during master init
         max_poll_attempts = JOB_POLL_MAX_ATTEMPTS
         if not self._poll_job_ready_dynamic(

@@ -367,11 +367,153 @@ class UltimateSDUpscaleDistributed(
             return "dynamic"
         return "static"
 
+class USDUDelegateCollector:
+    """Lightweight stand-in used automatically in delegate-only master prompts.
+
+    When the master is in delegate-only mode, the orchestration code swaps the
+    full ``UltimateSDUpscaleDistributed`` class for this one so that no upstream
+    model/image nodes execute on the master.  Workers initialise the dynamic job
+    queue via ``/distributed/init_dynamic_job`` and this node simply waits for
+    all images to arrive, then assembles the output tensor.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {},
+            "hidden": {
+                "multi_job_id": ("STRING", {"default": ""}),
+                "enabled_worker_ids": ("STRING", {"default": "[]"}),
+                "delegate_only": ("BOOLEAN", {"default": True}),
+                "is_worker": ("BOOLEAN", {"default": False}),
+                "worker_id": ("STRING", {"default": ""}),
+                "master_url": ("STRING", {"default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "run"
+    CATEGORY = "image/upscaling"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def run(self, multi_job_id="", enabled_worker_ids="[]", **kwargs):
+        import time
+        import torch
+        from ..utils.image import pil_to_tensor
+        from ..upscale.job_models import ImageJobState
+
+        if not multi_job_id:
+            log("USDUDelegateCollector: no multi_job_id, returning empty image")
+            return (torch.zeros(1, 64, 64, 3),)
+
+        enabled_workers = coerce_enabled_worker_ids(enabled_worker_ids)
+        num_workers = len(enabled_workers)
+        log(f"USDU delegate-only: waiting for workers to init job {multi_job_id}")
+
+        prompt_server = ensure_tile_jobs_initialized()
+
+        # Wait for workers to create the job via /distributed/init_dynamic_job
+        max_wait = 120.0
+        poll_interval = 1.0
+        start = time.time()
+        job_data = None
+        while time.time() - start < max_wait:
+            job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
+            if isinstance(job_data, ImageJobState) and job_data.batch_size > 0:
+                break
+            job_data = None
+            time.sleep(poll_interval)
+
+        if job_data is None:
+            log(f"USDUDelegateCollector: job {multi_job_id} was not initialized by workers within {max_wait}s")
+            return (torch.zeros(1, 64, 64, 3),)
+
+        batch_size = job_data.batch_size
+        log(f"USDU delegate-only: job ready, collecting {batch_size} images from {num_workers} workers")
+
+        # Collect all images using the existing result collector
+        collected = run_async_in_server_loop(
+            self._collect_all_images(multi_job_id, batch_size, num_workers, prompt_server),
+            timeout=600.0,
+        )
+
+        # Assemble tensor from collected PIL images
+        result_images = []
+        for idx in range(batch_size):
+            img = collected.get(idx)
+            if img is not None:
+                result_images.append(pil_to_tensor(img))
+            else:
+                log(f"USDUDelegateCollector: missing image {idx}, using blank")
+                result_images.append(torch.zeros(1, 64, 64, 3))
+
+        result_tensor = torch.cat(result_images, dim=0)
+        log(f"USDU delegate-only: collected all {batch_size} images")
+        return (result_tensor,)
+
+    @staticmethod
+    async def _collect_all_images(multi_job_id, batch_size, num_workers, prompt_server):
+        """Wait for all images to arrive from workers."""
+        import asyncio
+        from ..upscale.job_models import ImageJobState
+        from ..upscale.job_timeout import check_and_requeue_timed_out_workers
+
+        timeout_seconds = 300.0
+        poll_interval = 2.0
+        start = asyncio.get_event_loop().time()
+
+        while True:
+            # Drain results from the queue
+            job_data = prompt_server.distributed_pending_tile_jobs.get(multi_job_id)
+            if isinstance(job_data, ImageJobState):
+                # Drain queue items into completed_images
+                while True:
+                    try:
+                        result = job_data.queue.get_nowait()
+                        worker_id = result.get("worker_id")
+                        if "image_idx" in result and "image" in result:
+                            idx = result["image_idx"]
+                            if idx not in job_data.completed_images:
+                                job_data.completed_images[idx] = result["image"]
+                                debug_log(f"Delegate collected image {idx} from worker {worker_id}")
+                    except asyncio.QueueEmpty:
+                        break
+
+                completed_count = len(job_data.completed_images)
+                if completed_count >= batch_size:
+                    debug_log(f"Delegate: all {batch_size} images collected")
+                    completed = dict(job_data.completed_images)
+                    # Cleanup
+                    async with prompt_server.distributed_tile_jobs_lock:
+                        prompt_server.distributed_pending_tile_jobs.pop(multi_job_id, None)
+                    return completed
+
+                # Check for timeouts periodically
+                await check_and_requeue_timed_out_workers(multi_job_id, batch_size)
+
+            elapsed = asyncio.get_event_loop().time() - start
+            if elapsed > timeout_seconds:
+                log(f"USDUDelegateCollector: timed out after {elapsed:.0f}s with {len(getattr(job_data, 'completed_images', {}))} of {batch_size} images")
+                if isinstance(job_data, ImageJobState):
+                    completed = dict(job_data.completed_images)
+                    async with prompt_server.distributed_tile_jobs_lock:
+                        prompt_server.distributed_pending_tile_jobs.pop(multi_job_id, None)
+                    return completed
+                return {}
+
+            await asyncio.sleep(poll_interval)
+
+
 # Node registration
 NODE_CLASS_MAPPINGS = {
     "UltimateSDUpscaleDistributed": UltimateSDUpscaleDistributed,
+    "USDUDelegateCollector": USDUDelegateCollector,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UltimateSDUpscaleDistributed": "Ultimate SD Upscale Distributed (No Upscale)",
+    # No display name for USDUDelegateCollector — it's an internal node
 }

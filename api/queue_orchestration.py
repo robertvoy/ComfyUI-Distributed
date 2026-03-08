@@ -306,11 +306,8 @@ def _build_master_prompt(
         + find_nodes_by_class(master_prompt, "DistributedBranchCollector")
     )
     upscale_nodes = find_nodes_by_class(master_prompt, "UltimateSDUpscaleDistributed")
-    if upscale_nodes:
-        debug_log(
-            "Delegate-only master mode currently does not support UltimateSDUpscaleDistributed nodes; running full prompt on master."
-        )
-        return master_prompt
+    # Include USDU nodes as collector-like for delegate pruning
+    collector_ids.extend(upscale_nodes)
     if not collector_ids:
         debug_log(
             "Delegate-only master mode requested but no collector/branch-collector nodes found in master prompt. Running full prompt on master."
