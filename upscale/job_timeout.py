@@ -99,6 +99,10 @@ async def _check_and_requeue_timed_out_workers(multi_job_id, total_tasks):
                 f"Probe diagnostics: online={probe_queue is not None} queue_remaining={probe_queue}"
             )
 
+        if incomplete_assigned == 0:
+            debug_log(f"Worker {worker} heartbeat stale but all tasks complete; skipping")
+            continue
+
         if busy:
             workers_graced.append(worker)
             debug_log(f"Heartbeat grace: worker {worker} busy via probe; skipping requeue")
