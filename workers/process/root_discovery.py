@@ -1,10 +1,26 @@
 import os
+import sys
 
 from ...utils.logging import debug_log, log
 
 
 class ComfyRootDiscovery:
     """Resolve the ComfyUI root directory across local and container layouts."""
+
+    def _find_root_from_loaded_modules(self):
+        """Use already-imported ComfyUI modules to locate the runtime root."""
+        for module_name in ("server", "folder_paths", "main"):
+            module = sys.modules.get(module_name)
+            module_file = getattr(module, "__file__", None)
+            if not module_file:
+                continue
+
+            candidate = os.path.dirname(os.path.abspath(module_file))
+            if os.path.exists(os.path.join(candidate, "main.py")):
+                debug_log(f"Found ComfyUI root via loaded module {module_name}: {candidate}")
+                return candidate
+
+        return None
 
     def find_comfy_root(self):
         # Start from current file location.
@@ -17,12 +33,17 @@ class ComfyRootDiscovery:
             debug_log(f"Found ComfyUI root via COMFYUI_ROOT environment variable: {env_root}")
             return env_root
 
-        # Method 2: Try going up from custom_nodes directory.
+        # Method 2: Inspect the already-loaded ComfyUI runtime modules.
+        runtime_root = self._find_root_from_loaded_modules()
+        if runtime_root:
+            return runtime_root
+
+        # Method 3: Try going up from custom_nodes directory.
         if os.path.exists(os.path.join(potential_root, "main.py")):
             debug_log(f"Found ComfyUI root via directory traversal: {potential_root}")
             return potential_root
 
-        # Method 3: Look for common Docker paths.
+        # Method 4: Look for common Docker paths.
         docker_paths = [
             "/basedir",
             "/ComfyUI",
@@ -37,7 +58,7 @@ class ComfyRootDiscovery:
                 debug_log(f"Found ComfyUI root in Docker path: {path}")
                 return path
 
-        # Method 4: Search upwards for main.py.
+        # Method 5: Search upwards for main.py.
         search_dir = current_dir
         for _ in range(5):
             if os.path.exists(os.path.join(search_dir, "main.py")):
@@ -48,7 +69,7 @@ class ComfyRootDiscovery:
                 break
             search_dir = parent
 
-        # Method 5: Try to import and use folder_paths.
+        # Method 6: Try to import and use folder_paths.
         try:
             import folder_paths
 

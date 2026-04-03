@@ -196,7 +196,7 @@ No, it does not speed up the generation of a single image or video. Instead, it 
 
 <details>
 <summary>Does it work with the ComfyUI desktop app?</summary>
-Currently, it is not compatible with the ComfyUI desktop app.
+Yes. Local managed workers now inherit the active ComfyUI runtime paths, so ComfyUI Desktop installs can launch workers with the same base, user, input, output, and frontend directories as the master.
 </details>
 
 <details>
