@@ -90,8 +90,24 @@ class NetworkHelpersTests(unittest.TestCase):
             "https://master.example.com",
         )
 
+    def test_build_master_url_ignores_stale_saved_port_and_uses_runtime_port(self):
+        cfg = {"master": {"host": "192.168.68.56", "port": 8001}}
+        prompt_server = types.SimpleNamespace(address="127.0.0.1", port=8188)
+        self.assertEqual(
+            network.build_master_url(config=cfg, prompt_server_instance=prompt_server),
+            "http://192.168.68.56:8188",
+        )
+
+    def test_build_master_url_keeps_explicit_port_in_host(self):
+        cfg = {"master": {"host": "192.168.68.56:8001"}}
+        prompt_server = types.SimpleNamespace(address="127.0.0.1", port=8188)
+        self.assertEqual(
+            network.build_master_url(config=cfg, prompt_server_instance=prompt_server),
+            "http://192.168.68.56:8001",
+        )
+
     def test_build_master_url_falls_back_to_server_address(self):
-        cfg = {"master": {"host": ""}}
+        cfg = {"master": {"host": "", "port": 8001}}
         prompt_server = types.SimpleNamespace(address="0.0.0.0", port=8190)
         self.assertEqual(
             network.build_master_url(config=cfg, prompt_server_instance=prompt_server),

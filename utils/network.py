@@ -66,6 +66,25 @@ def normalize_host(value):
     return host.split("/")[0]
 
 
+def _split_host_and_port(host):
+    if not host:
+        return host, None
+
+    if host.startswith("["):
+        match = re.match(r"^(\[[^\]]+\])(?::(\d+))?$", host)
+        if match:
+            parsed_port = int(match.group(2)) if match.group(2) else None
+            return match.group(1), parsed_port
+        return host, None
+
+    if host.count(":") == 1:
+        candidate_host, candidate_port = host.rsplit(":", 1)
+        if candidate_port.isdigit():
+            return candidate_host, int(candidate_port)
+
+    return host, None
+
+
 def build_worker_url(worker, endpoint=""):
     """Construct the worker base URL with optional endpoint."""
     host = (worker.get("host") or "").strip()
@@ -126,12 +145,7 @@ def build_master_url(config=None, prompt_server_instance=None):
     prompt_server_instance = prompt_server_instance or server.PromptServer.instance
     master_cfg = (config or {}).get("master", {}) or {}
     configured_host = (master_cfg.get("host") or "").strip()
-    configured_port = master_cfg.get("port")
-    default_port = getattr(prompt_server_instance, "port", 8188) or 8188
-    try:
-        port = int(configured_port or default_port)
-    except (TypeError, ValueError):
-        port = int(default_port)
+    runtime_port = getattr(prompt_server_instance, "port", 8188) or 8188
 
     def _needs_https(hostname):
         hostname = hostname.lower()
@@ -149,10 +163,11 @@ def build_master_url(config=None, prompt_server_instance=None):
         if configured_host.startswith(("http://", "https://")):
             return configured_host.rstrip("/")
 
-        host = configured_host
+        host, explicit_port = _split_host_and_port(configured_host)
+        port = explicit_port if explicit_port is not None else int(runtime_port)
         scheme = "https" if _needs_https(host) or port == 443 else "http"
         default_port_for_scheme = 443 if scheme == "https" else 80
-        if configured_port is None and scheme == "https" and _needs_https(host):
+        if explicit_port is None and scheme == "https" and _needs_https(host):
             port = default_port_for_scheme
         port_part = "" if port == default_port_for_scheme else f":{port}"
         return f"{scheme}://{host}{port_part}"
@@ -160,6 +175,7 @@ def build_master_url(config=None, prompt_server_instance=None):
     address = getattr(prompt_server_instance, "address", "127.0.0.1") or "127.0.0.1"
     if address in ("0.0.0.0", "::"):
         address = "127.0.0.1"
+    port = int(runtime_port)
     scheme = "https" if port == 443 else "http"
     default_port_for_scheme = 443 if scheme == "https" else 80
     port_part = "" if port == default_port_for_scheme else f":{port}"
