@@ -51,7 +51,6 @@ ComfyUI Distributed supports three types of workers:
 ## Requirements
 
 - ComfyUI
-> Note: Desktop app not currently supported
 - Multiple NVIDIA GPUs
 > No additional GPUs? Use [Cloud Workers](https://github.com/robertvoy/ComfyUI-Distributed/blob/main/docs/worker-setup-guides.md#cloud-workers)
 - That's it
@@ -196,7 +195,7 @@ No, it does not speed up the generation of a single image or video. Instead, it 
 
 <details>
 <summary>Does it work with the ComfyUI desktop app?</summary>
-Yes. Local managed workers now inherit the active ComfyUI runtime paths, so ComfyUI Desktop installs can launch workers with the same base, user, input, output, and frontend directories as the master.
+Yes, it does now.
 </details>
 
 <details>
