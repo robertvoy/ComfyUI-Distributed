@@ -13,7 +13,7 @@ from ..utils.constants import (
     ORCHESTRATION_WORKER_PREP_CONCURRENCY,
 )
 from ..utils.logging import debug_log, log
-from ..utils.network import build_master_url
+from ..utils.network import build_master_url, build_master_callback_url
 from ..utils.trace_logger import trace_debug
 from .schemas import parse_positive_float, parse_positive_int
 from .orchestration.dispatch import (
@@ -144,6 +144,7 @@ async def _prepare_worker_payload(
     enabled_ids,
     job_id_map,
     master_url,
+    config,
     delegate_master,
     trace_execution_id,
     worker_prep_semaphore,
@@ -153,6 +154,11 @@ async def _prepare_worker_payload(
     """Prepare one worker prompt payload with bounded concurrency and media-sync timeout."""
     async with worker_prep_semaphore:
         worker_prompt = prompt_index.copy_prompt()
+        worker_master_url = build_master_callback_url(
+            worker,
+            config=config,
+            prompt_server_instance=prompt_server,
+        )
 
         worker_type = str(worker.get("type") or "local").strip().lower()
         is_remote_like = bool(worker.get("host")) and worker_type != "local"
@@ -167,7 +173,7 @@ async def _prepare_worker_payload(
             worker["id"],
             enabled_ids,
             job_id_map,
-            master_url,
+            worker_master_url,
             delegate_master,
             prompt_index,
         )
@@ -360,6 +366,7 @@ async def orchestrate_distributed_execution(
                     enabled_ids,
                     job_id_map,
                     master_url,
+                    config,
                     delegate_master,
                     execution_trace_id,
                     worker_prep_semaphore,

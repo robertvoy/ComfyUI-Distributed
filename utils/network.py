@@ -180,3 +180,22 @@ def build_master_url(config=None, prompt_server_instance=None):
     default_port_for_scheme = 443 if scheme == "https" else 80
     port_part = "" if port == default_port_for_scheme else f":{port}"
     return f"{scheme}://{address}{port_part}"
+
+
+def build_master_callback_url(worker, config=None, prompt_server_instance=None):
+    """Build the callback URL a specific worker should use to reach the master."""
+    prompt_server_instance = prompt_server_instance or server.PromptServer.instance
+
+    worker_type = str((worker or {}).get("type") or "").strip().lower()
+    worker_host = normalize_host((worker or {}).get("host"))
+    local_hosts = {"", "localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
+
+    is_local_worker = worker_type == "local" or worker_host in local_hosts
+    if is_local_worker:
+        port = int(getattr(prompt_server_instance, "port", 8188) or 8188)
+        scheme = "https" if port == 443 else "http"
+        default_port_for_scheme = 443 if scheme == "https" else 80
+        port_part = "" if port == default_port_for_scheme else f":{port}"
+        return f"{scheme}://127.0.0.1{port_part}"
+
+    return build_master_url(config=config, prompt_server_instance=prompt_server_instance)

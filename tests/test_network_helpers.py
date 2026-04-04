@@ -114,6 +114,24 @@ class NetworkHelpersTests(unittest.TestCase):
             "http://127.0.0.1:8190",
         )
 
+    def test_build_master_callback_url_uses_loopback_for_local_worker(self):
+        cfg = {"master": {"host": "192.168.68.56"}}
+        prompt_server = types.SimpleNamespace(address="127.0.0.1", port=8001)
+        worker = {"id": "w1", "type": "local", "host": "localhost", "port": 8189}
+        self.assertEqual(
+            network.build_master_callback_url(worker, config=cfg, prompt_server_instance=prompt_server),
+            "http://127.0.0.1:8001",
+        )
+
+    def test_build_master_callback_url_keeps_public_master_url_for_remote_worker(self):
+        cfg = {"master": {"host": "192.168.68.56"}}
+        prompt_server = types.SimpleNamespace(address="127.0.0.1", port=8001)
+        worker = {"id": "w2", "type": "remote", "host": "192.168.68.99", "port": 8189}
+        self.assertEqual(
+            network.build_master_callback_url(worker, config=cfg, prompt_server_instance=prompt_server),
+            "http://192.168.68.56:8001",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
