@@ -208,7 +208,7 @@ async def orchestrate_distributed_execution(
     """Core orchestration logic for the /distributed/queue endpoint.
 
     Returns:
-        tuple[str, int]: (prompt_id, worker_count)
+        tuple[str, int, int, dict]: (prompt_id, number, worker_count, node_errors)
     """
     ensure_distributed_state()
     execution_trace_id = trace_execution_id or _generate_execution_trace_id()
@@ -317,8 +317,18 @@ async def orchestrate_distributed_execution(
 
     if not job_id_map:
         trace_debug(execution_trace_id, "No distributed nodes detected; queueing prompt on master only.")
-        prompt_id = await queue_prompt_payload(prompt_obj, workflow_meta, client_id)
-        return prompt_id, 0
+        queue_result = await queue_prompt_payload(
+            prompt_obj,
+            workflow_meta,
+            client_id,
+            include_queue_metadata=True,
+        )
+        return (
+            queue_result["prompt_id"],
+            queue_result["number"],
+            0,
+            queue_result.get("node_errors", {}),
+        )
 
     for job_id in job_id_map.values():
         await _ensure_distributed_queue(job_id)
@@ -392,9 +402,17 @@ async def orchestrate_distributed_execution(
             ]
         )
 
-    prompt_id = await queue_prompt_payload(master_prompt, workflow_meta, client_id)
+    queue_result = await queue_prompt_payload(
+        master_prompt,
+        workflow_meta,
+        client_id,
+        include_queue_metadata=True,
+    )
+    prompt_id = queue_result["prompt_id"]
+    prompt_number = queue_result["number"]
+    node_errors = queue_result.get("node_errors", {})
     trace_debug(
         execution_trace_id,
         f"Orchestration complete: prompt_id={prompt_id}, dispatched_workers={len(worker_payloads)}, delegate_master={delegate_master}",
     )
-    return prompt_id, len(worker_payloads)
+    return prompt_id, prompt_number, len(worker_payloads), node_errors

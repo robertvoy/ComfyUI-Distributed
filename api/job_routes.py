@@ -217,7 +217,7 @@ async def distributed_queue_endpoint(request):
         return await handle_api_error(request, exc, 400)
 
     try:
-        prompt_id, worker_count = await orchestrate_distributed_execution(
+        prompt_id, prompt_number, worker_count, node_errors = await orchestrate_distributed_execution(
             payload.prompt,
             payload.workflow_meta,
             payload.client_id,
@@ -227,6 +227,8 @@ async def distributed_queue_endpoint(request):
         )
         return web.json_response({
             "prompt_id": prompt_id,
+            "number": prompt_number,
+            "node_errors": node_errors,
             "worker_count": worker_count,
             "auto_prepare_supported": True,
         })
