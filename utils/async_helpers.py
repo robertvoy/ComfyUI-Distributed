@@ -3,6 +3,7 @@ Async helper utilities for ComfyUI-Distributed.
 """
 import asyncio
 import threading
+import time
 import uuid
 import execution
 import server
@@ -122,7 +123,7 @@ async def queue_prompt_payload(
         node_errors = valid[3] if len(valid) > 3 else {}
         raise PromptValidationError(error_payload, node_errors)
 
-    extra_data = {}
+    extra_data = {"create_time": int(time.time() * 1000)}
     if workflow_meta:
         extra_data.setdefault("extra_pnginfo", {})["workflow"] = workflow_meta
     if client_id:
