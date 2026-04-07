@@ -162,7 +162,7 @@ def _load_job_routes_module():
     sys.modules[f"{package_name}.utils.async_helpers"] = async_helpers_module
 
     queue_orchestration_module = types.ModuleType(f"{package_name}.api.queue_orchestration")
-    queue_orchestration_module.orchestrate_distributed_execution = AsyncMock(return_value=("prompt_dist", 1))
+    queue_orchestration_module.orchestrate_distributed_execution = AsyncMock(return_value=("prompt_dist", 7, 1, {}))
     sys.modules[f"{package_name}.api.queue_orchestration"] = queue_orchestration_module
 
     @dataclass(frozen=True)
@@ -221,7 +221,7 @@ job_routes = _load_job_routes_module()
 
 
 class DistributedQueueEndpointTests(unittest.IsolatedAsyncioTestCase):
-    async def test_distributed_queue_happy_path_returns_prompt_id(self):
+    async def test_distributed_queue_happy_path_returns_prompt_metadata(self):
         request = _FakeRequest(
             {
                 "prompt": {"1": {"class_type": "Node"}},
@@ -233,12 +233,14 @@ class DistributedQueueEndpointTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             job_routes,
             "orchestrate_distributed_execution",
-            new=AsyncMock(return_value=("prompt_123", 2)),
+            new=AsyncMock(return_value=("prompt_123", 42, 2, {})),
         ):
             response = await job_routes.distributed_queue_endpoint(request)
 
         self.assertEqual(response.status, 200)
         self.assertEqual(response.payload.get("prompt_id"), "prompt_123")
+        self.assertEqual(response.payload.get("number"), 42)
+        self.assertEqual(response.payload.get("node_errors"), {})
         self.assertTrue(response.payload.get("auto_prepare_supported"))
 
     async def test_distributed_queue_missing_prompt_returns_400(self):
