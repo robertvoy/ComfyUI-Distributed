@@ -14,7 +14,7 @@ class _PromptQueue:
 
 
 def _load_async_helpers_module():
-    module_path = Path("/home/robert/ComfyUI_dev/custom_nodes/ComfyUI-Distributed/utils/async_helpers.py")
+    module_path = Path(__file__).resolve().parents[1] / "utils" / "async_helpers.py"
     package_name = "dist_async_helpers_testpkg"
 
     for mod_name in list(sys.modules):
