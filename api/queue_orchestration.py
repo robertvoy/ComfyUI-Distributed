@@ -46,10 +46,157 @@ def ensure_distributed_state(server_instance=None):
         ps.distributed_pending_jobs = {}
     if not hasattr(ps, "distributed_jobs_lock"):
         ps.distributed_jobs_lock = asyncio.Lock()
+    if not hasattr(ps, "distributed_worker_reservations"):
+        ps.distributed_worker_reservations = {}
 
 
 # Initialize top-level distributed queue state at module import time.
 ensure_distributed_state()
+
+
+def _worker_id(worker):
+    return str(worker.get("id"))
+
+
+def _non_negative_int(value, default=0):
+    try:
+        parsed = int(value if value is not None else default)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(parsed, 0)
+
+
+async def _release_worker_reservation(worker_id):
+    if not worker_id:
+        return
+    ensure_distributed_state()
+    async with prompt_server.distributed_jobs_lock:
+        reservations = prompt_server.distributed_worker_reservations
+        current = _non_negative_int(reservations.get(worker_id, 0))
+        if current <= 1:
+            reservations.pop(worker_id, None)
+        else:
+            reservations[worker_id] = current - 1
+
+
+async def _candidate_workers_with_reservations(candidate_workers):
+    ensure_distributed_state()
+    async with prompt_server.distributed_jobs_lock:
+        reservations = dict(prompt_server.distributed_worker_reservations)
+    return [
+        {
+            **worker,
+            "reserved_slots": reservations.get(_worker_id(worker), 0),
+        }
+        for worker in candidate_workers
+    ]
+
+
+async def _reserve_selected_worker(selected_worker):
+    selected_worker_id = _worker_id(selected_worker)
+    selected_reserved_slots = _non_negative_int(selected_worker.get("reserved_slots", 0))
+    async with prompt_server.distributed_jobs_lock:
+        reservations = prompt_server.distributed_worker_reservations
+        current_reserved_slots = _non_negative_int(reservations.get(selected_worker_id, 0))
+        if current_reserved_slots != selected_reserved_slots:
+            return None
+        reservations[selected_worker_id] = current_reserved_slots + 1
+        return selected_worker_id
+
+
+def _normalized_idle_poll_interval(value):
+    try:
+        poll_interval = float(value or 0)
+    except (TypeError, ValueError):
+        poll_interval = 1.0
+    return max(poll_interval, 0.05)
+
+
+async def _select_and_reserve_load_balance_worker(
+    candidate_workers,
+    execution_trace_id,
+    worker_probe_concurrency,
+    idle_poll_interval,
+):
+    poll_interval = _normalized_idle_poll_interval(idle_poll_interval)
+    while candidate_workers:
+        reserved_candidates = await _candidate_workers_with_reservations(candidate_workers)
+        selected_worker = await select_least_busy_worker(
+            reserved_candidates,
+            trace_execution_id=execution_trace_id,
+            probe_concurrency=worker_probe_concurrency,
+            require_idle=True,
+            idle_poll_interval=0,
+            idle_wait_timeout=0,
+        )
+        if selected_worker is None:
+            await asyncio.sleep(poll_interval)
+            continue
+
+        reserved_worker_id = await _reserve_selected_worker(selected_worker)
+        if reserved_worker_id is not None:
+            return selected_worker
+
+        await asyncio.sleep(0)
+    return None
+
+
+def _load_balance_candidate_workers(active_workers, delegate_master, master_url):
+    candidate_workers = list(active_workers)
+    if not delegate_master:
+        candidate_workers.append(
+            {
+                "id": "master",
+                "name": "Master",
+                "host": master_url,
+                "type": "local",
+            }
+        )
+    return candidate_workers
+
+
+async def _resolve_load_balance_selection(
+    active_workers,
+    delegate_master,
+    master_url,
+    config,
+    execution_trace_id,
+    worker_probe_concurrency,
+):
+    candidate_workers = _load_balance_candidate_workers(active_workers, delegate_master, master_url)
+    selected_worker = None
+    if candidate_workers:
+        settings = (config.get("settings", {}) or {})
+        idle_poll_interval = parse_positive_float(
+            settings.get("load_balance_idle_poll_interval_seconds"),
+            1.0,
+        )
+        selected_worker = await _select_and_reserve_load_balance_worker(
+            candidate_workers,
+            execution_trace_id,
+            worker_probe_concurrency,
+            idle_poll_interval,
+        )
+
+    if selected_worker is not None and _worker_id(selected_worker) == "master":
+        trace_debug(
+            execution_trace_id,
+            "Load-balance selected master for execution (workers skipped).",
+        )
+        return [], False, "master"
+
+    if selected_worker is not None:
+        trace_debug(
+            execution_trace_id,
+            f"Load-balance selected worker {selected_worker.get('id')} (master set to delegate-only).",
+        )
+        return [selected_worker], True, _worker_id(selected_worker)
+
+    trace_debug(
+        execution_trace_id,
+        "Load-balance requested but no idle/probeable execution candidates were available.",
+    )
+    return [], False, None
 
 
 async def _ensure_distributed_queue(job_id):
@@ -259,160 +406,123 @@ async def orchestrate_distributed_execution(
         probe_concurrency=worker_probe_concurrency,
     )
 
+    reserved_worker_id = None
     if load_balance_requested:
-        candidate_workers = list(active_workers)
-        if not delegate_master:
-            # Include master in load balancing only when master participation is enabled.
-            candidate_workers.append(
-                {
-                    "id": "master",
-                    "name": "Master",
-                    "host": master_url,
-                    "type": "local",
-                }
+        active_workers, delegate_master, reserved_worker_id = await _resolve_load_balance_selection(
+            active_workers,
+            delegate_master,
+            master_url,
+            config,
+            execution_trace_id,
+            worker_probe_concurrency,
+        )
+
+    try:
+        enabled_ids = [worker["id"] for worker in active_workers]
+
+        discovery_prefix = f"exec_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        job_id_map = generate_job_id_map(prompt_index, discovery_prefix)
+
+        if not job_id_map:
+            trace_debug(execution_trace_id, "No distributed nodes detected; queueing prompt on master only.")
+            queue_result = await queue_prompt_payload(
+                prompt_obj,
+                workflow_meta,
+                client_id,
+                include_queue_metadata=True,
+            )
+            return (
+                queue_result["prompt_id"],
+                queue_result["number"],
+                0,
+                queue_result.get("node_errors", {}),
             )
 
-        selected_worker = None
-        if candidate_workers:
-            selected_worker = await select_least_busy_worker(
-                candidate_workers,
-                trace_execution_id=execution_trace_id,
-                probe_concurrency=worker_probe_concurrency,
-            )
-        if selected_worker is None and candidate_workers:
+        for job_id in job_id_map.values():
+            await _ensure_distributed_queue(job_id)
+
+        master_prompt = prompt_index.copy_prompt()
+        master_prompt = apply_participant_overrides(
+            master_prompt,
+            "master",
+            enabled_ids,
+            job_id_map,
+            master_url,
+            delegate_master,
+            prompt_index,
+        )
+
+        if delegate_master:
+            collector_ids = find_nodes_by_class(master_prompt, "DistributedCollector")
+            upscale_nodes = find_nodes_by_class(master_prompt, "UltimateSDUpscaleDistributed")
+            if upscale_nodes:
+                debug_log(
+                    "Delegate-only master mode currently does not support UltimateSDUpscaleDistributed nodes; running full prompt on master."
+                )
+            elif not collector_ids:
+                debug_log(
+                    "Delegate-only master mode requested but no collectors found in master prompt. Running full prompt on master."
+                )
+            else:
+                master_prompt = prepare_delegate_master_prompt(master_prompt, collector_ids)
+
+        if active_workers:
             trace_debug(
                 execution_trace_id,
-                "Load-balance selection probe failed; using first available candidate.",
+                "Active distributed workers: "
+                + ", ".join(f"{worker['name']} ({worker['id']})" for worker in active_workers),
             )
-            selected_worker = candidate_workers[0]
-
-        if selected_worker is not None and str(selected_worker.get("id")) == "master":
-            # Master selected as least busy; run master workload only.
-            active_workers = []
-            delegate_master = False
-            trace_debug(
-                execution_trace_id,
-                "Load-balance selected master for execution (workers skipped).",
+        worker_payloads = []
+        if active_workers:
+            worker_prep_semaphore = asyncio.Semaphore(worker_prep_concurrency)
+            media_sync_semaphore = asyncio.Semaphore(media_sync_concurrency)
+            worker_payloads = await asyncio.gather(
+                *[
+                    _prepare_worker_payload(
+                        worker,
+                        prompt_index,
+                        enabled_ids,
+                        job_id_map,
+                        master_url,
+                        config,
+                        delegate_master,
+                        execution_trace_id,
+                        worker_prep_semaphore,
+                        media_sync_semaphore,
+                        media_sync_timeout_seconds,
+                    )
+                    for worker in active_workers
+                ]
             )
-        elif selected_worker is not None:
-            active_workers = [selected_worker]
-            # Worker selected as least busy; keep master orchestrator-only for this run.
-            delegate_master = True
-            trace_debug(
-                execution_trace_id,
-                f"Load-balance selected worker {selected_worker.get('id')} (master set to delegate-only).",
+
+        if worker_payloads:
+            await asyncio.gather(
+                *[
+                    dispatch_worker_prompt(
+                        worker,
+                        wprompt,
+                        workflow_meta,
+                        client_id,
+                        use_websocket=use_websocket,
+                        trace_execution_id=execution_trace_id,
+                    )
+                    for worker, wprompt in worker_payloads
+                ]
             )
-        else:
-            trace_debug(
-                execution_trace_id,
-                "Load-balance requested but no execution candidates were available.",
-            )
-            active_workers = []
-            delegate_master = False
 
-    enabled_ids = [worker["id"] for worker in active_workers]
-
-    discovery_prefix = f"exec_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
-    job_id_map = generate_job_id_map(prompt_index, discovery_prefix)
-
-    if not job_id_map:
-        trace_debug(execution_trace_id, "No distributed nodes detected; queueing prompt on master only.")
         queue_result = await queue_prompt_payload(
-            prompt_obj,
+            master_prompt,
             workflow_meta,
             client_id,
             include_queue_metadata=True,
         )
-        return (
-            queue_result["prompt_id"],
-            queue_result["number"],
-            0,
-            queue_result.get("node_errors", {}),
-        )
-
-    for job_id in job_id_map.values():
-        await _ensure_distributed_queue(job_id)
-
-    master_prompt = prompt_index.copy_prompt()
-    master_prompt = apply_participant_overrides(
-        master_prompt,
-        "master",
-        enabled_ids,
-        job_id_map,
-        master_url,
-        delegate_master,
-        prompt_index,
-    )
-
-    if delegate_master:
-        collector_ids = find_nodes_by_class(master_prompt, "DistributedCollector")
-        upscale_nodes = find_nodes_by_class(master_prompt, "UltimateSDUpscaleDistributed")
-        if upscale_nodes:
-            debug_log(
-                "Delegate-only master mode currently does not support UltimateSDUpscaleDistributed nodes; running full prompt on master."
-            )
-        elif not collector_ids:
-            debug_log(
-                "Delegate-only master mode requested but no collectors found in master prompt. Running full prompt on master."
-            )
-        else:
-            master_prompt = prepare_delegate_master_prompt(master_prompt, collector_ids)
-
-    if active_workers:
+        prompt_id = queue_result["prompt_id"]
+        prompt_number = queue_result["number"]
+        node_errors = queue_result.get("node_errors", {})
         trace_debug(
             execution_trace_id,
-            "Active distributed workers: "
-            + ", ".join(f"{worker['name']} ({worker['id']})" for worker in active_workers),
+            f"Orchestration complete: prompt_id={prompt_id}, dispatched_workers={len(worker_payloads)}, delegate_master={delegate_master}",
         )
-    worker_payloads = []
-    if active_workers:
-        worker_prep_semaphore = asyncio.Semaphore(worker_prep_concurrency)
-        media_sync_semaphore = asyncio.Semaphore(media_sync_concurrency)
-        worker_payloads = await asyncio.gather(
-            *[
-                _prepare_worker_payload(
-                    worker,
-                    prompt_index,
-                    enabled_ids,
-                    job_id_map,
-                    master_url,
-                    config,
-                    delegate_master,
-                    execution_trace_id,
-                    worker_prep_semaphore,
-                    media_sync_semaphore,
-                    media_sync_timeout_seconds,
-                )
-                for worker in active_workers
-            ]
-        )
-
-    if worker_payloads:
-        await asyncio.gather(
-            *[
-                dispatch_worker_prompt(
-                    worker,
-                    wprompt,
-                    workflow_meta,
-                    client_id,
-                    use_websocket=use_websocket,
-                    trace_execution_id=execution_trace_id,
-                )
-                for worker, wprompt in worker_payloads
-            ]
-        )
-
-    queue_result = await queue_prompt_payload(
-        master_prompt,
-        workflow_meta,
-        client_id,
-        include_queue_metadata=True,
-    )
-    prompt_id = queue_result["prompt_id"]
-    prompt_number = queue_result["number"]
-    node_errors = queue_result.get("node_errors", {})
-    trace_debug(
-        execution_trace_id,
-        f"Orchestration complete: prompt_id={prompt_id}, dispatched_workers={len(worker_payloads)}, delegate_master={delegate_master}",
-    )
-    return prompt_id, prompt_number, len(worker_payloads), node_errors
+        return prompt_id, prompt_number, len(worker_payloads), node_errors
+    finally:
+        await _release_worker_reservation(reserved_worker_id)

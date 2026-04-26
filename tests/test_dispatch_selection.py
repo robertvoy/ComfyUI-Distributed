@@ -250,5 +250,63 @@ class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(selected)
 
 
+    async def test_select_least_busy_worker_waits_for_idle_when_required(self):
+        workers = [
+            {"id": "w1", "name": "Worker 1"},
+            {"id": "w2", "name": "Worker 2"},
+        ]
+        queue_sequences = {
+            "w1": [1, 1],
+            "w2": [1, 0],
+        }
+
+        async def fake_probe(worker_url, timeout=3.0):
+            worker_id = worker_url.rsplit("/", 1)[-1]
+            sequence = queue_sequences[worker_id]
+            value = sequence.pop(0) if sequence else 0
+            return {"exec_info": {"queue_remaining": value}}
+
+        with patch.object(dispatch, "build_worker_url", side_effect=lambda worker: f"http://host/{worker['id']}"), patch.object(
+            dispatch,
+            "probe_worker",
+            side_effect=fake_probe,
+        ):
+            dispatch._least_busy_rr_index = 0
+            selected = await dispatch.select_least_busy_worker(
+                workers,
+                probe_concurrency=2,
+                require_idle=True,
+                idle_poll_interval=0,
+            )
+
+        self.assertEqual(selected["id"], "w2")
+
+
+    async def test_select_least_busy_worker_counts_reserved_slots_as_busy(self):
+        workers = [
+            {"id": "w1", "name": "Worker 1", "reserved_slots": 1},
+            {"id": "w2", "name": "Worker 2"},
+        ]
+
+        async def fake_probe(worker_url, timeout=3.0):
+            return {"exec_info": {"queue_remaining": 0}}
+
+        with patch.object(dispatch, "build_worker_url", side_effect=lambda worker: f"http://host/{worker['id']}"), patch.object(
+            dispatch,
+            "probe_worker",
+            side_effect=fake_probe,
+        ):
+            dispatch._least_busy_rr_index = 0
+            selected = await dispatch.select_least_busy_worker(
+                workers,
+                probe_concurrency=2,
+                require_idle=True,
+                idle_poll_interval=0,
+                idle_wait_timeout=0,
+            )
+
+        self.assertEqual(selected["id"], "w2")
+
+
 if __name__ == "__main__":
     unittest.main()

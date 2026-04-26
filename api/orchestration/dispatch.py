@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import uuid
 
 import aiohttp
@@ -207,9 +208,13 @@ async def _probe_worker_queue(worker, semaphore, probe_timeout):
         payload = await probe_worker(worker_url, timeout=probe_timeout)
         if payload is None:
             return None
+        try:
+            reserved_slots = int(worker.get("reserved_slots", 0) or 0)
+        except (TypeError, ValueError):
+            reserved_slots = 0
         return {
             "worker": worker,
-            "queue_remaining": _extract_queue_remaining(payload),
+            "queue_remaining": _extract_queue_remaining(payload) + max(reserved_slots, 0),
         }
 
 
@@ -222,17 +227,7 @@ def _select_idle_round_robin(statuses):
     return statuses[index]
 
 
-async def select_least_busy_worker(
-    workers,
-    trace_execution_id=None,
-    probe_concurrency=8,
-    probe_timeout=3.0,
-):
-    """Select one worker by queue depth, round-robin among idle workers."""
-    if not workers:
-        return None
-
-    probe_limit = parse_positive_int(probe_concurrency, 8)
+async def _probe_worker_queues(workers, probe_limit, probe_timeout):
     probe_semaphore = asyncio.Semaphore(probe_limit)
     statuses = await asyncio.gather(
         *[
@@ -240,29 +235,66 @@ async def select_least_busy_worker(
             for worker in workers
         ]
     )
-    statuses = [status for status in statuses if status is not None]
-    if not statuses:
-        if trace_execution_id:
-            trace_info(trace_execution_id, "Least-busy selection failed: no worker queue probes succeeded.")
-        else:
-            log("[Distributed] Least-busy selection failed: no worker queue probes succeeded.")
-        return None
+    return [status for status in statuses if status is not None]
 
+
+def _select_worker_status(statuses, require_idle=False):
     idle_statuses = [status for status in statuses if status["queue_remaining"] == 0]
     if idle_statuses:
-        selected = _select_idle_round_robin(idle_statuses)
-    else:
-        selected = min(statuses, key=lambda status: status["queue_remaining"])
+        return _select_idle_round_robin(idle_statuses)
+    if require_idle:
+        return None
+    return min(statuses, key=lambda status: status["queue_remaining"])
 
-    worker = selected["worker"]
-    queue_remaining = selected["queue_remaining"]
-    if trace_execution_id:
-        trace_debug(
-            trace_execution_id,
-            f"Least-busy worker selected: {worker.get('name')} ({worker.get('id')}), queue_remaining={queue_remaining}",
-        )
-    else:
-        debug_log(
-            f"Least-busy worker selected: {worker.get('name')} ({worker.get('id')}), queue_remaining={queue_remaining}"
-        )
-    return worker
+
+async def select_least_busy_worker(
+    workers,
+    trace_execution_id=None,
+    probe_concurrency=8,
+    probe_timeout=3.0,
+    require_idle=False,
+    idle_poll_interval=1.0,
+    idle_wait_timeout=None,
+):
+    """Select a worker by queue depth, optionally waiting until one is idle."""
+    if not workers:
+        return None
+
+    probe_limit = parse_positive_int(probe_concurrency, 8)
+    poll_interval = max(float(idle_poll_interval or 0), 0.0)
+    deadline = None
+    if idle_wait_timeout is not None:
+        deadline = time.monotonic() + max(float(idle_wait_timeout), 0.0)
+
+    while True:
+        statuses = await _probe_worker_queues(workers, probe_limit, probe_timeout)
+        if not statuses:
+            if trace_execution_id:
+                trace_info(trace_execution_id, "Least-busy selection failed: no worker queue probes succeeded.")
+            else:
+                log("[Distributed] Least-busy selection failed: no worker queue probes succeeded.")
+            return None
+
+        selected = _select_worker_status(statuses, require_idle=require_idle)
+        if selected is not None:
+            worker = selected["worker"]
+            queue_remaining = selected["queue_remaining"]
+            if trace_execution_id:
+                trace_debug(
+                    trace_execution_id,
+                    f"Least-busy worker selected: {worker.get('name')} ({worker.get('id')}), queue_remaining={queue_remaining}",
+                )
+            else:
+                debug_log(
+                    f"Least-busy worker selected: {worker.get('name')} ({worker.get('id')}), queue_remaining={queue_remaining}"
+                )
+            return worker
+
+        if deadline is not None and time.monotonic() >= deadline:
+            if trace_execution_id:
+                trace_info(trace_execution_id, "No idle load-balance worker became available before timeout.")
+            else:
+                debug_log("No idle load-balance worker became available before timeout.")
+            return None
+
+        await asyncio.sleep(poll_interval)
