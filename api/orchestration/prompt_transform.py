@@ -125,6 +125,50 @@ def _find_upstream_nodes(prompt_obj, start_ids):
     return connected
 
 
+_DELEGATE_MASTER_PRIMITIVE_CLASSES = {
+    "PrimitiveBoolean",
+    "PrimitiveFloat",
+    "PrimitiveInt",
+    "PrimitiveNode",
+    "PrimitiveString",
+}
+
+
+def _is_delegate_master_primitive_node(node):
+    """Return True for lightweight primitive nodes safe to keep on the master."""
+    if not isinstance(node, dict):
+        return False
+    class_type = node.get("class_type")
+    return isinstance(class_type, str) and (
+        class_type in _DELEGATE_MASTER_PRIMITIVE_CLASSES or class_type.startswith("Primitive")
+    )
+
+
+def _find_delegate_master_primitive_upstream_nodes(prompt_obj, start_ids):
+    """Return primitive upstream nodes needed by kept delegate-master nodes."""
+    connected = set()
+    visited = set()
+    queue = deque(str(node_id) for node_id in start_ids)
+    while queue:
+        node_id = queue.popleft()
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+        node = prompt_obj.get(node_id) or {}
+        inputs = node.get("inputs", {})
+        for value in inputs.values():
+            if not (isinstance(value, list) and len(value) == 2):
+                continue
+            source_id = str(value[0])
+            source_node = prompt_obj.get(source_id)
+            if not _is_delegate_master_primitive_node(source_node):
+                continue
+            if source_id not in connected:
+                connected.add(source_id)
+                queue.append(source_id)
+    return connected
+
+
 def prune_prompt_for_worker(prompt_obj):
     """Prune worker prompt to distributed nodes and their upstream dependencies."""
     collector_ids = find_nodes_by_class(prompt_obj, "DistributedCollector")
@@ -167,6 +211,9 @@ def prepare_delegate_master_prompt(prompt_obj, collector_ids):
     downstream = _find_downstream_nodes(prompt_obj, collector_ids)
     nodes_to_keep = set(collector_ids)
     nodes_to_keep.update(downstream)
+    nodes_to_keep.update(
+        _find_delegate_master_primitive_upstream_nodes(prompt_obj, nodes_to_keep)
+    )
 
     pruned_prompt = {}
     for node_id in nodes_to_keep:

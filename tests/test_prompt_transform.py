@@ -296,6 +296,34 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         empty_nodes = [n for n in result.values() if n.get("class_type") == "DistributedEmptyImage"]
         self.assertEqual(len(empty_nodes), 2)
 
+    def test_preserves_primitive_string_for_downstream_required_input(self):
+        """Delegate-only master keeps primitive inputs needed by SaveImage."""
+        prompt = {
+            "8": {"class_type": "KSampler", "inputs": {}},
+            "11": {"class_type": "DistributedCollector", "inputs": {"images": ["8", 0]}},
+            "15": {"class_type": "PrimitiveString", "inputs": {"value": "test/input_bug"}},
+            "9": {
+                "class_type": "SaveImage",
+                "inputs": {
+                    "images": ["11", 0],
+                    "filename_prefix": ["15", 0],
+                },
+            },
+        }
+
+        result = pt.prepare_delegate_master_prompt(prompt, ["11"])
+
+        self.assertIn("15", result)
+        self.assertEqual(result["15"], prompt["15"])
+        self.assertEqual(result["9"]["inputs"]["filename_prefix"], ["15", 0])
+
+    def test_does_not_preserve_non_primitive_upstream_for_collector(self):
+        prompt = _delegate_prompt()
+        result = pt.prepare_delegate_master_prompt(prompt, ["3"])
+
+        self.assertNotIn("2", result)
+        self.assertNotEqual(result["3"]["inputs"]["images"], ["2", 0])
+
     def test_result_is_independent_copy(self):
         prompt = _delegate_prompt()
         result = pt.prepare_delegate_master_prompt(prompt, ["3"])
