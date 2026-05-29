@@ -324,6 +324,29 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         self.assertNotIn("2", result)
         self.assertNotEqual(result["3"]["inputs"]["images"], ["2", 0])
 
+    def test_preserves_load_image_for_switch_alternate_required_input(self):
+        """Delegate-only master keeps LoadImage inputs needed by switches."""
+        prompt = {
+            "848": {"class_type": "LoadImage", "inputs": {"image": "input_bug2_00003_.png"}},
+            "862": {"class_type": "VAEDecode", "inputs": {}},
+            "854": {"class_type": "DistributedCollector", "inputs": {"images": ["862", 0]}},
+            "850": {
+                "class_type": "ComfySwitchNode",
+                "inputs": {
+                    "on_false": ["848", 0],
+                    "on_true": ["854", 0],
+                },
+            },
+            "851": {"class_type": "PreviewImage", "inputs": {"images": ["850", 0]}},
+        }
+
+        result = pt.prepare_delegate_master_prompt(prompt, ["854"])
+
+        self.assertIn("848", result)
+        self.assertEqual(result["850"]["inputs"]["on_false"], ["848", 0])
+        self.assertEqual(result["850"]["inputs"]["on_true"], ["854", 0])
+        self.assertNotIn("862", result)
+
     def test_result_is_independent_copy(self):
         prompt = _delegate_prompt()
         result = pt.prepare_delegate_master_prompt(prompt, ["3"])
