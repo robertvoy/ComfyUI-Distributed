@@ -134,40 +134,121 @@ _DELEGATE_MASTER_RETAINED_UPSTREAM_CLASSES = {
     "PrimitiveString",
 }
 
+_DELEGATE_MASTER_SAFE_RETURN_TYPES = {"BOOLEAN", "FLOAT", "INT", "STRING"}
 
-def _is_delegate_master_retained_upstream_node(node):
+# Test hook. At runtime this stays None and the ComfyUI node registry is loaded lazily.
+_DELEGATE_MASTER_NODE_CLASS_MAPPINGS = None
+
+
+def _get_delegate_master_node_class_mappings():
+    """Return ComfyUI node-class mappings when available."""
+    if _DELEGATE_MASTER_NODE_CLASS_MAPPINGS is not None:
+        return _DELEGATE_MASTER_NODE_CLASS_MAPPINGS
+    try:
+        import nodes as comfy_nodes  # type: ignore
+    except Exception:  # pragma: no cover - depends on ComfyUI runtime imports
+        return {}
+    return getattr(comfy_nodes, "NODE_CLASS_MAPPINGS", {}) or {}
+
+
+def _normalize_delegate_master_return_type(return_type):
+    if return_type is None:
+        return ""
+    return str(return_type).strip().upper()
+
+
+def _delegate_master_output_is_safe_scalar(class_type, output_index):
+    """Return True when a registered node output is a lightweight scalar type."""
+    mappings = _get_delegate_master_node_class_mappings()
+    node_class = mappings.get(class_type) if isinstance(mappings, dict) else None
+    return_types = getattr(node_class, "RETURN_TYPES", ()) if node_class is not None else ()
+    try:
+        output_type = return_types[int(output_index)]
+    except (IndexError, TypeError, ValueError):
+        return False
+    return _normalize_delegate_master_return_type(output_type) in _DELEGATE_MASTER_SAFE_RETURN_TYPES
+
+
+def _is_delegate_master_retained_upstream_node(node, output_index=0):
     """Return True for lightweight upstream nodes safe to keep on the master."""
     if not isinstance(node, dict):
         return False
     class_type = node.get("class_type")
-    return isinstance(class_type, str) and (
+    if not isinstance(class_type, str):
+        return False
+    return (
         class_type in _DELEGATE_MASTER_RETAINED_UPSTREAM_CLASSES
         or class_type.startswith("Primitive")
+        or _delegate_master_output_is_safe_scalar(class_type, output_index)
     )
+
+
+def _collect_delegate_master_retained_upstream_branch(
+    prompt_obj,
+    node_id,
+    output_index,
+    memo,
+    visiting,
+):
+    """Return safe retained branch nodes, or None when the branch is not safe."""
+    node_id = str(node_id)
+    cache_key = (node_id, output_index)
+    if cache_key in memo:
+        cached = memo[cache_key]
+        return None if cached is None else set(cached)
+    if cache_key in visiting:
+        memo[cache_key] = None
+        return None
+
+    node = prompt_obj.get(node_id)
+    if not _is_delegate_master_retained_upstream_node(node, output_index):
+        memo[cache_key] = None
+        return None
+
+    visiting.add(cache_key)
+    retained = {node_id}
+    inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+    for value in inputs.values():
+        if not (isinstance(value, list) and len(value) == 2):
+            continue
+        source_id = str(value[0])
+        branch = _collect_delegate_master_retained_upstream_branch(
+            prompt_obj,
+            source_id,
+            value[1],
+            memo,
+            visiting,
+        )
+        if branch is None:
+            visiting.remove(cache_key)
+            memo[cache_key] = None
+            return None
+        retained.update(branch)
+
+    visiting.remove(cache_key)
+    memo[cache_key] = frozenset(retained)
+    return retained
 
 
 def _find_delegate_master_retained_upstream_nodes(prompt_obj, start_ids):
     """Return lightweight upstream nodes needed by kept delegate-master nodes."""
     connected = set()
-    visited = set()
-    queue = deque(str(node_id) for node_id in start_ids)
-    while queue:
-        node_id = queue.popleft()
-        if node_id in visited:
-            continue
-        visited.add(node_id)
-        node = prompt_obj.get(node_id) or {}
+    memo = {}
+    for node_id in start_ids:
+        node = prompt_obj.get(str(node_id)) or {}
         inputs = node.get("inputs", {})
         for value in inputs.values():
             if not (isinstance(value, list) and len(value) == 2):
                 continue
-            source_id = str(value[0])
-            source_node = prompt_obj.get(source_id)
-            if not _is_delegate_master_retained_upstream_node(source_node):
-                continue
-            if source_id not in connected:
-                connected.add(source_id)
-                queue.append(source_id)
+            branch = _collect_delegate_master_retained_upstream_branch(
+                prompt_obj,
+                value[0],
+                value[1],
+                memo,
+                set(),
+            )
+            if branch is not None:
+                connected.update(branch)
     return connected
 
 
