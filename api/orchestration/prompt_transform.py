@@ -126,12 +126,15 @@ def _find_upstream_nodes(prompt_obj, start_ids):
 
 
 _DELEGATE_MASTER_RETAINED_UPSTREAM_CLASSES = {
-    "LoadImage",
     "PrimitiveBoolean",
     "PrimitiveFloat",
     "PrimitiveInt",
     "PrimitiveNode",
     "PrimitiveString",
+}
+
+_DELEGATE_MASTER_ALWAYS_RETAINED_UPSTREAM_CLASSES = {
+    "LoadImage",
 }
 
 _DELEGATE_MASTER_SAFE_RETURN_TYPES = {"BOOLEAN", "FLOAT", "INT", "STRING"}
@@ -151,6 +154,11 @@ def _get_delegate_master_node_class_mappings():
     return getattr(comfy_nodes, "NODE_CLASS_MAPPINGS", {}) or {}
 
 
+def _get_delegate_master_node_class(class_type):
+    mappings = _get_delegate_master_node_class_mappings()
+    return mappings.get(class_type) if isinstance(mappings, dict) else None
+
+
 def _normalize_delegate_master_return_type(return_type):
     if return_type is None:
         return ""
@@ -159,14 +167,48 @@ def _normalize_delegate_master_return_type(return_type):
 
 def _delegate_master_output_is_safe_scalar(class_type, output_index):
     """Return True when a registered node output is a lightweight scalar type."""
-    mappings = _get_delegate_master_node_class_mappings()
-    node_class = mappings.get(class_type) if isinstance(mappings, dict) else None
+    node_class = _get_delegate_master_node_class(class_type)
     return_types = getattr(node_class, "RETURN_TYPES", ()) if node_class is not None else ()
     try:
         output_type = return_types[int(output_index)]
     except (IndexError, TypeError, ValueError):
         return False
     return _normalize_delegate_master_return_type(output_type) in _DELEGATE_MASTER_SAFE_RETURN_TYPES
+
+
+def _get_delegate_master_input_types(class_type):
+    node_class = _get_delegate_master_node_class(class_type)
+    input_types = getattr(node_class, "INPUT_TYPES", None) if node_class is not None else None
+    if callable(input_types):
+        try:
+            input_types = input_types()
+        except TypeError:
+            return {}
+    return input_types if isinstance(input_types, dict) else {}
+
+
+def _normalize_delegate_master_input_type(input_spec):
+    if isinstance(input_spec, (list, tuple)) and input_spec:
+        return _normalize_delegate_master_return_type(input_spec[0])
+    return _normalize_delegate_master_return_type(input_spec)
+
+
+def _delegate_master_input_is_safe_scalar(class_type, input_name):
+    """Return True when a registered downstream input expects scalar config."""
+    input_types = _get_delegate_master_input_types(class_type)
+    for section_name in ("required", "optional"):
+        section = input_types.get(section_name, {})
+        if isinstance(section, dict) and input_name in section:
+            input_type = _normalize_delegate_master_input_type(section[input_name])
+            return input_type in _DELEGATE_MASTER_SAFE_RETURN_TYPES
+    return False
+
+
+def _is_delegate_master_always_retained_upstream_node(node):
+    if not isinstance(node, dict):
+        return False
+    class_type = node.get("class_type")
+    return isinstance(class_type, str) and class_type in _DELEGATE_MASTER_ALWAYS_RETAINED_UPSTREAM_CLASSES
 
 
 def _is_delegate_master_retained_upstream_node(node, output_index=0):
@@ -208,9 +250,14 @@ def _collect_delegate_master_retained_upstream_branch(
     visiting.add(cache_key)
     retained = {node_id}
     inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
-    for value in inputs.values():
+    class_type = node.get("class_type") if isinstance(node, dict) else None
+    for input_name, value in inputs.items():
         if not (isinstance(value, list) and len(value) == 2):
             continue
+        if not _delegate_master_input_is_safe_scalar(class_type, input_name):
+            visiting.remove(cache_key)
+            memo[cache_key] = None
+            return None
         source_id = str(value[0])
         branch = _collect_delegate_master_retained_upstream_branch(
             prompt_obj,
@@ -237,8 +284,15 @@ def _find_delegate_master_retained_upstream_nodes(prompt_obj, start_ids):
     for node_id in start_ids:
         node = prompt_obj.get(str(node_id)) or {}
         inputs = node.get("inputs", {})
-        for value in inputs.values():
+        class_type = node.get("class_type") if isinstance(node, dict) else None
+        for input_name, value in inputs.items():
             if not (isinstance(value, list) and len(value) == 2):
+                continue
+            source_node = prompt_obj.get(str(value[0]))
+            if _is_delegate_master_always_retained_upstream_node(source_node):
+                connected.add(str(value[0]))
+                continue
+            if not _delegate_master_input_is_safe_scalar(class_type, input_name):
                 continue
             branch = _collect_delegate_master_retained_upstream_branch(
                 prompt_obj,

@@ -298,20 +298,39 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
 
     def test_preserves_primitive_string_for_downstream_required_input(self):
         """Delegate-only master keeps primitive inputs needed by SaveImage."""
-        prompt = {
-            "8": {"class_type": "KSampler", "inputs": {}},
-            "11": {"class_type": "DistributedCollector", "inputs": {"images": ["8", 0]}},
-            "15": {"class_type": "PrimitiveString", "inputs": {"value": "test/input_bug"}},
-            "9": {
-                "class_type": "SaveImage",
-                "inputs": {
-                    "images": ["11", 0],
-                    "filename_prefix": ["15", 0],
-                },
+        save_image = type(
+            "SaveImage",
+            (),
+            {
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {
+                            "images": ("IMAGE",),
+                            "filename_prefix": ("STRING",),
+                        }
+                    }
+                )
             },
-        }
+        )
+        previous_mappings = getattr(pt, "_DELEGATE_MASTER_NODE_CLASS_MAPPINGS", None)
+        pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = {"SaveImage": save_image}
+        try:
+            prompt = {
+                "8": {"class_type": "KSampler", "inputs": {}},
+                "11": {"class_type": "DistributedCollector", "inputs": {"images": ["8", 0]}},
+                "15": {"class_type": "PrimitiveString", "inputs": {"value": "test/input_bug"}},
+                "9": {
+                    "class_type": "SaveImage",
+                    "inputs": {
+                        "images": ["11", 0],
+                        "filename_prefix": ["15", 0],
+                    },
+                },
+            }
 
-        result = pt.prepare_delegate_master_prompt(prompt, ["11"])
+            result = pt.prepare_delegate_master_prompt(prompt, ["11"])
+        finally:
+            pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = previous_mappings
 
         self.assertIn("15", result)
         self.assertEqual(result["15"], prompt["15"])
@@ -349,9 +368,40 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
 
     def test_preserves_registered_string_utility_subgraph_for_downstream_required_input(self):
         """Delegate-only master keeps scalar utility chains used by SaveImage."""
-        string_concat = type("StringConcatenate", (), {"RETURN_TYPES": ("STRING",)})
+        string_concat = type(
+            "StringConcatenate",
+            (),
+            {
+                "RETURN_TYPES": ("STRING",),
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {
+                            "string_a": ("STRING",),
+                            "string_b": ("STRING",),
+                        }
+                    }
+                ),
+            },
+        )
+        save_image = type(
+            "SaveImage",
+            (),
+            {
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {
+                            "images": ("IMAGE",),
+                            "filename_prefix": ("STRING",),
+                        }
+                    }
+                )
+            },
+        )
         previous_mappings = getattr(pt, "_DELEGATE_MASTER_NODE_CLASS_MAPPINGS", None)
-        pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = {"StringConcatenate": string_concat}
+        pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = {
+            "SaveImage": save_image,
+            "StringConcatenate": string_concat,
+        }
         try:
             prompt = {
                 "8": {"class_type": "KSampler", "inputs": {}},
@@ -387,9 +437,41 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
 
     def test_preserves_registered_multi_string_join_subgraph_for_downstream_required_input(self):
         """Delegate-only master keeps multi-input scalar utility chains."""
-        join_string_multi = type("JoinStringMulti", (), {"RETURN_TYPES": ("STRING",)})
+        join_string_multi = type(
+            "JoinStringMulti",
+            (),
+            {
+                "RETURN_TYPES": ("STRING",),
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {"string_1": ("STRING",)},
+                        "optional": {
+                            "string_2": ("STRING",),
+                            "string_3": ("STRING",),
+                        },
+                    }
+                ),
+            },
+        )
+        save_image = type(
+            "SaveImage",
+            (),
+            {
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {
+                            "images": ("IMAGE",),
+                            "filename_prefix": ("STRING",),
+                        }
+                    }
+                )
+            },
+        )
         previous_mappings = getattr(pt, "_DELEGATE_MASTER_NODE_CLASS_MAPPINGS", None)
-        pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = {"JoinStringMulti": join_string_multi}
+        pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = {
+            "JoinStringMulti": join_string_multi,
+            "SaveImage": save_image,
+        }
         try:
             prompt = {
                 "8": {"class_type": "KSampler", "inputs": {}},
@@ -426,9 +508,40 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
 
     def test_does_not_preserve_scalar_utility_with_heavy_upstream_dependency(self):
         """Scalar utility nodes are retained only when their full input branch is safe."""
-        string_concat = type("StringConcatenate", (), {"RETURN_TYPES": ("STRING",)})
+        string_concat = type(
+            "StringConcatenate",
+            (),
+            {
+                "RETURN_TYPES": ("STRING",),
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {
+                            "string_a": ("STRING",),
+                            "string_b": ("STRING",),
+                        }
+                    }
+                ),
+            },
+        )
+        save_image = type(
+            "SaveImage",
+            (),
+            {
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {
+                            "images": ("IMAGE",),
+                            "filename_prefix": ("STRING",),
+                        }
+                    }
+                )
+            },
+        )
         previous_mappings = getattr(pt, "_DELEGATE_MASTER_NODE_CLASS_MAPPINGS", None)
-        pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = {"StringConcatenate": string_concat}
+        pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = {
+            "SaveImage": save_image,
+            "StringConcatenate": string_concat,
+        }
         try:
             prompt = {
                 "8": {"class_type": "KSampler", "inputs": {}},
@@ -457,6 +570,49 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         self.assertNotIn("8", result)
         self.assertNotIn("17", result)
         self.assertNotIn("filename_prefix", result["9"]["inputs"])
+
+    def test_does_not_preserve_scalar_output_for_non_scalar_downstream_input(self):
+        """Scalar outputs are retained only for scalar/config downstream inputs."""
+        string_provider = type("StringProvider", (), {"RETURN_TYPES": ("STRING",)})
+        image_consumer = type(
+            "ImageConsumer",
+            (),
+            {
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {
+                            "images": ("IMAGE",),
+                            "mask": ("IMAGE",),
+                        }
+                    }
+                )
+            },
+        )
+        previous_mappings = getattr(pt, "_DELEGATE_MASTER_NODE_CLASS_MAPPINGS", None)
+        pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = {
+            "ImageConsumer": image_consumer,
+            "StringProvider": string_provider,
+        }
+        try:
+            prompt = {
+                "8": {"class_type": "KSampler", "inputs": {}},
+                "11": {"class_type": "DistributedCollector", "inputs": {"images": ["8", 0]}},
+                "17": {"class_type": "StringProvider", "inputs": {}},
+                "9": {
+                    "class_type": "ImageConsumer",
+                    "inputs": {
+                        "images": ["11", 0],
+                        "mask": ["17", 0],
+                    },
+                },
+            }
+
+            result = pt.prepare_delegate_master_prompt(prompt, ["11"])
+        finally:
+            pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = previous_mappings
+
+        self.assertNotIn("17", result)
+        self.assertNotIn("mask", result["9"]["inputs"])
 
     def test_result_is_independent_copy(self):
         prompt = _delegate_prompt()
