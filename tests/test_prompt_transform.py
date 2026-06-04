@@ -614,6 +614,104 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         self.assertNotIn("17", result)
         self.assertNotIn("mask", result["9"]["inputs"])
 
+    def test_preserves_scalar_list_join_subgraph_for_downstream_required_input(self):
+        """Delegate-only master keeps list-shaped scalar config chains."""
+        create_list = type(
+            "CreateList",
+            (),
+            {
+                "RETURN_TYPES": ("LIST",),
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {"inputs.input0": ("STRING",)},
+                        "optional": {
+                            "inputs.input1": ("STRING",),
+                            "inputs.input2": ("STRING",),
+                        },
+                    }
+                ),
+            },
+        )
+        string_data_list_join = type(
+            "StringDataListJoin",
+            (),
+            {
+                "RETURN_TYPES": ("STRING",),
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {
+                            "strings": ("LIST",),
+                            "delimiter": ("STRING",),
+                        }
+                    }
+                ),
+            },
+        )
+        save_image = type(
+            "SaveImage",
+            (),
+            {
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {
+                            "images": ("IMAGE",),
+                            "filename_prefix": ("STRING",),
+                        }
+                    }
+                )
+            },
+        )
+        previous_mappings = getattr(pt, "_DELEGATE_MASTER_NODE_CLASS_MAPPINGS", None)
+        pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = {
+            "CreateList": create_list,
+            "SaveImage": save_image,
+            "StringDataListJoin": string_data_list_join,
+        }
+        try:
+            prompt = {
+                "8": {"class_type": "KSampler", "inputs": {}},
+                "11": {"class_type": "DistributedCollector", "inputs": {"images": ["8", 0]}},
+                "15": {"class_type": "PrimitiveString", "inputs": {"value": "test"}},
+                "17": {"class_type": "PrimitiveString", "inputs": {"value": "input_bug"}},
+                "29": {"class_type": "PrimitiveString", "inputs": {"value": "new"}},
+                "28": {
+                    "class_type": "CreateList",
+                    "inputs": {
+                        "inputs.input0": ["15", 0],
+                        "inputs.input1": ["17", 0],
+                        "inputs.input2": ["29", 0],
+                    },
+                },
+                "32": {
+                    "class_type": "StringDataListJoin",
+                    "inputs": {
+                        "strings": ["28", 0],
+                        "delimiter": "/",
+                    },
+                },
+                "9": {
+                    "class_type": "SaveImage",
+                    "inputs": {
+                        "images": ["11", 0],
+                        "filename_prefix": ["32", 0],
+                    },
+                },
+            }
+
+            result = pt.prepare_delegate_master_prompt(prompt, ["11"])
+        finally:
+            pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = previous_mappings
+
+        self.assertIn("15", result)
+        self.assertIn("17", result)
+        self.assertIn("28", result)
+        self.assertIn("29", result)
+        self.assertIn("32", result)
+        self.assertEqual(result["9"]["inputs"]["filename_prefix"], ["32", 0])
+        self.assertEqual(result["32"]["inputs"]["strings"], ["28", 0])
+        self.assertEqual(result["28"]["inputs"]["inputs.input0"], ["15", 0])
+        self.assertNotIn("8", result)
+
     def test_result_is_independent_copy(self):
         prompt = _delegate_prompt()
         result = pt.prepare_delegate_master_prompt(prompt, ["3"])

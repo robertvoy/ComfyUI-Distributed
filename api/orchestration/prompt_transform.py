@@ -137,7 +137,8 @@ _DELEGATE_MASTER_ALWAYS_RETAINED_UPSTREAM_CLASSES = {
     "LoadImage",
 }
 
-_DELEGATE_MASTER_SAFE_RETURN_TYPES = {"BOOLEAN", "FLOAT", "INT", "STRING"}
+_DELEGATE_MASTER_SAFE_SCALAR_TYPES = {"BOOLEAN", "FLOAT", "INT", "STRING"}
+_DELEGATE_MASTER_SAFE_LIST_TYPES = {"LIST"}
 
 # Test hook. At runtime this stays None and the ComfyUI node registry is loaded lazily.
 _DELEGATE_MASTER_NODE_CLASS_MAPPINGS = None
@@ -165,6 +166,14 @@ def _normalize_delegate_master_return_type(return_type):
     return str(return_type).strip().upper()
 
 
+def _delegate_master_type_is_safe_scalar(type_name):
+    return type_name in _DELEGATE_MASTER_SAFE_SCALAR_TYPES
+
+
+def _delegate_master_type_is_safe_config(type_name):
+    return _delegate_master_type_is_safe_scalar(type_name) or type_name in _DELEGATE_MASTER_SAFE_LIST_TYPES
+
+
 def _delegate_master_output_is_safe_scalar(class_type, output_index):
     """Return True when a registered node output is a lightweight scalar type."""
     node_class = _get_delegate_master_node_class(class_type)
@@ -173,7 +182,7 @@ def _delegate_master_output_is_safe_scalar(class_type, output_index):
         output_type = return_types[int(output_index)]
     except (IndexError, TypeError, ValueError):
         return False
-    return _normalize_delegate_master_return_type(output_type) in _DELEGATE_MASTER_SAFE_RETURN_TYPES
+    return _delegate_master_type_is_safe_config(_normalize_delegate_master_return_type(output_type))
 
 
 def _get_delegate_master_input_types(class_type):
@@ -200,7 +209,7 @@ def _delegate_master_input_is_safe_scalar(class_type, input_name):
         section = input_types.get(section_name, {})
         if isinstance(section, dict) and input_name in section:
             input_type = _normalize_delegate_master_input_type(section[input_name])
-            return input_type in _DELEGATE_MASTER_SAFE_RETURN_TYPES
+            return _delegate_master_type_is_safe_config(input_type)
     return False
 
 
