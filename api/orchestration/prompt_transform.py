@@ -140,6 +140,14 @@ _DELEGATE_MASTER_ALWAYS_RETAINED_UPSTREAM_CLASSES = {
 _DELEGATE_MASTER_SAFE_SCALAR_TYPES = {"BOOLEAN", "FLOAT", "INT", "STRING"}
 _DELEGATE_MASTER_SAFE_LIST_TYPES = {"LIST"}
 
+# ComfyUI 0.23 exposes CreateList via the newer schema API rather than the
+# legacy RETURN_TYPES/INPUT_TYPES attributes. Treat it as a safe config utility
+# only after its connected inputs recursively prove safe.
+_DELEGATE_MASTER_SAFE_DYNAMIC_CONFIG_OUTPUT_CLASSES = {"CreateList"}
+_DELEGATE_MASTER_SAFE_DYNAMIC_CONFIG_INPUT_PREFIXES = {
+    "CreateList": ("inputs.",),
+}
+
 # Test hook. At runtime this stays None and the ComfyUI node registry is loaded lazily.
 _DELEGATE_MASTER_NODE_CLASS_MAPPINGS = None
 
@@ -175,7 +183,9 @@ def _delegate_master_type_is_safe_config(type_name):
 
 
 def _delegate_master_output_is_safe_scalar(class_type, output_index):
-    """Return True when a registered node output is a lightweight scalar type."""
+    """Return True when a registered node output is lightweight config data."""
+    if class_type in _DELEGATE_MASTER_SAFE_DYNAMIC_CONFIG_OUTPUT_CLASSES:
+        return True
     node_class = _get_delegate_master_node_class(class_type)
     return_types = getattr(node_class, "RETURN_TYPES", ()) if node_class is not None else ()
     try:
@@ -203,7 +213,10 @@ def _normalize_delegate_master_input_type(input_spec):
 
 
 def _delegate_master_input_is_safe_scalar(class_type, input_name):
-    """Return True when a registered downstream input expects scalar config."""
+    """Return True when a registered downstream input expects config data."""
+    for prefix in _DELEGATE_MASTER_SAFE_DYNAMIC_CONFIG_INPUT_PREFIXES.get(class_type, ()):
+        if input_name.startswith(prefix):
+            return True
     input_types = _get_delegate_master_input_types(class_type)
     for section_name in ("required", "optional"):
         section = input_types.get(section_name, {})

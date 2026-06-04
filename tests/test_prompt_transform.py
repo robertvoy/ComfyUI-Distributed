@@ -712,6 +712,85 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         self.assertEqual(result["28"]["inputs"]["inputs.input0"], ["15", 0])
         self.assertNotIn("8", result)
 
+    def test_preserves_builtin_create_list_string_data_list_join_subgraph(self):
+        """Delegate-only master handles ComfyUI 0.23 CreateList data-list output."""
+        string_data_list_join = type(
+            "StringDataListJoin",
+            (),
+            {
+                "RETURN_TYPES": ("STRING",),
+                "INPUT_IS_LIST": True,
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {
+                            "strings": ("STRING", {"forceInput": True}),
+                            "sep": ("STRING", {"default": " "}),
+                        }
+                    }
+                ),
+            },
+        )
+        save_image = type(
+            "SaveImage",
+            (),
+            {
+                "INPUT_TYPES": classmethod(
+                    lambda cls: {
+                        "required": {
+                            "images": ("IMAGE",),
+                            "filename_prefix": ("STRING",),
+                        }
+                    }
+                )
+            },
+        )
+        previous_mappings = getattr(pt, "_DELEGATE_MASTER_NODE_CLASS_MAPPINGS", None)
+        pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = {
+            "Basic data handling: StringDataListJoin": string_data_list_join,
+            "SaveImage": save_image,
+        }
+        try:
+            prompt = {
+                "8": {"class_type": "KSampler", "inputs": {}},
+                "11": {"class_type": "DistributedCollector", "inputs": {"images": ["8", 0]}},
+                "15": {"class_type": "PrimitiveString", "inputs": {"value": "input_bug"}},
+                "17": {"class_type": "PrimitiveString", "inputs": {"value": "test"}},
+                "29": {"class_type": "PrimitiveString", "inputs": {"value": "new"}},
+                "28": {
+                    "class_type": "CreateList",
+                    "inputs": {
+                        "inputs.input0": ["17", 0],
+                        "inputs.input1": ["15", 0],
+                        "inputs.input2": ["29", 0],
+                    },
+                },
+                "32": {
+                    "class_type": "Basic data handling: StringDataListJoin",
+                    "inputs": {
+                        "strings": ["28", 0],
+                        "sep": "/",
+                    },
+                },
+                "9": {
+                    "class_type": "SaveImage",
+                    "inputs": {
+                        "images": ["11", 0],
+                        "filename_prefix": ["32", 0],
+                    },
+                },
+            }
+
+            result = pt.prepare_delegate_master_prompt(prompt, ["11"])
+        finally:
+            pt._DELEGATE_MASTER_NODE_CLASS_MAPPINGS = previous_mappings
+
+        for node_id in ("15", "17", "28", "29", "32"):
+            self.assertIn(node_id, result)
+        self.assertEqual(result["9"]["inputs"]["filename_prefix"], ["32", 0])
+        self.assertEqual(result["32"]["inputs"]["strings"], ["28", 0])
+        self.assertEqual(result["28"]["inputs"]["inputs.input0"], ["17", 0])
+        self.assertNotIn("8", result)
+
     def test_result_is_independent_copy(self):
         prompt = _delegate_prompt()
         result = pt.prepare_delegate_master_prompt(prompt, ["3"])
