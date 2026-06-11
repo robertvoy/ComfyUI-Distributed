@@ -476,6 +476,54 @@ async def _ltx_master_process(
     return samples, denoised
 
 
+def _ltx_local_tiled_process(
+    noise,
+    guider,
+    sampler,
+    sigmas,
+    latent_tensor,
+    denoise_mask,
+    n_h_tiles,
+    n_w_tiles,
+    tile_overlap,
+):
+    """Process all LTX latent tiles locally in the current ComfyUI execution context.
+
+    This path is used when no workers are enabled. Keeping it synchronous avoids
+    crossing ComfyUI's execution/inference context boundary while still using the
+    same tile extraction and blend logic as the distributed master/worker path.
+    """
+    tiles = _build_tile_queue(latent_tensor.shape, n_h_tiles, n_w_tiles, tile_overlap)
+    full_noise = noise.generate_noise({"samples": latent_tensor})
+    output_sum = torch.zeros_like(latent_tensor)
+    weight_sum = torch.zeros_like(latent_tensor)
+    denoised_sum = None
+
+    for tile in tiles:
+        tile_latent = _tile_latent(latent_tensor, tile)
+        tile_noise = _tile_latent(full_noise, tile)
+        tile_mask = _tile_mask(denoise_mask, tile)
+        tile_samples, tile_denoised = _sample_tile(guider, tile_noise, tile_latent, sampler, sigmas, tile_mask)
+        if denoised_sum is None and tile_denoised is not None:
+            denoised_sum = torch.zeros_like(latent_tensor)
+        _blend_tile_into_sums(
+            tile,
+            tile_samples,
+            tile_denoised,
+            output_sum,
+            weight_sum,
+            denoised_sum,
+            n_h_tiles,
+            n_w_tiles,
+            tile_overlap,
+        )
+
+    weight_sum = torch.where(weight_sum == 0, torch.ones_like(weight_sum), weight_sum)
+    samples = output_sum / weight_sum
+    denoised = denoised_sum / weight_sum if denoised_sum is not None else None
+    return samples, denoised
+
+
 class LTXTiledSamplerDistributed:
     """Distributed wrapper around the LTX tiled sampler."""
 
@@ -583,9 +631,8 @@ class LTXTiledSamplerDistributed:
             placeholder = rebuild_latent(latent_tensor)
             return (placeholder, placeholder, placeholder)
 
-        samples, denoised = run_async_in_server_loop(
-            _ltx_master_process(
-                self,
+        if not self.enabled_worker_ids:
+            samples, denoised = _ltx_local_tiled_process(
                 noise,
                 guider,
                 sampler,
@@ -595,9 +642,23 @@ class LTXTiledSamplerDistributed:
                 int(h_tiles),
                 int(w_tiles),
                 int(overlap),
-            ),
-            timeout=None,
-        )
+            )
+        else:
+            samples, denoised = run_async_in_server_loop(
+                _ltx_master_process(
+                    self,
+                    noise,
+                    guider,
+                    sampler,
+                    sigmas,
+                    latent_tensor,
+                    mask_tensor,
+                    int(h_tiles),
+                    int(w_tiles),
+                    int(overlap),
+                ),
+                timeout=None,
+            )
         samples_latent = rebuild_latent(samples)
         denoised_latent = rebuild_latent(denoised if denoised is not None else samples)
         return (samples_latent, denoised_latent, samples_latent)

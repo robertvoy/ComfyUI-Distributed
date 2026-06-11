@@ -125,5 +125,33 @@ class LtxTiledSamplerTests(unittest.TestCase):
         self.assertIn("LTXTiledSamplerDistributed", ltx.NODE_CLASS_MAPPINGS)
 
 
+    def test_local_tiled_process_runs_without_async_master_path(self):
+        class _Noise:
+            def generate_noise(self, latent):
+                return torch.ones_like(latent['samples']) * 0.25
+
+        class _Guider:
+            def sample(self, noise, latent_image, sampler, sigmas, denoise_mask=None, disable_pbar=True):
+                return latent_image + noise
+
+        latent = torch.zeros((1, 1, 2, 4, 4), dtype=torch.float32)
+
+        samples, denoised = ltx._ltx_local_tiled_process(
+            _Noise(),
+            _Guider(),
+            sampler=object(),
+            sigmas=torch.tensor([1.0, 0.0]),
+            latent_tensor=latent,
+            denoise_mask=None,
+            n_h_tiles=2,
+            n_w_tiles=2,
+            tile_overlap=0,
+        )
+
+        self.assertIsNone(denoised)
+        self.assertEqual(tuple(samples.shape), tuple(latent.shape))
+        self.assertTrue(torch.allclose(samples, torch.full_like(latent, 0.25)))
+
+
 if __name__ == "__main__":
     unittest.main()
