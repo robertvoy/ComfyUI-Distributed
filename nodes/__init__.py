@@ -10,6 +10,10 @@ from .utilities import (
     any_type,
 )
 from .collector import DistributedCollectorNode
+from .ltx_tiled_sampler import (
+    NODE_CLASS_MAPPINGS as LTX_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as LTX_DISPLAY_NAME_MAPPINGS,
+)
 
 NODE_CLASS_MAPPINGS = {
     "DistributedCollector": DistributedCollectorNode,
@@ -19,6 +23,7 @@ NODE_CLASS_MAPPINGS = {
     "ImageBatchDivider": ImageBatchDivider,
     "AudioBatchDivider": AudioBatchDivider,
     "DistributedEmptyImage": DistributedEmptyImage,
+    **LTX_CLASS_MAPPINGS,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DistributedCollector": "Distributed Collector",
@@ -28,4 +33,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageBatchDivider": "Image Batch Divider",
     "AudioBatchDivider": "Audio Batch Divider",
     "DistributedEmptyImage": "Distributed Empty Image",
+    **LTX_DISPLAY_NAME_MAPPINGS,
 }
