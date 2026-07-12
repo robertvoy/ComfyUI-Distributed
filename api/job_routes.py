@@ -295,17 +295,24 @@ async def job_complete_endpoint(request):
             errors.append("worker_id: expected non-empty string")
         if not isinstance(batch_idx, int) or batch_idx < 0:
             errors.append("batch_idx: expected non-negative integer")
-        if not isinstance(image_payload, str) or not image_payload.strip():
+        image_provided = image_payload is not None
+        audio_provided = audio_payload is not None
+        if not image_provided and not audio_provided:
+            errors.append("expected at least one of image or audio")
+        if image_provided and (not isinstance(image_payload, str) or not image_payload.strip()):
             errors.append("image: expected non-empty base64 PNG string")
-        if audio_payload is not None and not isinstance(audio_payload, dict):
+        if audio_provided and not isinstance(audio_payload, dict):
             errors.append("audio: expected object when provided")
         if not isinstance(is_last, bool):
             errors.append("is_last: expected boolean")
         if errors:
             return await handle_api_error(request, errors, 400)
 
-        tensor = _decode_canonical_png_tensor(image_payload)
-        decoded_audio = _decode_audio_payload(audio_payload) if audio_payload is not None else None
+        try:
+            tensor = _decode_canonical_png_tensor(image_payload) if image_provided else None
+            decoded_audio = _decode_audio_payload(audio_payload) if audio_provided else None
+        except ValueError as exc:
+            return await handle_api_error(request, exc, 400)
         multi_job_id = job_id.strip()
         worker_id = worker_id.strip()
 

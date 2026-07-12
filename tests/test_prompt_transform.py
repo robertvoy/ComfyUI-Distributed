@@ -71,6 +71,15 @@ def _collector_only_prompt():
     }
 
 
+def _audio_only_prompt():
+    """1(Audio source) → 2(DistributedCollector) → 3(Audio sink)."""
+    return {
+        "1": {"class_type": "LoadAudio", "inputs": {}},
+        "2": {"class_type": "DistributedCollector", "inputs": {"audio": ["1", 0]}},
+        "3": {"class_type": "SaveAudio", "inputs": {"audio": ["2", 1]}},
+    }
+
+
 def _delegate_prompt():
     """1 → 2 → 3(DistributedCollector) → 4(SaveImage)"""
     return {
@@ -217,6 +226,35 @@ class PrunePromptForWorkerTests(unittest.TestCase):
         self.assertEqual(len(preview_nodes), 1)
         self.assertEqual(preview_nodes[0]["inputs"]["images"], ["4", 0])
 
+    def test_injects_preview_audio_for_audio_only_collector(self):
+        result = pt.prune_prompt_for_worker(_audio_only_prompt())
+        preview_nodes = [n for n in result.values() if n.get("class_type") == "PreviewAudio"]
+        self.assertEqual(len(preview_nodes), 1)
+        self.assertEqual(preview_nodes[0]["inputs"]["audio"], ["2", 1])
+        self.assertFalse(any(n.get("class_type") == "PreviewImage" for n in result.values()))
+
+    def test_prefers_image_preview_when_collector_has_images_and_audio(self):
+        prompt = _linear_prompt()
+        prompt["6"] = {"class_type": "LoadAudio", "inputs": {}}
+        prompt["4"]["inputs"]["audio"] = ["6", 0]
+        result = pt.prune_prompt_for_worker(prompt)
+        self.assertEqual(
+            len([n for n in result.values() if n.get("class_type") == "PreviewImage"]),
+            1,
+        )
+        self.assertFalse(any(n.get("class_type") == "PreviewAudio" for n in result.values()))
+
+    def test_preserves_image_preview_for_distributed_upscale(self):
+        prompt = {
+            "1": {"class_type": "LoadImage", "inputs": {}},
+            "2": {"class_type": "UltimateSDUpscaleDistributed", "inputs": {"upscaled_image": ["1", 0]}},
+            "3": {"class_type": "SaveImage", "inputs": {"images": ["2", 0]}},
+        }
+        result = pt.prune_prompt_for_worker(prompt)
+        preview_nodes = [n for n in result.values() if n.get("class_type") == "PreviewImage"]
+        self.assertEqual(len(preview_nodes), 1)
+        self.assertEqual(preview_nodes[0]["inputs"]["images"], ["2", 0])
+
     def test_no_preview_image_when_no_downstream(self):
         result = pt.prune_prompt_for_worker(_collector_only_prompt())
         preview_nodes = [n for n in result.values() if n.get("class_type") == "PreviewImage"]
@@ -242,7 +280,7 @@ class PrunePromptForWorkerTests(unittest.TestCase):
     def test_upscale_node_is_treated_as_distributed(self):
         prompt = {
             "1": {"class_type": "KSampler", "inputs": {}},
-            "2": {"class_type": "UltimateSDUpscaleDistributed", "inputs": {"image": ["1", 0]}},
+            "2": {"class_type": "UltimateSDUpscaleDistributed", "inputs": {"upscaled_image": ["1", 0]}},
             "3": {"class_type": "SaveImage", "inputs": {"images": ["2", 0]}},
         }
         result = pt.prune_prompt_for_worker(prompt)
@@ -285,12 +323,22 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         placeholder_id = empty_nodes[0][0]
         self.assertEqual(result["3"]["inputs"]["images"], [placeholder_id, 0])
 
+    def test_audio_only_collector_does_not_get_image_placeholder(self):
+        prompt = _audio_only_prompt()
+        result = pt.prepare_delegate_master_prompt(prompt, ["2"])
+        empty_nodes = [n for n in result.values() if n.get("class_type") == "DistributedEmptyImage"]
+        self.assertEqual(empty_nodes, [])
+        self.assertNotIn("images", result["2"].get("inputs", {}))
+        self.assertNotIn("audio", result["2"].get("inputs", {}))
+
     def test_one_placeholder_per_collector(self):
         """Two collectors → two placeholders."""
         prompt = {
-            "1": {"class_type": "DistributedCollector", "inputs": {}},
-            "2": {"class_type": "DistributedCollector", "inputs": {}},
+            "1": {"class_type": "DistributedCollector", "inputs": {"images": ["10", 0]}},
+            "2": {"class_type": "DistributedCollector", "inputs": {"images": ["11", 0]}},
             "3": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}},
+            "10": {"class_type": "LoadImage", "inputs": {}},
+            "11": {"class_type": "LoadImage", "inputs": {}},
         }
         result = pt.prepare_delegate_master_prompt(prompt, ["1", "2"])
         empty_nodes = [n for n in result.values() if n.get("class_type") == "DistributedEmptyImage"]

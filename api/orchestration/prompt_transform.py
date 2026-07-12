@@ -351,16 +351,33 @@ def prune_prompt_for_worker(prompt_obj):
         downstream = _find_downstream_nodes(prompt_obj, [dist_id])
         has_removed_downstream = any(node_id != dist_id for node_id in downstream)
         if has_removed_downstream:
-            preview_id = next_id()
-            pruned_prompt[preview_id] = {
-                "inputs": {
-                    "images": [dist_id, 0],
-                },
-                "class_type": "PreviewImage",
-                "_meta": {
-                    "title": "Preview Image (auto-added)",
-                },
-            }
+            original_node = prompt_obj.get(str(dist_id), {})
+            class_type = original_node.get("class_type")
+            inputs = original_node.get("inputs", {})
+            image_connected = class_type != "DistributedCollector" or (
+                isinstance(inputs.get("images"), list)
+                and len(inputs["images"]) == 2
+            )
+            audio_connected = (
+                class_type == "DistributedCollector"
+                and isinstance(inputs.get("audio"), list)
+                and len(inputs["audio"]) == 2
+            )
+
+            if image_connected:
+                preview_id = next_id()
+                pruned_prompt[preview_id] = {
+                    "inputs": {"images": [dist_id, 0]},
+                    "class_type": "PreviewImage",
+                    "_meta": {"title": "Preview Image (auto-added)"},
+                }
+            elif audio_connected:
+                preview_id = next_id()
+                pruned_prompt[preview_id] = {
+                    "inputs": {"audio": [dist_id, 1]},
+                    "class_type": "PreviewAudio",
+                    "_meta": {"title": "Preview Audio (auto-added)"},
+                }
 
     return pruned_prompt
 
@@ -399,6 +416,10 @@ def prepare_delegate_master_prompt(prompt_obj, collector_ids):
     for collector_id in collector_ids:
         collector_entry = pruned_prompt.get(collector_id)
         if not collector_entry:
+            continue
+        original_inputs = (prompt_obj.get(collector_id) or {}).get("inputs", {})
+        original_images = original_inputs.get("images")
+        if not (isinstance(original_images, list) and len(original_images) == 2):
             continue
         placeholder_id = next_id()
         pruned_prompt[placeholder_id] = {

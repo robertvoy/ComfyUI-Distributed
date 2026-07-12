@@ -29,7 +29,6 @@ class DistributedCollectorNode:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "images": ("IMAGE",),
                 "load_balance": (
                     "BOOLEAN",
                     {
@@ -38,7 +37,10 @@ class DistributedCollectorNode:
                     },
                 ),
             },
-            "optional": { "audio": ("AUDIO",) },
+            "optional": {
+                "images": ("IMAGE",),
+                "audio": ("AUDIO",),
+            },
             "hidden": {
                 "multi_job_id": ("STRING", {"default": ""}),
                 "is_worker": ("BOOLEAN", {"default": False}),
@@ -102,8 +104,9 @@ class DistributedCollectorNode:
             return None
         return {"waveform": torch.cat(waveforms, dim=-1), "sample_rate": sample_rate}
 
-    def run(self, images, load_balance=False, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
-        images = self._normalize_images_input(images)
+    def run(self, images=None, load_balance=False, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+        if images is not None:
+            images = self._normalize_images_input(images)
         audio = self._normalize_audio_input(audio)
         load_balance = self._unwrap_list_input(load_balance)
         multi_job_id = self._unwrap_list_input(multi_job_id)
@@ -114,6 +117,14 @@ class DistributedCollectorNode:
         worker_id = self._unwrap_list_input(worker_id)
         pass_through = self._unwrap_list_input(pass_through)
         delegate_only = self._unwrap_list_input(delegate_only)
+
+        remote_only_master = (
+            bool(multi_job_id)
+            and not is_worker
+            and (delegate_only or is_master_delegate_only())
+        )
+        if images is None and audio is None and not remote_only_master:
+            raise ValueError("DistributedCollector requires at least one image or audio input")
 
         # Create empty audio if not provided
         empty_audio = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
@@ -141,41 +152,56 @@ class DistributedCollectorNode:
         return result
 
     async def send_batch_to_master(self, image_batch, audio, multi_job_id, master_url, worker_id):
-        """Send image batch to master via canonical JSON envelopes."""
-        batch_size = image_batch.shape[0]
-        if batch_size == 0:
-            return
-
+        """Send an image batch, optionally with audio, or an audio-only completion."""
         encoded_audio = encode_audio_payload(audio)
-
         session = await get_client_session()
         url = f"{master_url}/distributed/job_complete"
-        for batch_idx in range(batch_size):
-            img = tensor_to_pil(image_batch[batch_idx:batch_idx+1], 0)
-            byte_io = io.BytesIO()
-            img.save(byte_io, format='PNG', compress_level=0)
-            encoded_image = base64.b64encode(byte_io.getvalue()).decode('utf-8')
-            payload = {
-                "job_id": str(multi_job_id),
-                "worker_id": str(worker_id),
-                "batch_idx": int(batch_idx),
-                "image": f"data:image/png;base64,{encoded_image}",
-                "is_last": bool(batch_idx == batch_size - 1),
-            }
-            if payload["is_last"] and encoded_audio is not None:
-                payload["audio"] = encoded_audio
 
+        payloads = []
+        batch_size = 0 if image_batch is None else image_batch.shape[0]
+        if batch_size == 0:
+            if encoded_audio is None:
+                raise ValueError("Worker completion requires image or audio data")
+            payloads.append(
+                {
+                    "job_id": str(multi_job_id),
+                    "worker_id": str(worker_id),
+                    "batch_idx": 0,
+                    "audio": encoded_audio,
+                    "is_last": True,
+                }
+            )
+        else:
+            for batch_idx in range(batch_size):
+                img = tensor_to_pil(image_batch[batch_idx:batch_idx+1], 0)
+                byte_io = io.BytesIO()
+                img.save(byte_io, format='PNG', compress_level=0)
+                encoded_image = base64.b64encode(byte_io.getvalue()).decode('utf-8')
+                payload = {
+                    "job_id": str(multi_job_id),
+                    "worker_id": str(worker_id),
+                    "batch_idx": int(batch_idx),
+                    "image": f"data:image/png;base64,{encoded_image}",
+                    "is_last": bool(batch_idx == batch_size - 1),
+                }
+                if payload["is_last"] and encoded_audio is not None:
+                    payload["audio"] = encoded_audio
+                payloads.append(payload)
+
+        for payload in payloads:
+            timeout_seconds = 60 if "image" in payload else 600
             try:
                 async with session.post(
                     url,
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=60),
+                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
                 ) as response:
                     response.raise_for_status()
             except Exception as e:
-                log(f"Worker - Failed to send canonical image envelope to master: {e}")
+                media_type = "image/audio" if "image" in payload else "audio-only"
+                log(f"Worker - Failed to send canonical {media_type} envelope to master: {e}")
                 debug_log(f"Worker - Full error details: URL={url}")
-                raise  # Re-raise to handle at caller level
+                raise
 
     def _combine_audio(self, master_audio, worker_audio, empty_audio, worker_order=None):
         """Combine audio from master and workers into a single audio output.
@@ -257,8 +283,8 @@ class DistributedCollectorNode:
         images_on_cpu,
         delegate_mode: bool,
         fallback_images,
-    ) -> torch.Tensor:
-        """Assemble final tensor: master first, then workers in enabled order."""
+    ):
+        """Assemble final tensor, or return None when the job contains only audio."""
         ordered_tensors = []
         if not delegate_mode and images_on_cpu is not None:
             for i in range(master_batch_size):
@@ -289,15 +315,15 @@ class DistributedCollectorNode:
 
         if cpu_tensors:
             return ensure_contiguous(torch.cat(cpu_tensors, dim=0))
-        elif fallback_images is not None:
+        if fallback_images is not None:
             return ensure_contiguous(fallback_images)
-        else:
-            raise ValueError("No image data collected from master or workers")
+        return None
 
     async def execute(self, images, audio, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
         if is_worker:
             # Worker mode: send images and audio to master in a single batch
-            debug_log(f"Worker - Job {multi_job_id} complete. Sending {images.shape[0]} image(s) to master")
+            image_count = 0 if images is None else images.shape[0]
+            debug_log(f"Worker - Job {multi_job_id} complete. Sending {image_count} image(s) to master")
             await self.send_batch_to_master(images, audio, multi_job_id, master_url, worker_id)
             return (images, audio if audio is not None else self.EMPTY_AUDIO)
         else:
@@ -332,13 +358,14 @@ class DistributedCollectorNode:
                 master_audio = None
                 debug_log(f"Master - Job {multi_job_id}: Delegate-only mode enabled, collecting exclusively from {num_workers} workers")
             else:
-                images_on_cpu = images.cpu()
-                master_batch_size = images.shape[0]
+                if images is None:
+                    images_on_cpu = None
+                    master_batch_size = 0
+                else:
+                    images_on_cpu = ensure_contiguous(images.cpu())
+                    master_batch_size = images.shape[0]
                 master_audio = audio  # Keep master's audio for later
                 debug_log(f"Master - Job {multi_job_id}: Master has {master_batch_size} images, collecting from {num_workers} workers...")
-
-                # Ensure master images are contiguous
-                images_on_cpu = ensure_contiguous(images_on_cpu)
 
 
             # Initialize storage for collected images and audio
@@ -511,18 +538,19 @@ class DistributedCollectorNode:
                 if multi_job_id in prompt_server.distributed_pending_jobs:
                     del prompt_server.distributed_pending_jobs[multi_job_id]
 
+            combined_audio = self._combine_audio(master_audio, worker_audio, self.EMPTY_AUDIO, enabled_workers)
             try:
                 combined = self._reorder_and_combine_tensors(
                     worker_images, enabled_workers, master_batch_size, images_on_cpu, delegate_mode, images
                 )
-                debug_log(f"Master - Job {multi_job_id} complete. Combined {combined.shape[0]} images total "
-                          f"(master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})")
-
-                # Combine audio from master and workers
-                combined_audio = self._combine_audio(master_audio, worker_audio, self.EMPTY_AUDIO, enabled_workers)
+                if combined is None:
+                    debug_log(f"Master - Job {multi_job_id} complete with audio only")
+                else:
+                    debug_log(f"Master - Job {multi_job_id} complete. Combined {combined.shape[0]} images total "
+                              f"(master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})")
 
                 return (combined, combined_audio)
             except Exception as e:
                 log(f"Master - Error combining images: {e}")
-                # Return just the master images as fallback
-                return (images, audio if audio is not None else self.EMPTY_AUDIO)
+                # Preserve collected audio even when image assembly fails.
+                return (images, combined_audio)

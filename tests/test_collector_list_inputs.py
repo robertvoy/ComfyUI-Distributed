@@ -124,6 +124,49 @@ def test_collector_opts_into_comfyui_list_inputs():
     assert collector.INPUT_IS_LIST is True
 
 
+def test_collector_exposes_images_as_optional_input():
+    input_types = _load_collector_module().DistributedCollectorNode.INPUT_TYPES()
+
+    assert "images" not in input_types["required"]
+    assert input_types["optional"]["images"] == ("IMAGE",)
+
+
+def test_audio_only_pass_through_returns_no_images_and_preserves_audio():
+    collector = _load_collector_module().DistributedCollectorNode()
+    audio = {"waveform": torch.ones(1, 2, 4), "sample_rate": 48000}
+
+    images, returned_audio = collector.run(images=None, audio=[audio])
+
+    assert images is None
+    assert returned_audio is audio
+
+
+def test_collector_rejects_missing_images_and_audio():
+    collector = _load_collector_module().DistributedCollectorNode()
+
+    try:
+        collector.run(images=None, audio=None)
+    except ValueError as exc:
+        assert "image or audio" in str(exc).lower()
+    else:
+        raise AssertionError("Expected collector to reject a run with no media input")
+
+
+def test_delegate_only_master_allows_no_local_media_input():
+    collector = _load_collector_module().DistributedCollectorNode()
+
+    images, audio = collector.run(
+        images=None,
+        audio=None,
+        multi_job_id=["delegate-audio-job"],
+        delegate_only=[True],
+        enabled_worker_ids=["[]"],
+    )
+
+    assert images is None
+    assert tuple(audio["waveform"].shape) == (1, 2, 1)
+
+
 def test_pass_through_collapses_comfyui_image_list_to_batch_and_unwraps_hidden_inputs():
     collector = _load_collector_module().DistributedCollectorNode()
     first = torch.zeros(1, 2, 2, 3)
@@ -203,3 +246,119 @@ def test_worker_list_input_sends_one_completion_sequence_with_last_only_on_final
     assert [payload["is_last"] for payload in posted_payloads] == [False, True]
     assert {payload["job_id"] for payload in posted_payloads} == {"job-list-1"}
     assert {payload["worker_id"] for payload in posted_payloads} == {"worker-a"}
+
+
+def test_audio_only_worker_sends_one_completion_without_image():
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    audio = {"waveform": torch.ones(1, 2, 4), "sample_rate": 48000}
+    posted = []
+
+    class _FakeResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class _FakeSession:
+        def post(self, url, json, timeout):
+            posted.append((url, json, timeout.total))
+            return _FakeResponse()
+
+    async def _fake_get_client_session():
+        return _FakeSession()
+
+    module.get_client_session = _fake_get_client_session
+    module.encode_audio_payload = lambda value: {"encoded": value is audio}
+
+    images, returned_audio = collector.run(
+        images=None,
+        audio=[audio],
+        multi_job_id=["audio-job"],
+        is_worker=[True],
+        master_url=["http://master"],
+        worker_id=["worker-a"],
+    )
+
+    assert images is None
+    assert returned_audio is audio
+    assert len(posted) == 1
+    assert posted[0][0] == "http://master/distributed/job_complete"
+    assert posted[0][2] == 600
+    assert posted[0][1] == {
+        "job_id": "audio-job",
+        "worker_id": "worker-a",
+        "batch_idx": 0,
+        "audio": {"encoded": True},
+        "is_last": True,
+    }
+
+
+def test_audio_only_master_combines_local_and_worker_audio():
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    master_audio = {"waveform": torch.ones(1, 2, 2), "sample_rate": 48000}
+    worker_audio = {"waveform": torch.full((1, 2, 3), 2.0), "sample_rate": 48000}
+    module.prompt_server.distributed_jobs_lock = asyncio.Lock()
+    queue = asyncio.Queue()
+    queue.put_nowait(
+        {
+            "worker_id": "worker-a",
+            "image_index": 0,
+            "tensor": None,
+            "audio": worker_audio,
+            "is_last": True,
+        }
+    )
+    module.prompt_server.distributed_pending_jobs = {"audio-job": queue}
+
+    images, combined_audio = asyncio.run(
+        collector.execute(
+            images=None,
+            audio=master_audio,
+            multi_job_id="audio-job",
+            enabled_worker_ids='["worker-a"]',
+        )
+    )
+
+    assert images is None
+    assert combined_audio["sample_rate"] == 48000
+    assert tuple(combined_audio["waveform"].shape) == (1, 2, 5)
+    assert torch.equal(combined_audio["waveform"][..., :2], master_audio["waveform"])
+    assert torch.equal(combined_audio["waveform"][..., 2:], worker_audio["waveform"])
+
+
+def test_delegate_only_audio_collects_worker_audio_without_placeholder_image():
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    worker_audio = {"waveform": torch.full((1, 2, 3), 2.0), "sample_rate": 48000}
+    module.prompt_server.distributed_jobs_lock = asyncio.Lock()
+    queue = asyncio.Queue()
+    queue.put_nowait(
+        {
+            "worker_id": "worker-a",
+            "image_index": 0,
+            "tensor": None,
+            "audio": worker_audio,
+            "is_last": True,
+        }
+    )
+    module.prompt_server.distributed_pending_jobs = {"delegate-audio-job": queue}
+
+    images, combined_audio = asyncio.run(
+        collector.execute(
+            images=None,
+            audio=None,
+            multi_job_id="delegate-audio-job",
+            enabled_worker_ids='["worker-a"]',
+            delegate_only=True,
+        )
+    )
+
+    assert images is None
+    assert combined_audio["sample_rate"] == 48000
+    assert torch.equal(combined_audio["waveform"], worker_audio["waveform"])

@@ -302,6 +302,77 @@ class JobCompleteAudioPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queued["audio"]["sample_rate"], 44100)
         self.assertEqual(tuple(queued["audio"]["waveform"].shape), (1, 2, 4))
 
+    async def test_job_complete_accepts_audio_without_image(self):
+        queue = asyncio.Queue()
+        job_routes.prompt_server.distributed_jobs_lock = asyncio.Lock()
+        job_routes.prompt_server.distributed_pending_jobs = {"audio-only-job": queue}
+        request = _FakeRequest(
+            {
+                "job_id": "audio-only-job",
+                "worker_id": "worker-1",
+                "batch_idx": 0,
+                "audio": self._encoded_audio_payload(),
+                "is_last": True,
+            }
+        )
+
+        with patch.object(job_routes, "_decode_canonical_png_tensor") as decode_image:
+            response = await job_routes.job_complete_endpoint(request)
+
+        self.assertEqual(response.status, 200)
+        decode_image.assert_not_called()
+        queued = await queue.get()
+        self.assertIsNone(queued["tensor"])
+        self.assertEqual(queued["audio"]["sample_rate"], 44100)
+
+    async def test_job_complete_rejects_payload_without_image_or_audio(self):
+        request = _FakeRequest(
+            {
+                "job_id": "job-1",
+                "worker_id": "worker-1",
+                "batch_idx": 0,
+                "is_last": True,
+            }
+        )
+
+        response = await job_routes.job_complete_endpoint(request)
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("image or audio", response.payload.get("message", "").lower())
+
+    async def test_job_complete_rejects_invalid_image_even_when_audio_is_present(self):
+        request = _FakeRequest(
+            {
+                "job_id": "job-1",
+                "worker_id": "worker-1",
+                "batch_idx": 0,
+                "image": 123,
+                "audio": self._encoded_audio_payload(),
+                "is_last": True,
+            }
+        )
+
+        response = await job_routes.job_complete_endpoint(request)
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("image", response.payload.get("message", "").lower())
+
+    async def test_job_complete_returns_400_for_malformed_audio(self):
+        request = _FakeRequest(
+            {
+                "job_id": "job-1",
+                "worker_id": "worker-1",
+                "batch_idx": 0,
+                "audio": {"data": "AAAA", "shape": [1, 2], "dtype": "float32"},
+                "is_last": True,
+            }
+        )
+
+        response = await job_routes.job_complete_endpoint(request)
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("audio.shape", response.payload.get("message", "").lower())
+
     def test_decode_audio_payload_rejects_bad_shape(self):
         bad = {
             "sample_rate": 44100,
