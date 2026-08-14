@@ -45,6 +45,16 @@ MAX_BATCH = int(os.environ.get('COMFYUI_MAX_BATCH', '20'))  # Maximum items per 
 # Heartbeat monitoring
 HEARTBEAT_INTERVAL = float(os.environ.get('COMFYUI_HEARTBEAT_INTERVAL', '10'))  # Heartbeat/check interval in seconds
 HEARTBEAT_TIMEOUT = int(os.environ.get('COMFYUI_HEARTBEAT_TIMEOUT', '60'))  # Worker heartbeat timeout in seconds (default 60s)
+# Cap consecutive worker-timeout extensions when probes keep reporting "busy".
+MAX_COLLECTOR_BUSY_GRACE_PERIODS = max(
+    0,
+    int(os.environ.get('COMFYUI_MAX_COLLECTOR_BUSY_GRACE_PERIODS', '10')),
+)
+# Retain terminal job IDs long enough to classify delayed worker callbacks.
+CLOSED_JOB_TTL_SECONDS = max(
+    0.0,
+    float(os.environ.get('COMFYUI_CLOSED_JOB_TTL_SECONDS', '3600')),
+)
 
 # USDU result collection
 DYNAMIC_MODE_MAX_POLL_TIMEOUT = 10.0

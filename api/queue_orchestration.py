@@ -44,6 +44,8 @@ def ensure_distributed_state(server_instance=None):
     ps = server_instance or prompt_server
     if not hasattr(ps, "distributed_pending_jobs"):
         ps.distributed_pending_jobs = {}
+    if not hasattr(ps, "distributed_closed_jobs"):
+        ps.distributed_closed_jobs = {}
     if not hasattr(ps, "distributed_jobs_lock"):
         ps.distributed_jobs_lock = asyncio.Lock()
 
@@ -56,6 +58,7 @@ async def _ensure_distributed_queue(job_id):
     """Ensure a queue exists for the given distributed job ID."""
     ensure_distributed_state()
     async with prompt_server.distributed_jobs_lock:
+        prompt_server.distributed_closed_jobs.pop(job_id, None)
         if job_id not in prompt_server.distributed_pending_jobs:
             prompt_server.distributed_pending_jobs[job_id] = asyncio.Queue()
 

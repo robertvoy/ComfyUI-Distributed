@@ -46,7 +46,7 @@ def _load_collector_module():
     comfy_module = types.ModuleType("comfy")
     model_management = types.ModuleType("comfy.model_management")
 
-    class InterruptProcessingException(Exception):
+    class InterruptProcessingException(BaseException):
         pass
 
     model_management.InterruptProcessingException = InterruptProcessingException
@@ -85,7 +85,9 @@ def _load_collector_module():
     sys.modules[f"{package_name}.utils.config"] = config_module
 
     constants_module = types.ModuleType(f"{package_name}.utils.constants")
+    constants_module.CLOSED_JOB_TTL_SECONDS = 3600.0
     constants_module.HEARTBEAT_INTERVAL = 1.0
+    constants_module.MAX_COLLECTOR_BUSY_GRACE_PERIODS = 10
     sys.modules[f"{package_name}.utils.constants"] = constants_module
 
     image_module = types.ModuleType(f"{package_name}.utils.image")
@@ -246,6 +248,90 @@ def test_worker_list_input_sends_one_completion_sequence_with_last_only_on_final
     assert [payload["is_last"] for payload in posted_payloads] == [False, True]
     assert {payload["job_id"] for payload in posted_payloads} == {"job-list-1"}
     assert {payload["worker_id"] for payload in posted_payloads} == {"worker-a"}
+
+
+def test_worker_treats_closed_master_job_as_terminal_acknowledgement():
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    images = torch.zeros(2, 2, 2, 3)
+    posted_payloads = []
+
+    class _FakeImage:
+        def save(self, fp, format=None, compress_level=None):
+            fp.write(b"png-bytes")
+
+    class _FakeResponse:
+        status = 410
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self, content_type=None):
+            return {"code": "job_closed", "error": "job no longer accepts results"}
+
+        def raise_for_status(self):
+            raise AssertionError("known closed jobs must not raise")
+
+    class _FakeSession:
+        def post(self, url, json, timeout):
+            posted_payloads.append(json)
+            return _FakeResponse()
+
+    async def _fake_get_client_session():
+        return _FakeSession()
+
+    module.tensor_to_pil = lambda *_args, **_kwargs: _FakeImage()
+    module.get_client_session = _fake_get_client_session
+    module.encode_audio_payload = lambda _audio: None
+
+    asyncio.run(
+        collector.send_batch_to_master(
+            images,
+            None,
+            "closed-job",
+            "http://master",
+            "worker-a",
+        )
+    )
+
+    assert len(posted_payloads) == 1
+
+
+def test_master_busy_probe_has_a_finite_grace_limit():
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    module.prompt_server.distributed_jobs_lock = asyncio.Lock()
+    module.prompt_server.distributed_pending_jobs = {}
+    module.MAX_COLLECTOR_BUSY_GRACE_PERIODS = 1
+    module.get_worker_timeout_seconds = lambda: 0.05
+    module.load_config = lambda: {
+        "workers": [{"id": "worker-a", "host": "127.0.0.1", "port": 8189}]
+    }
+
+    async def _busy_probe(*_args, **_kwargs):
+        return {"exec_info": {"queue_remaining": 1}}
+
+    module.probe_worker = _busy_probe
+    images = torch.zeros(1, 2, 2, 3)
+
+    combined, _audio = asyncio.run(
+        asyncio.wait_for(
+            collector.execute(
+                images=images,
+                audio=None,
+                multi_job_id="bounded-job",
+                enabled_worker_ids='["worker-a"]',
+            ),
+            timeout=0.5,
+        )
+    )
+
+    assert torch.equal(combined, images)
+    assert "bounded-job" not in module.prompt_server.distributed_pending_jobs
+    assert "bounded-job" in module.prompt_server.distributed_closed_jobs
 
 
 def test_audio_only_worker_sends_one_completion_without_image():
