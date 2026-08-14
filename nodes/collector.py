@@ -12,7 +12,11 @@ from comfy.utils import ProgressBar
 
 from ..utils.logging import debug_log, log
 from ..utils.config import get_worker_timeout_seconds, load_config, is_master_delegate_only
-from ..utils.constants import HEARTBEAT_INTERVAL
+from ..utils.constants import (
+    CLOSED_JOB_TTL_SECONDS,
+    HEARTBEAT_INTERVAL,
+    MAX_COLLECTOR_BUSY_GRACE_PERIODS,
+)
 from ..utils.image import tensor_to_pil, pil_to_tensor, ensure_contiguous
 from ..utils.network import build_worker_url, get_client_session, probe_worker
 from ..utils.audio_payload import encode_audio_payload
@@ -57,6 +61,22 @@ class DistributedCollectorNode:
     RETURN_NAMES = ("images", "audio")
     FUNCTION = "run"
     CATEGORY = "image"
+
+    @staticmethod
+    def _mark_job_closed(multi_job_id):
+        closed_jobs = getattr(prompt_server, "distributed_closed_jobs", None)
+        if closed_jobs is None:
+            closed_jobs = {}
+            prompt_server.distributed_closed_jobs = closed_jobs
+
+        now = time.monotonic()
+        cutoff = now - CLOSED_JOB_TTL_SECONDS
+        stale_job_ids = [
+            job_id for job_id, closed_at in closed_jobs.items() if closed_at < cutoff
+        ]
+        for job_id in stale_job_ids:
+            closed_jobs.pop(job_id, None)
+        closed_jobs[str(multi_job_id)] = now
     
     @staticmethod
     def _unwrap_list_input(value):
@@ -196,6 +216,17 @@ class DistributedCollectorNode:
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=timeout_seconds),
                 ) as response:
+                    if getattr(response, "status", 200) == 410:
+                        response_payload = await response.json(content_type=None)
+                        if (
+                            isinstance(response_payload, dict)
+                            and response_payload.get("code") == "job_closed"
+                        ):
+                            log(
+                                f"Worker - Master closed job {multi_job_id} before the result arrived; "
+                                "discarding the remaining completion payloads."
+                            )
+                            return
                     response.raise_for_status()
             except Exception as e:
                 media_type = "image/audio" if "image" in payload else "audio-only"
@@ -345,6 +376,9 @@ class DistributedCollectorNode:
 
             # Create the queue before any expensive local work to avoid job_complete race.
             async with prompt_server.distributed_jobs_lock:
+                closed_jobs = getattr(prompt_server, "distributed_closed_jobs", None)
+                if closed_jobs is not None:
+                    closed_jobs.pop(multi_job_id, None)
                 if multi_job_id not in prompt_server.distributed_pending_jobs:
                     prompt_server.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
                     debug_log(f"Master - Initialized queue early for job {multi_job_id}")
@@ -380,6 +414,7 @@ class DistributedCollectorNode:
             base_timeout = float(get_worker_timeout_seconds())
             slice_timeout = min(max(0.1, HEARTBEAT_INTERVAL / 20.0), base_timeout)
             last_activity = time.time()
+            busy_grace_periods = 0
             
             
             # Get queue size before starting
@@ -434,6 +469,7 @@ class DistributedCollectorNode:
                         # Record activity and refresh timeout baseline
                         last_activity = time.time()
                         base_timeout = float(get_worker_timeout_seconds())
+                        busy_grace_periods = 0
 
                         if is_last:
                             mark_worker_done(worker_id)
@@ -479,10 +515,6 @@ class DistributedCollectorNode:
                                     )
                                     if payload is not None and queue_remaining and queue_remaining > 0:
                                         any_busy = True
-                                        log(
-                                            f"Master - Probe grace: worker {wid} appears busy "
-                                            f"(queue_remaining={queue_remaining}). Continuing to wait."
-                                        )
                                         break
                                 except Exception as e:
                                     debug_log(f"Collector probe failed for worker {wid}: {e}")
@@ -490,11 +522,22 @@ class DistributedCollectorNode:
                             debug_log(f"Collector probe setup error: {e}")
 
                         if any_busy:
-                            # Refresh last_activity and continue waiting
-                            last_activity = time.time()
-                            # Refresh base timeout in case the user changed it in UI
-                            base_timeout = float(get_worker_timeout_seconds())
-                            continue
+                            if busy_grace_periods < MAX_COLLECTOR_BUSY_GRACE_PERIODS:
+                                busy_grace_periods += 1
+                                log(
+                                    "Master - Probe grace: a missing worker still appears busy; "
+                                    f"continuing wait period {busy_grace_periods}/"
+                                    f"{MAX_COLLECTOR_BUSY_GRACE_PERIODS}."
+                                )
+                                last_activity = time.time()
+                                # Refresh base timeout in case the user changed it in UI.
+                                base_timeout = float(get_worker_timeout_seconds())
+                                continue
+                            log(
+                                "Master - Busy-worker grace exhausted after "
+                                f"{MAX_COLLECTOR_BUSY_GRACE_PERIODS} additional wait periods; "
+                                "finishing with the results received so far."
+                            )
                         
                         # Check queue size again with lock
                         async with prompt_server.distributed_jobs_lock:
@@ -529,6 +572,7 @@ class DistributedCollectorNode:
                 async with prompt_server.distributed_jobs_lock:
                     if multi_job_id in prompt_server.distributed_pending_jobs:
                         del prompt_server.distributed_pending_jobs[multi_job_id]
+                    self._mark_job_closed(multi_job_id)
                 raise
             
             total_collected = sum(len(imgs) for imgs in worker_images.values())
@@ -537,6 +581,7 @@ class DistributedCollectorNode:
             async with prompt_server.distributed_jobs_lock:
                 if multi_job_id in prompt_server.distributed_pending_jobs:
                     del prompt_server.distributed_pending_jobs[multi_job_id]
+                self._mark_job_closed(multi_job_id)
 
             combined_audio = self._combine_audio(master_audio, worker_audio, self.EMPTY_AUDIO, enabled_workers)
             try:

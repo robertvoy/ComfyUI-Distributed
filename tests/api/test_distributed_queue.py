@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import time
 import types
 import unittest
 import asyncio
@@ -153,6 +154,7 @@ def _load_job_routes_module():
     sys.modules[f"{package_name}.utils.network"] = network_module
 
     constants_module = types.ModuleType(f"{package_name}.utils.constants")
+    constants_module.CLOSED_JOB_TTL_SECONDS = 3600.0
     constants_module.MEMORY_CLEAR_DELAY = 0.0
     constants_module.JOB_INIT_GRACE_PERIOD = 10.0
     sys.modules[f"{package_name}.utils.constants"] = constants_module
@@ -324,6 +326,53 @@ class JobCompleteAudioPayloadTests(unittest.IsolatedAsyncioTestCase):
         queued = await queue.get()
         self.assertIsNone(queued["tensor"])
         self.assertEqual(queued["audio"]["sample_rate"], 44100)
+
+    async def test_job_complete_returns_gone_for_known_closed_job(self):
+        job_routes.prompt_server.distributed_jobs_lock = asyncio.Lock()
+        job_routes.prompt_server.distributed_pending_jobs = {}
+        job_routes.prompt_server.distributed_closed_jobs = {
+            "closed-job": time.monotonic()
+        }
+        request = _FakeRequest(
+            {
+                "job_id": "closed-job",
+                "worker_id": "worker-1",
+                "batch_idx": 0,
+                "image": "data:image/png;base64,AAAA",
+                "is_last": True,
+            }
+        )
+
+        with (
+            patch.object(job_routes, "JOB_INIT_GRACE_PERIOD", 0.0),
+            patch.object(job_routes, "_decode_canonical_png_tensor", return_value="tensor-data"),
+        ):
+            response = await job_routes.job_complete_endpoint(request)
+
+        self.assertEqual(response.status, 410)
+        self.assertEqual(response.payload.get("code"), "job_closed")
+
+    async def test_job_complete_keeps_unknown_job_distinct_from_closed_job(self):
+        job_routes.prompt_server.distributed_jobs_lock = asyncio.Lock()
+        job_routes.prompt_server.distributed_pending_jobs = {}
+        job_routes.prompt_server.distributed_closed_jobs = {}
+        request = _FakeRequest(
+            {
+                "job_id": "unknown-job",
+                "worker_id": "worker-1",
+                "batch_idx": 0,
+                "image": "data:image/png;base64,AAAA",
+                "is_last": True,
+            }
+        )
+
+        with (
+            patch.object(job_routes, "JOB_INIT_GRACE_PERIOD", 0.0),
+            patch.object(job_routes, "_decode_canonical_png_tensor", return_value="tensor-data"),
+        ):
+            response = await job_routes.job_complete_endpoint(request)
+
+        self.assertEqual(response.status, 404)
 
     async def test_job_complete_rejects_payload_without_image_or_audio(self):
         request = _FakeRequest(

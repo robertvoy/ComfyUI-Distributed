@@ -1,5 +1,7 @@
+import asyncio
 import importlib.util
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -85,6 +87,55 @@ class QueuePromptPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(extra_data["create_time"], int)
         self.assertGreater(extra_data["create_time"], 0)
         self.assertEqual(extra_data["extra_pnginfo"]["workflow"], {"id": "workflow-1"})
+
+
+class RunAsyncInServerLoopTests(unittest.TestCase):
+    def test_propagates_comfy_style_base_exception(self):
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        original_get_server_loop = async_helpers.get_server_loop
+        async_helpers.get_server_loop = lambda: loop
+
+        class ComfyStyleInterrupt(BaseException):
+            pass
+
+        async def raise_interrupt():
+            raise ComfyStyleInterrupt("cancelled")
+
+        try:
+            with self.assertRaisesRegex(ComfyStyleInterrupt, "cancelled"):
+                async_helpers.run_async_in_server_loop(raise_interrupt(), timeout=1.0)
+        finally:
+            async_helpers.get_server_loop = original_get_server_loop
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=1.0)
+            loop.close()
+
+    def test_timeout_cancels_scheduled_coroutine(self):
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever, daemon=True)
+        loop_thread.start()
+        original_get_server_loop = async_helpers.get_server_loop
+        async_helpers.get_server_loop = lambda: loop
+        cancelled = threading.Event()
+
+        async def wait_forever():
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        try:
+            with self.assertRaisesRegex(TimeoutError, "timed out after 0.05 seconds"):
+                async_helpers.run_async_in_server_loop(wait_forever(), timeout=0.05)
+            self.assertTrue(cancelled.wait(timeout=1.0))
+        finally:
+            async_helpers.get_server_loop = original_get_server_loop
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=1.0)
+            loop.close()
 
 
 if __name__ == "__main__":

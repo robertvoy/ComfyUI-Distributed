@@ -14,7 +14,7 @@ from PIL import Image
 from ..utils.logging import debug_log
 from ..utils.image import pil_to_tensor, ensure_contiguous
 from ..utils.network import handle_api_error
-from ..utils.constants import JOB_INIT_GRACE_PERIOD, MEMORY_CLEAR_DELAY
+from ..utils.constants import CLOSED_JOB_TTL_SECONDS, JOB_INIT_GRACE_PERIOD, MEMORY_CLEAR_DELAY
 try:
     from .queue_orchestration import ensure_distributed_state, orchestrate_distributed_execution
 except ImportError:
@@ -149,6 +149,9 @@ async def prepare_job_endpoint(request):
 
         ensure_distributed_state()
         async with prompt_server.distributed_jobs_lock:
+            closed_jobs = getattr(prompt_server, "distributed_closed_jobs", None)
+            if closed_jobs is not None:
+                closed_jobs.pop(multi_job_id, None)
             if multi_job_id not in prompt_server.distributed_pending_jobs:
                 prompt_server.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
         
@@ -334,6 +337,19 @@ async def job_complete_endpoint(request):
                     )
                     queue_size = pending.qsize()
                     break
+
+                closed_jobs = getattr(prompt_server, "distributed_closed_jobs", {})
+                closed_at = closed_jobs.get(multi_job_id)
+                if closed_at is not None:
+                    if time.monotonic() - closed_at <= CLOSED_JOB_TTL_SECONDS:
+                        return web.json_response(
+                            {
+                                "code": "job_closed",
+                                "error": "job no longer accepts results",
+                            },
+                            status=410,
+                        )
+                    closed_jobs.pop(multi_job_id, None)
 
             if time.monotonic() > deadline:
                 return await handle_api_error(request, "job not initialized", 404)
