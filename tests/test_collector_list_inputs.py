@@ -7,6 +7,17 @@ from pathlib import Path
 import torch
 
 
+def _register_real_transfer_codec(package_name, utils_pkg):
+    """Load the real utils/transfer_codec.py into the synthetic test package."""
+    codec_path = Path(__file__).resolve().parents[1] / "utils" / "transfer_codec.py"
+    codec_spec = importlib.util.spec_from_file_location(f"{package_name}.utils.transfer_codec", codec_path)
+    codec_module = importlib.util.module_from_spec(codec_spec)
+    sys.modules[f"{package_name}.utils.transfer_codec"] = codec_module
+    codec_spec.loader.exec_module(codec_module)
+    utils_pkg.transfer_codec = codec_module
+    return codec_module
+
+
 def _load_collector_module():
     module_path = Path(__file__).resolve().parents[1] / "nodes" / "collector.py"
     package_name = "dist_collector_list_testpkg"
@@ -26,6 +37,7 @@ def _load_collector_module():
     utils_pkg = types.ModuleType(f"{package_name}.utils")
     utils_pkg.__path__ = []
     sys.modules[f"{package_name}.utils"] = utils_pkg
+    _register_real_transfer_codec(package_name, utils_pkg)
 
     class _Routes:
         def post(self, _path):
@@ -86,6 +98,7 @@ def _load_collector_module():
 
     constants_module = types.ModuleType(f"{package_name}.utils.constants")
     constants_module.HEARTBEAT_INTERVAL = 1.0
+    constants_module.TRANSFER_MAX_CHUNK_BYTES = 32 * 1024 * 1024
     sys.modules[f"{package_name}.utils.constants"] = constants_module
 
     image_module = types.ModuleType(f"{package_name}.utils.image")
@@ -362,3 +375,173 @@ def test_delegate_only_audio_collects_worker_audio_without_placeholder_image():
     assert images is None
     assert combined_audio["sample_rate"] == 48000
     assert torch.equal(combined_audio["waveform"], worker_audio["waveform"])
+
+
+# --------------------------------------------------------------------------- #
+# Compressed worker -> master transfer
+# --------------------------------------------------------------------------- #
+
+class _RecordingResponse:
+    def __init__(self, status=200, text=""):
+        self.status = status
+        self._text = text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def text(self):
+        return self._text
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"HTTP {self.status}")
+
+
+class _RecordingSession:
+    def __init__(self, statuses=None):
+        self.calls = []
+        self._statuses = list(statuses or [])
+
+    def post(self, url, timeout, json=None, data=None):
+        self.calls.append({"url": url, "json": json, "data": data, "timeout": timeout.total})
+        status = self._statuses.pop(0) if self._statuses else 200
+        return _RecordingResponse(status=status, text="Invalid JSON payload")
+
+
+def _install_fake_transport(module, session):
+    async def _fake_get_client_session():
+        return session
+
+    module.get_client_session = _fake_get_client_session
+    # Record the multipart content instead of building a real aiohttp.FormData.
+    module.DistributedCollectorNode._build_multipart = staticmethod(
+        lambda envelope, parts: {"envelope": envelope, "parts": list(parts)}
+    )
+
+
+def _run_worker(collector, images, audio=None, **kwargs):
+    return collector.run(
+        images=[images],
+        audio=[audio],
+        multi_job_id=["job-c"],
+        is_worker=[True],
+        master_url=["http://master"],
+        worker_id=["worker-a"],
+        **{key: [value] for key, value in kwargs.items()},
+    )
+
+
+def test_collector_exposes_transfer_widgets_with_legacy_default():
+    module = _load_collector_module()
+    optional = module.DistributedCollectorNode.INPUT_TYPES()["optional"]
+
+    formats, options = optional["transfer_format"]
+    assert "legacy_png" in formats and "h264" in formats and "ffv1" in formats
+    assert options["default"] == "legacy_png"
+    assert optional["transfer_quality"][0] == "INT"
+
+
+def test_worker_sends_video_batch_as_one_multipart_chunk_with_audio_on_last():
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    session = _RecordingSession()
+    _install_fake_transport(module, session)
+    module.encode_audio_payload = lambda value: None if value is None else {"encoded": True}
+    images = torch.rand(6, 32, 48, 3)
+
+    _run_worker(
+        collector,
+        images,
+        audio={"waveform": torch.ones(1, 2, 4), "sample_rate": 48000},
+        transfer_format="ffv1",
+        transfer_quality=90,
+    )
+
+    assert len(session.calls) == 1
+    call = session.calls[0]
+    assert call["url"] == "http://master/distributed/job_complete"
+    assert call["json"] is None
+    envelope = call["data"]["envelope"]
+    assert envelope["format"] == "ffv1"
+    assert (envelope["start_index"], envelope["count"]) == (0, 6)
+    assert (envelope["width"], envelope["height"]) == (48, 32)
+    assert envelope["is_last"] is True
+    assert envelope["audio"] == {"encoded": True}
+    assert envelope["job_id"] == "job-c" and envelope["worker_id"] == "worker-a"
+    assert len(call["data"]["parts"]) == 1
+
+
+def test_worker_marks_only_final_chunk_as_last():
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    session = _RecordingSession()
+    _install_fake_transport(module, session)
+    module.TRANSFER_MAX_CHUNK_BYTES = 1  # force one frame per request
+
+    _run_worker(collector, torch.rand(3, 8, 8, 3), transfer_format="png")
+
+    envelopes = [call["data"]["envelope"] for call in session.calls]
+    assert [(e["start_index"], e["count"], e["is_last"]) for e in envelopes] == [
+        (0, 1, False),
+        (1, 1, False),
+        (2, 1, True),
+    ]
+    assert "audio" not in envelopes[-1]
+
+
+def test_worker_falls_back_to_legacy_png_when_master_rejects_multipart():
+    from PIL import Image
+    import numpy as np
+
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    session = _RecordingSession(statuses=[400])
+    _install_fake_transport(module, session)
+    module.tensor_to_pil = lambda tensor, idx: Image.fromarray(
+        (255 * tensor[idx].cpu().numpy()).astype(np.uint8)
+    )
+
+    _run_worker(collector, torch.rand(2, 8, 8, 3), transfer_format="h264")
+
+    assert session.calls[0]["data"] is not None  # compressed attempt
+    legacy = [call["json"] for call in session.calls[1:]]
+    assert [payload["batch_idx"] for payload in legacy] == [0, 1]
+    assert all(payload["image"].startswith("data:image/png;base64,") for payload in legacy)
+    assert [payload["is_last"] for payload in legacy] == [False, True]
+
+
+def test_worker_uses_legacy_path_for_unknown_transfer_format():
+    from PIL import Image
+    import numpy as np
+
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    session = _RecordingSession()
+    _install_fake_transport(module, session)
+    module.tensor_to_pil = lambda tensor, idx: Image.fromarray(
+        (255 * tensor[idx].cpu().numpy()).astype(np.uint8)
+    )
+
+    _run_worker(collector, torch.rand(1, 8, 8, 3), transfer_format="gif")
+
+    assert len(session.calls) == 1
+    assert session.calls[0]["json"]["image"].startswith("data:image/png;base64,")
+
+
+def test_worker_falls_back_when_video_encoder_missing():
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    session = _RecordingSession()
+    _install_fake_transport(module, session)
+    codec = module.transfer_codec
+    original = codec.video_codec_available
+    codec.video_codec_available = lambda fmt: fmt == "h264" and original("h264")
+    try:
+        _run_worker(collector, torch.rand(2, 16, 16, 3), transfer_format="av1")
+    finally:
+        codec.video_codec_available = original
+
+    assert session.calls[0]["data"]["envelope"]["format"] == "h264"

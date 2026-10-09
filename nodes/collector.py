@@ -12,11 +12,12 @@ from comfy.utils import ProgressBar
 
 from ..utils.logging import debug_log, log
 from ..utils.config import get_worker_timeout_seconds, load_config, is_master_delegate_only
-from ..utils.constants import HEARTBEAT_INTERVAL
+from ..utils.constants import HEARTBEAT_INTERVAL, TRANSFER_MAX_CHUNK_BYTES
 from ..utils.image import tensor_to_pil, pil_to_tensor, ensure_contiguous
 from ..utils.network import build_worker_url, get_client_session, probe_worker
 from ..utils.audio_payload import encode_audio_payload
 from ..utils.async_helpers import run_async_in_server_loop
+from ..utils import transfer_codec
 
 prompt_server = _server.PromptServer.instance
 
@@ -40,6 +41,33 @@ class DistributedCollectorNode:
             "optional": {
                 "images": ("IMAGE",),
                 "audio": ("AUDIO",),
+                "transfer_format": (
+                    list(transfer_codec.TRANSFER_FORMATS),
+                    {
+                        "default": transfer_codec.DEFAULT_TRANSFER_FORMAT,
+                        "tooltip": (
+                            "How workers send images back to the master. "
+                            "legacy_png: original uncompressed PNG (largest). "
+                            "png / ffv1: lossless, identical result. "
+                            "jpeg / webp: lossy stills. "
+                            "h264 / h265 / av1: lossy video of the whole batch, smallest for frame sequences."
+                        ),
+                    },
+                ),
+                "transfer_quality": (
+                    "INT",
+                    {
+                        "default": transfer_codec.DEFAULT_TRANSFER_QUALITY,
+                        "min": 1,
+                        "max": 100,
+                        "step": 1,
+                        "tooltip": (
+                            "Quality for lossy transfer formats (ignored by lossless ones). "
+                            "JPEG/WebP use it directly; video codecs map it to CRF "
+                            "(90 -> h264/h265 CRF 13, av1 CRF 16)."
+                        ),
+                    },
+                ),
             },
             "hidden": {
                 "multi_job_id": ("STRING", {"default": ""}),
@@ -104,7 +132,7 @@ class DistributedCollectorNode:
             return None
         return {"waveform": torch.cat(waveforms, dim=-1), "sample_rate": sample_rate}
 
-    def run(self, images=None, load_balance=False, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False):
+    def run(self, images=None, load_balance=False, audio=None, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", pass_through=False, delegate_only=False, transfer_format=transfer_codec.DEFAULT_TRANSFER_FORMAT, transfer_quality=transfer_codec.DEFAULT_TRANSFER_QUALITY):
         if images is not None:
             images = self._normalize_images_input(images)
         audio = self._normalize_audio_input(audio)
@@ -117,6 +145,8 @@ class DistributedCollectorNode:
         worker_id = self._unwrap_list_input(worker_id)
         pass_through = self._unwrap_list_input(pass_through)
         delegate_only = self._unwrap_list_input(delegate_only)
+        transfer_format = self._unwrap_list_input(transfer_format)
+        transfer_quality = self._unwrap_list_input(transfer_quality)
 
         remote_only_master = (
             bool(multi_job_id)
@@ -147,12 +177,121 @@ class DistributedCollectorNode:
                 worker_batch_size,
                 worker_id,
                 delegate_only,
+                transfer_format,
+                transfer_quality,
             )
         )
         return result
 
-    async def send_batch_to_master(self, image_batch, audio, multi_job_id, master_url, worker_id):
+    async def send_batch_to_master(
+        self,
+        image_batch,
+        audio,
+        multi_job_id,
+        master_url,
+        worker_id,
+        transfer_format=transfer_codec.DEFAULT_TRANSFER_FORMAT,
+        transfer_quality=transfer_codec.DEFAULT_TRANSFER_QUALITY,
+    ):
         """Send an image batch, optionally with audio, or an audio-only completion."""
+        batch_size = 0 if image_batch is None else image_batch.shape[0]
+        fmt = self._resolve_transfer_format(transfer_format) if batch_size else transfer_codec.LEGACY_FORMAT
+        if fmt != transfer_codec.LEGACY_FORMAT:
+            sent = await self._send_compressed_batch(
+                image_batch, audio, multi_job_id, master_url, worker_id, fmt, transfer_quality
+            )
+            if sent:
+                return
+            log(
+                "Worker - Master did not accept compressed transfer "
+                "(older ComfyUI-Distributed on the master?). Falling back to legacy_png."
+            )
+        await self._send_legacy_batch(image_batch, audio, multi_job_id, master_url, worker_id)
+
+    @staticmethod
+    def _resolve_transfer_format(transfer_format):
+        try:
+            fmt = transfer_codec.normalize_format(transfer_format)
+        except transfer_codec.TransferCodecError as exc:
+            log(f"Worker - {exc}; using legacy_png.")
+            return transfer_codec.LEGACY_FORMAT
+        if fmt not in transfer_codec.VIDEO_FORMATS or transfer_codec.video_codec_available(fmt):
+            return fmt
+        fallback = "h264" if fmt != "ffv1" and transfer_codec.video_codec_available("h264") else "png"
+        log(f"Worker - Encoder for '{fmt}' is not available in this PyAV build; using '{fallback}'.")
+        return fallback
+
+    @staticmethod
+    def _build_multipart(envelope, parts):
+        form = aiohttp.FormData()
+        form.add_field("envelope", json.dumps(envelope), content_type="application/json")
+        for i, data in enumerate(parts):
+            form.add_field("media", data, filename=f"{i}.bin", content_type="application/octet-stream")
+        return form
+
+    async def _send_compressed_batch(self, image_batch, audio, multi_job_id, master_url, worker_id, fmt, quality):
+        """Send the batch as compressed multipart chunks.
+
+        Returns False (without having delivered anything) when the master
+        rejects the first chunk, so the caller can retry with legacy_png.
+        """
+        encoded_audio = encode_audio_payload(audio)
+        session = await get_client_session()
+        url = f"{master_url}/distributed/job_complete"
+        loop = asyncio.get_running_loop()
+
+        frames = await loop.run_in_executor(None, transfer_codec.tensor_batch_to_uint8, image_batch)
+        raw_bytes = int(frames.nbytes)
+        total = int(frames.shape[0])
+        chunks = transfer_codec.encode_chunks(frames, fmt, quality, TRANSFER_MAX_CHUNK_BYTES)
+        started = time.time()
+        sent_bytes = 0
+        chunk_count = 0
+
+        while True:
+            # Encoding is CPU-bound (seconds for video); keep the server loop responsive.
+            chunk = await loop.run_in_executor(None, next, chunks, None)
+            if chunk is None:
+                break
+            parts = chunk.pop("parts")
+            is_last = chunk["start_index"] + chunk["count"] >= total
+            envelope = {
+                "job_id": str(multi_job_id),
+                "worker_id": str(worker_id),
+                "is_last": bool(is_last),
+                **chunk,
+            }
+            if is_last and encoded_audio is not None:
+                envelope["audio"] = encoded_audio
+            chunk_bytes = sum(len(p) for p in parts)
+            timeout_seconds = min(600, 60 + chunk_bytes // (256 * 1024))
+            try:
+                async with session.post(
+                    url,
+                    data=self._build_multipart(envelope, parts),
+                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                ) as response:
+                    if chunk_count == 0 and response.status == 400:
+                        body = await response.text()
+                        debug_log(f"Worker - Master rejected compressed chunk: {body[:300]}")
+                        return False
+                    response.raise_for_status()
+            except Exception as e:
+                log(f"Worker - Failed to send {fmt} chunk to master: {e}")
+                debug_log(f"Worker - Full error details: URL={url}")
+                raise
+            sent_bytes += chunk_bytes
+            chunk_count += 1
+
+        log(
+            f"Worker - Sent {total} image(s) as {fmt} in {chunk_count} request(s): "
+            f"{sent_bytes / 1e6:.2f} MB (raw {raw_bytes / 1e6:.2f} MB, "
+            f"{transfer_codec.describe_ratio(sent_bytes, raw_bytes)} smaller) in {time.time() - started:.1f}s"
+        )
+        return True
+
+    async def _send_legacy_batch(self, image_batch, audio, multi_job_id, master_url, worker_id):
+        """Original transfer: one JSON request per frame with a base64 PNG."""
         encoded_audio = encode_audio_payload(audio)
         session = await get_client_session()
         url = f"{master_url}/distributed/job_complete"
@@ -319,12 +458,14 @@ class DistributedCollectorNode:
             return ensure_contiguous(fallback_images)
         return None
 
-    async def execute(self, images, audio, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False):
+    async def execute(self, images, audio, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False, transfer_format=transfer_codec.DEFAULT_TRANSFER_FORMAT, transfer_quality=transfer_codec.DEFAULT_TRANSFER_QUALITY):
         if is_worker:
             # Worker mode: send images and audio to master in a single batch
             image_count = 0 if images is None else images.shape[0]
             debug_log(f"Worker - Job {multi_job_id} complete. Sending {image_count} image(s) to master")
-            await self.send_batch_to_master(images, audio, multi_job_id, master_url, worker_id)
+            await self.send_batch_to_master(
+                images, audio, multi_job_id, master_url, worker_id, transfer_format, transfer_quality
+            )
             return (images, audio if audio is not None else self.EMPTY_AUDIO)
         else:
             delegate_mode = delegate_only or is_master_delegate_only()
