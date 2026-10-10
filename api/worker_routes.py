@@ -16,12 +16,14 @@ from ..utils.logging import debug_log, log
 from ..utils.network import (
     build_worker_url,
     get_client_session,
+    get_server_port,
     handle_api_error,
     normalize_host,
     probe_worker,
 )
 from ..utils.constants import CHUNK_SIZE
 from ..workers import get_worker_manager
+from ..workers.ports import allocate_worker_ports
 from .schemas import require_fields, validate_worker_id
 from ..workers.detection import (
     get_machine_id,
@@ -277,6 +279,13 @@ def _get_cuda_info():
 def _collect_network_info_sync():
     """Collect network/cuda info in a worker thread to avoid blocking route handlers."""
     cuda_device, cuda_device_count, physical_device_count = _get_cuda_info()
+    device_count = physical_device_count if physical_device_count > 0 else cuda_device_count
+    master_port = get_server_port()
+    config = load_config()
+    worker_ports = []
+    if not config.get("settings", {}).get("has_auto_populated_workers") and not config.get("workers"):
+        worker_count = device_count - (1 if cuda_device is not None and 0 <= cuda_device < device_count else 0)
+        worker_ports = allocate_worker_ports(master_port, config.get("workers", []), worker_count)
     hostname = socket.gethostname()
     all_ips = get_network_ips()
     recommended_ip = get_recommended_ip(all_ips)
@@ -285,7 +294,9 @@ def _collect_network_info_sync():
         "all_ips": all_ips,
         "recommended_ip": recommended_ip,
         "cuda_device": cuda_device,
-        "cuda_device_count": physical_device_count if physical_device_count > 0 else cuda_device_count,
+        "cuda_device_count": device_count,
+        "master_port": master_port,
+        "local_worker_ports": worker_ports,
     }
 
 
@@ -483,6 +494,8 @@ async def launch_worker_endpoint(request):
                 "message": f"Worker {worker['name']} launched",
                 "log_file": log_file
             })
+        except ValueError as e:
+            return await handle_api_error(request, f"Failed to launch worker: {str(e)}", 400)
         except Exception as e:
             return await handle_api_error(request, f"Failed to launch worker: {str(e)}", 500)
             

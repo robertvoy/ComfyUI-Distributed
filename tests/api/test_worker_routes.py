@@ -106,7 +106,7 @@ def _load_worker_routes_module():
     sys.modules[f"{package_name}.utils"] = utils_pkg
 
     workers_pkg = types.ModuleType(f"{package_name}.workers")
-    workers_pkg.__path__ = []
+    workers_pkg.__path__ = [str(module_path.parents[1] / "workers")]
     workers_pkg.get_worker_manager = lambda: _DummyWorkerManager()
     sys.modules[f"{package_name}.workers"] = workers_pkg
 
@@ -213,6 +213,7 @@ def _load_worker_routes_module():
         raise RuntimeError("not used in these tests")
 
     network_module.get_client_session = _get_client_session
+    network_module.get_server_port = lambda: 8189
     sys.modules[f"{package_name}.utils.network"] = network_module
 
     constants_module = types.ModuleType(f"{package_name}.utils.constants")
@@ -269,6 +270,38 @@ worker_routes = _load_worker_routes_module()
 
 
 class WorkerRoutesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_network_info_reports_actual_master_and_available_ports(self):
+        with patch.object(worker_routes, "_get_cuda_info", return_value=(0, 1, 4)), \
+             patch.object(worker_routes, "get_network_ips", return_value=["127.0.0.1"]), \
+             patch.object(worker_routes, "load_config", return_value={"workers": []}), \
+             patch.object(worker_routes, "get_server_port", return_value=8189), \
+             patch.object(worker_routes, "allocate_worker_ports", return_value=[8191, 8192, 8193]) as allocate:
+            response = await worker_routes.get_network_info_endpoint(_FakeRequest())
+        self.assertEqual(response.payload["master_port"], 8189)
+        self.assertEqual(response.payload["local_worker_ports"], [8191, 8192, 8193])
+        self.assertEqual(response.payload["cuda_device_count"], 4)
+        allocate.assert_called_once_with(8189, [], 3)
+
+    async def test_network_info_does_not_reallocate_existing_configuration(self):
+        with patch.object(worker_routes, "_get_cuda_info", return_value=(0, 4, 4)), \
+             patch.object(worker_routes, "get_network_ips", return_value=[]), \
+             patch.object(worker_routes, "load_config", return_value={"workers": [{"id": "existing", "port": 8189}]}), \
+             patch.object(worker_routes, "allocate_worker_ports") as allocate:
+            response = await worker_routes.get_network_info_endpoint(_FakeRequest())
+        self.assertEqual(response.payload["local_worker_ports"], [])
+        allocate.assert_not_called()
+
+    async def test_launch_conflict_is_a_clear_client_error(self):
+        manager = _DummyWorkerManager()
+        config = {"workers": [{"id": "worker-a", "name": "Worker A", "port": 8189}]}
+        with patch.object(worker_routes, "get_worker_manager", return_value=manager), \
+             patch.object(worker_routes, "load_config", return_value=config), \
+             patch.object(manager, "launch_worker", side_effect=ValueError("Worker port 8189 conflicts with the master port 8189")):
+            response = await worker_routes.launch_worker_endpoint(_FakeRequest({"worker_id": "worker-a"}))
+        self.assertEqual(response.status, 400)
+        self.assertIn("master port 8189", response.payload["message"])
+        self.assertEqual(manager.processes, {})
+
     async def test_launch_worker_valid_id_returns_200(self):
         manager = _DummyWorkerManager()
         config = {"workers": [{"id": "worker-a", "name": "Worker A", "port": 8188}]}

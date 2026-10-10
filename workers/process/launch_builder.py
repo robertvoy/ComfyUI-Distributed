@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import os
 import shlex
 import shutil
@@ -87,6 +88,51 @@ class LaunchCommandBuilder:
             return wt_path
         return None
 
+    @staticmethod
+    def _arg_value(cmd, flag):
+        """Return the last value, matching argparse's override semantics."""
+        value = None
+        for index, arg in enumerate(cmd):
+            if arg == flag and index + 1 < len(cmd):
+                value = cmd[index + 1]
+            elif arg.startswith(flag + "="):
+                value = arg.split("=", 1)[1]
+        return value
+
+    def _add_worker_database(self, cmd, worker_config, comfy_root):
+        args = self._get_runtime_args()
+        # The parsed namespace advertises support without launching ComfyUI
+        # (or importing another checkout's argument parser).
+        if args is None or not hasattr(args, "database_url"):
+            return
+        if any(arg.split("=", 1)[0] in ("--database-url", "--disable-assets") for arg in cmd):
+            return
+
+        user_directory = self._arg_value(cmd, "--user-directory")
+        base_directory = self._arg_value(cmd, "--base-directory")
+        if not user_directory:
+            user_directory = os.path.join(base_directory or comfy_root, "user")
+        if not os.path.isabs(user_directory):
+            # Popen uses comfy_root as cwd, which can differ from the master's.
+            user_directory = os.path.join(comfy_root, user_directory)
+        database_directory = os.path.abspath(os.path.join(user_directory, "distributed", "workers"))
+        # Hash the immutable ID: names/GPU/ports may change, and IDs must not
+        # become filesystem paths or collide after filename sanitization.
+        worker_id = str(worker_config["id"])
+        filename = hashlib.sha256(worker_id.encode("utf-8")).hexdigest() + ".db"
+        database_path = os.path.join(database_directory, filename).replace(os.sep, "/")
+        # Use the same URL codec as ComfyUI; raw '?' and '%xx' can otherwise
+        # truncate/decode the path and make distinct workers share a database.
+        from sqlalchemy.engine import URL, make_url
+        database_url = URL.create("sqlite", database=database_path).render_as_string()
+        if make_url(database_url).database != database_path:
+            raise ValueError(
+                "Installed SQLAlchemy cannot safely encode the worker database path; "
+                "use a user directory without '?' or an explicit --database-url with a safe path"
+            )
+        os.makedirs(database_directory, exist_ok=True)
+        cmd.extend(["--database-url", database_url])
+
     def build_launch_command(self, worker_config, comfy_root):
         """Build the command to launch a worker."""
         main_py = os.path.join(comfy_root, "main.py")
@@ -141,4 +187,7 @@ class LaunchCommandBuilder:
                         raise ValueError(f"Invalid characters in extra_args: {arg}. Forbidden: {forbidden}")
                 cmd.extend(extra_args_list)
 
+        if int(self._arg_value(cmd, "--port")) != int(worker_config["port"]):
+            raise ValueError("extra_args must not override the configured worker port; set the port in the UI/config instead")
+        self._add_worker_database(cmd, worker_config, comfy_root)
         return cmd

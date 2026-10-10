@@ -42,6 +42,15 @@ export async function detectMasterIP(extension) {
             if (shouldAutoPopulate) {
                 extension.log(`Auto-populating workers based on ${extension.cudaDeviceCount} CUDA devices (excluding master on CUDA ${extension.masterCudaDevice})`, "info");
 
+                const workerCount = extension.cudaDeviceCount - (
+                    Number.isInteger(extension.masterCudaDevice) &&
+                    extension.masterCudaDevice >= 0 &&
+                    extension.masterCudaDevice < extension.cudaDeviceCount ? 1 : 0
+                );
+                const workerPorts = data.local_worker_ports;
+                if (!Array.isArray(workerPorts) || workerPorts.length !== workerCount) {
+                    throw new Error("Could not allocate enough available local worker ports; check the server log");
+                }
                 const newWorkers = [];
                 let workerNum = 1;
                 let portOffset = 0;
@@ -56,7 +65,7 @@ export async function detectMasterIP(extension) {
                         id: generateUUID(),
                         name: `Worker ${workerNum}`,
                         host: isRunpod ? null : "localhost",
-                        port: 8189 + portOffset,
+                        port: workerPorts[portOffset],
                         cuda_device: i,
                         enabled: true,
                         extra_args: isRunpod ? "--listen" : "",
