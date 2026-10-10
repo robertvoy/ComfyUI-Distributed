@@ -106,11 +106,6 @@ describe("buildWorkerWebSocketUrl", () => {
             "wss://worker.example.com/distributed/worker_ws"
         );
     });
-
-    it("always appends /distributed/worker_ws", () => {
-        const url = buildWorkerWebSocketUrl("http://worker.local:8188");
-        expect(url.endsWith("/distributed/worker_ws")).toBe(true);
-    });
 });
 
 

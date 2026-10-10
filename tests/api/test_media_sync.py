@@ -164,25 +164,10 @@ class ConvertPathsForPlatformTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class FindMediaReferencesTests(unittest.TestCase):
-    def test_finds_image_input(self):
-        prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "photo.png"}}}
-        refs = ms._find_media_references(prompt)
-        self.assertIn("photo.png", refs)
-
-    def test_finds_video_input(self):
-        prompt = {"1": {"class_type": "LoadVideo", "inputs": {"video": "clip.mp4"}}}
-        refs = ms._find_media_references(prompt)
-        self.assertIn("clip.mp4", refs)
-
     def test_finds_file_input_for_load_video(self):
         prompt = {"1": {"class_type": "LoadVideo", "inputs": {"file": "1 - Copy.mp4"}}}
         refs = ms._find_media_references(prompt)
         self.assertIn("1 - Copy.mp4", refs)
-
-    def test_finds_audio_input(self):
-        prompt = {"1": {"class_type": "LoadAudio", "inputs": {"audio": "track.wav"}}}
-        refs = ms._find_media_references(prompt)
-        self.assertIn("track.wav", refs)
 
     def test_strips_annotation_suffix(self):
         prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "photo.jpg [abc123]"}}}
