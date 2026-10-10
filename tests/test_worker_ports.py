@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import socket
 import unittest
 from pathlib import Path
@@ -61,6 +62,46 @@ class WorkerPortTests(unittest.TestCase):
             self.assertFalse(self.ports.is_port_available(port))
             with self.assertRaisesRegex(ValueError, "already in use"):
                 self.ports.validate_worker_port({"id": "manual", "port": port}, 8189, [])
+
+    @unittest.skipIf(os.name == "nt", "asyncio does not reuse addresses on Windows")
+    def test_recently_closed_connection_does_not_block_worker_restart(self):
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+                accepted, _ = listener.accept()
+                with accepted:
+                    accepted.settimeout(2)
+                    accepted.shutdown(socket.SHUT_WR)
+                    self.assertEqual(client.recv(1), b"")
+                    client.shutdown(socket.SHUT_WR)
+                    self.assertEqual(accepted.recv(1), b"")
+        self.assertTrue(self.ports.is_port_available(port))
+        self.ports.validate_worker_port({"id": "restart", "port": port}, 1, [])
+        with socket.socket() as restarted:
+            restarted.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            restarted.bind(("127.0.0.1", port))
+            restarted.listen(1)
+
+    def test_active_listener_with_reuseaddr_is_still_a_conflict(self):
+        with socket.socket() as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            self.assertFalse(self.ports.is_port_available(listener.getsockname()[1]))
+
+    @unittest.skipUnless(socket.has_ipv6, "IPv6 unavailable")
+    def test_ipv6_only_listener_is_still_a_conflict(self):
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            try:
+                listener.bind(("::1", 0))
+            except OSError as exc:
+                self.skipTest(f"IPv6 loopback unavailable: {exc}")
+            listener.listen(1)
+            self.assertFalse(self.ports.is_port_available(listener.getsockname()[1]))
 
     def test_invalid_ports_fail_clearly(self):
         for port in [0, 65536, "not-a-port", None, True, 8190.5]:

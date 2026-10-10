@@ -31,7 +31,16 @@ class ProcessLifecycle:
         _ = show_window  # Kept for API compatibility.
         comfy_root = self._manager.find_comfy_root()
         config = load_config()
-        validate_worker_port(worker_config, get_server_port(), config.get("workers", []))
+        try:
+            master_port = get_server_port()
+        except AttributeError:
+            master_port = None
+        if master_port is None:
+            # The auto-launch timer can fire during custom-node imports, before
+            # PromptServer assigns its port. Still reserve the configured port.
+            from comfy.cli_args import args
+            master_port = args.port
+        validate_worker_port(worker_config, master_port, config.get("workers", []))
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(worker_config.get("cuda_device", 0))

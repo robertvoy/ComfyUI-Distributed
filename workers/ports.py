@@ -1,5 +1,6 @@
 """Host-local worker port selection and launch preflight (no ComfyUI imports)."""
 import errno
+import os
 import socket
 from urllib.parse import urlsplit
 
@@ -42,14 +43,22 @@ def _reserved_ports(workers, exclude_id=None):
 
 
 def is_port_available(port):
-    """Probe bindability without SO_REUSEADDR; include IPv6-only listeners."""
+    """Match asyncio's address reuse while rejecting active IPv4/IPv6 listeners."""
     addresses = [(socket.AF_INET, "0.0.0.0")]
     if socket.has_ipv6:
         addresses.append((socket.AF_INET6, "::"))
     for family, address in addresses:
         try:
             with socket.socket(family, socket.SOCK_STREAM) as probe:
+                if os.name != "nt":
+                    # Like asyncio, allow a restart while old connections are
+                    # in TIME_WAIT. Do not enable SO_REUSEPORT.
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                elif hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    # Windows SO_REUSEADDR can steal an active listener's port.
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
                 probe.bind((address, port))
+                probe.listen(1)
         except OSError as exc:
             if family == socket.AF_INET6 and exc.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
                 continue

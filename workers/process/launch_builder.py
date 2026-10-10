@@ -112,14 +112,26 @@ class LaunchCommandBuilder:
         base_directory = self._arg_value(cmd, "--base-directory")
         if not user_directory:
             user_directory = os.path.join(base_directory or comfy_root, "user")
+        if not os.path.isabs(user_directory):
+            # Popen uses comfy_root as cwd, which can differ from the master's.
+            user_directory = os.path.join(comfy_root, user_directory)
         database_directory = os.path.abspath(os.path.join(user_directory, "distributed", "workers"))
-        os.makedirs(database_directory, exist_ok=True)
         # Hash the immutable ID: names/GPU/ports may change, and IDs must not
         # become filesystem paths or collide after filename sanitization.
         worker_id = str(worker_config["id"])
         filename = hashlib.sha256(worker_id.encode("utf-8")).hexdigest() + ".db"
         database_path = os.path.join(database_directory, filename).replace(os.sep, "/")
-        cmd.extend(["--database-url", "sqlite:///" + database_path])
+        # Use the same URL codec as ComfyUI; raw '?' and '%xx' can otherwise
+        # truncate/decode the path and make distinct workers share a database.
+        from sqlalchemy.engine import URL, make_url
+        database_url = URL.create("sqlite", database=database_path).render_as_string()
+        if make_url(database_url).database != database_path:
+            raise ValueError(
+                "Installed SQLAlchemy cannot safely encode the worker database path; "
+                "use a user directory without '?' or an explicit --database-url with a safe path"
+            )
+        os.makedirs(database_directory, exist_ok=True)
+        cmd.extend(["--database-url", database_url])
 
     def build_launch_command(self, worker_config, comfy_root):
         """Build the command to launch a worker."""

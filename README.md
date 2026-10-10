@@ -44,10 +44,6 @@ ComfyUI Distributed supports three types of workers:
 - **Remote Workers** - GPUs on other computers in your network
 - **Cloud Workers** - GPUs hosted on a cloud service like Runpod, accessible via secure tunnels
 
-Local auto-setup chooses available ports above the actual master port, skipping ports already in use. Existing worker ports are never silently reassigned: a launch conflict reports which port needs changing.
-
-On ComfyUI versions that support `--database-url`, each managed local worker automatically uses its own asset database under `<effective user directory>/distributed/workers/`. The filename is stable for the worker ID, even after renaming it or changing its GPU/port. Models and custom nodes remain shared. Explicit worker `--database-url` and `--disable-assets` arguments are preserved; older ComfyUI versions receive no automatic database flag. Set the worker port in the UI/config, rather than overriding it with `--port` in extra arguments.
-
 > For detailed setup instructions, see the [setup guide](/docs/worker-setup-guides.md)
 
 ---
