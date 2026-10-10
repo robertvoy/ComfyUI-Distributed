@@ -1,29 +1,22 @@
-# Import everything needed from the main module
-from .distributed import (
-    NODE_CLASS_MAPPINGS as DISTRIBUTED_CLASS_MAPPINGS, 
-    NODE_DISPLAY_NAME_MAPPINGS as DISTRIBUTED_DISPLAY_NAME_MAPPINGS
-)
+"""ComfyUI-Distributed's native V3 extension entrypoint."""
+from comfy_api.v0_0_2 import ComfyExtension, io
 
-# Import utilities
-from .utils.config import ensure_config_exists, CONFIG_FILE
-from .utils.logging import debug_log
+from .nodes.v3 import NODES
+from .runtime.bootstrap import initialize
 
-# Import distributed upscale nodes
-from .nodes.distributed_upscale import (
-    NODE_CLASS_MAPPINGS as UPSCALE_CLASS_MAPPINGS,
-    NODE_DISPLAY_NAME_MAPPINGS as UPSCALE_DISPLAY_NAME_MAPPINGS
-)
+WEB_DIRECTORY = './web'
 
-WEB_DIRECTORY = "./web"
 
-ensure_config_exists()
+class DistributedExtension(ComfyExtension):
+    async def on_load(self) -> None:
+        initialize()
 
-# Merge node mappings
-NODE_CLASS_MAPPINGS = {**DISTRIBUTED_CLASS_MAPPINGS, **UPSCALE_CLASS_MAPPINGS}
-NODE_DISPLAY_NAME_MAPPINGS = {**DISTRIBUTED_DISPLAY_NAME_MAPPINGS, **UPSCALE_DISPLAY_NAME_MAPPINGS}
+    async def get_node_list(self) -> list[type[io.ComfyNode]]:
+        return list(NODES)
 
-__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
 
-debug_log("Loaded Distributed nodes.")
-debug_log(f"Config file: {CONFIG_FILE}")
-debug_log(f"Available nodes: {list(NODE_CLASS_MAPPINGS.keys())}")
+async def comfy_entrypoint() -> DistributedExtension:
+    return DistributedExtension()
+
+
+__all__ = ['comfy_entrypoint', 'WEB_DIRECTORY']

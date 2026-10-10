@@ -268,12 +268,3 @@ class UltimateSDUpscaleDistributed(
 
 # Ensure initialization before registering routes
 ensure_tile_jobs_initialized()
-
-# Node registration
-NODE_CLASS_MAPPINGS = {
-    "UltimateSDUpscaleDistributed": UltimateSDUpscaleDistributed,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "UltimateSDUpscaleDistributed": "Ultimate SD Upscale Distributed (No Upscale)",
-}
