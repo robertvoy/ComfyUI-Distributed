@@ -302,8 +302,8 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         self.assertNotIn("1", result)
         self.assertNotIn("2", result)
 
-    def test_removes_dangling_upstream_refs(self):
-        """Collector must not retain dangling refs to pruned upstream nodes."""
+    def test_replaces_dangling_upstream_ref_with_one_empty_image_placeholder(self):
+        """Collector must point to exactly one valid placeholder after pruning."""
         prompt = _delegate_prompt()
         result = pt.prepare_delegate_master_prompt(prompt, ["3"])
         collector_inputs = result["3"].get("inputs", {})
@@ -314,10 +314,6 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         self.assertNotEqual(source_id, "2")
         self.assertIn(source_id, result)
         self.assertEqual(result[source_id].get("class_type"), "DistributedEmptyImage")
-
-    def test_injects_empty_image_placeholder(self):
-        prompt = _delegate_prompt()
-        result = pt.prepare_delegate_master_prompt(prompt, ["3"])
         empty_nodes = [(nid, n) for nid, n in result.items() if n.get("class_type") == "DistributedEmptyImage"]
         self.assertEqual(len(empty_nodes), 1)
         placeholder_id = empty_nodes[0][0]
@@ -383,13 +379,6 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         self.assertIn("15", result)
         self.assertEqual(result["15"], prompt["15"])
         self.assertEqual(result["9"]["inputs"]["filename_prefix"], ["15", 0])
-
-    def test_does_not_preserve_non_primitive_upstream_for_collector(self):
-        prompt = _delegate_prompt()
-        result = pt.prepare_delegate_master_prompt(prompt, ["3"])
-
-        self.assertNotIn("2", result)
-        self.assertNotEqual(result["3"]["inputs"]["images"], ["2", 0])
 
     def test_preserves_load_image_for_switch_alternate_required_input(self):
         """Delegate-only master keeps LoadImage inputs needed by switches."""
