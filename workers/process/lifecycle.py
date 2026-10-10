@@ -7,7 +7,9 @@ import time
 from ...utils.config import load_config, save_config
 from ...utils.constants import PROCESS_TERMINATION_TIMEOUT, PROCESS_WAIT_TIMEOUT, WORKER_CHECK_INTERVAL
 from ...utils.logging import debug_log, log
+from ...utils.network import get_server_port
 from ...utils.process import get_python_executable, is_process_alive, terminate_process
+from ..ports import validate_worker_port
 
 try:
     import psutil
@@ -28,6 +30,8 @@ class ProcessLifecycle:
         """Launch a worker process with logging."""
         _ = show_window  # Kept for API compatibility.
         comfy_root = self._manager.find_comfy_root()
+        config = load_config()
+        validate_worker_port(worker_config, get_server_port(), config.get("workers", []))
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(worker_config.get("cuda_device", 0))
