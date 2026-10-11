@@ -38,17 +38,10 @@ def _load_config_routes_module():
     sys.modules[f"{package_name}.api"] = api_pkg
 
     utils_pkg = types.ModuleType(f"{package_name}.utils")
-    utils_pkg.__path__ = []
+    utils_pkg.__path__ = [str(module_path.parents[1] / "utils")]
     sys.modules[f"{package_name}.utils"] = utils_pkg
 
-    created_aiohttp_stub = False
-    if "aiohttp" not in sys.modules:
-        created_aiohttp_stub = True
-        aiohttp_module = types.ModuleType("aiohttp")
-        aiohttp_module.web = types.SimpleNamespace(
-            json_response=lambda payload, status=200: _FakeResponse(payload, status=status)
-        )
-        sys.modules["aiohttp"] = aiohttp_module
+    import aiohttp  # Load the real dependency; isolate the fake response at the tested module.
 
     class _Routes:
         def get(self, _path):
@@ -96,8 +89,14 @@ def _load_config_routes_module():
     assert spec is not None and spec.loader is not None
     spec.loader.exec_module(module)
 
-    if created_aiohttp_stub:
-        sys.modules.pop("aiohttp", None)
+    class _EmptySecretStore:
+        def has(self, _worker_id):
+            return False
+
+    module.web = types.SimpleNamespace(
+        json_response=lambda payload, status=200: _FakeResponse(payload, status=status)
+    )
+    module._serverless_secret_store = lambda: _EmptySecretStore()
 
     return module
 

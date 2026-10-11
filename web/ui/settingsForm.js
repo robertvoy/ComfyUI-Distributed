@@ -1,5 +1,5 @@
 import { BUTTON_STYLES } from '../constants.js';
-import { cancelWorkerSettings, deleteWorker, isRemoteWorker, saveWorkerSettings } from '../workerSettings.js';
+import { cancelWorkerSettings, deleteWorker, isRemoteWorker, saveWorkerSettings, testServerlessWorker } from '../workerSettings.js';
 
 export function createWorkerSettingsForm(ui, extension, worker) {
     const form = document.createElement("div");
@@ -33,9 +33,14 @@ export function createWorkerSettingsForm(ui, extension, worker) {
     cloudOption.value = "cloud";
     cloudOption.textContent = "Cloud";
 
+    const serverlessOption = document.createElement("option");
+    serverlessOption.value = "serverless";
+    serverlessOption.textContent = "Serverless (Runpod)";
+
     typeSelect.appendChild(localOption);
     typeSelect.appendChild(remoteOption);
     typeSelect.appendChild(cloudOption);
+    typeSelect.appendChild(serverlessOption);
 
     const runpodText = document.createElement("a");
     runpodText.id = `runpod-text-${worker.id}`;
@@ -54,18 +59,32 @@ export function createWorkerSettingsForm(ui, extension, worker) {
             const cudaGroup = document.getElementById(`cuda-group-${worker.id}`);
             const argsGroup = document.getElementById(`args-group-${worker.id}`);
             const runpodTextElem = document.getElementById(`runpod-text-${worker.id}`);
+            const serverlessGroups = [
+                `endpoint-id-group-${worker.id}`,
+                `api-key-group-${worker.id}`,
+                `clear-api-key-group-${worker.id}`,
+                `jobs-per-run-group-${worker.id}`,
+                `concurrency-group-${worker.id}`,
+                `timeout-seconds-group-${worker.id}`,
+                `serverless-test-group-${worker.id}`,
+                `serverless-help-${worker.id}`,
+            ].map((id) => document.getElementById(id));
 
-            if (!hostGroup || !portGroup || !cudaGroup || !argsGroup || !runpodTextElem || !hostInput || !portInput) {
+            if (!hostGroup || !portGroup || !cudaGroup || !argsGroup || !runpodTextElem || !hostInput || !portInput || serverlessGroups.some((group) => !group)) {
                 return;
             }
 
+            const hideServerless = () => serverlessGroups.forEach((group) => { group.style.display = "none"; });
+
             if (workerType === "local") {
+                hideServerless();
                 hostGroup.style.display = "none";
                 portGroup.style.display = "flex";
                 cudaGroup.style.display = "flex";
                 argsGroup.style.display = "flex";
                 runpodTextElem.style.display = "none";
             } else if (workerType === "remote") {
+                hideServerless();
                 hostGroup.style.display = "flex";
                 portGroup.style.display = "flex";
                 cudaGroup.style.display = "none";
@@ -76,6 +95,7 @@ export function createWorkerSettingsForm(ui, extension, worker) {
                     hostInput.value = "";
                 }
             } else if (workerType === "cloud") {
+                hideServerless();
                 hostGroup.style.display = "flex";
                 portGroup.style.display = "flex";
                 cudaGroup.style.display = "none";
@@ -86,6 +106,13 @@ export function createWorkerSettingsForm(ui, extension, worker) {
                 if (hostInput.value === "localhost" || hostInput.value === "127.0.0.1") {
                     hostInput.value = "";
                 }
+            } else if (workerType === "serverless") {
+                hostGroup.style.display = "none";
+                portGroup.style.display = "none";
+                cudaGroup.style.display = "none";
+                argsGroup.style.display = "none";
+                runpodTextElem.style.display = "none";
+                serverlessGroups.forEach((group) => { group.style.display = "flex"; });
             }
         };
     };
@@ -114,6 +141,77 @@ export function createWorkerSettingsForm(ui, extension, worker) {
     argsGroup.group.style.display = (isRemoteWorker(extension, worker) || worker.type === "cloud") ? "none" : "flex";
     form.appendChild(argsGroup.group);
 
+    const serverlessHelp = document.createElement("small");
+    serverlessHelp.id = `serverless-help-${worker.id}`;
+    serverlessHelp.style.display = "none";
+    serverlessHelp.textContent = "Preview: image Collectors only. The endpoint must provide the generic workflow + images handler and required models/nodes. Enabling it permits paid Runpod jobs.";
+    form.appendChild(serverlessHelp);
+
+    const endpointGroup = ui.createFormGroup("Endpoint ID:", worker.endpoint_id || "", `endpoint-id-${worker.id}`, "text", "Runpod endpoint ID");
+    endpointGroup.group.id = `endpoint-id-group-${worker.id}`;
+    endpointGroup.group.style.display = "none";
+    form.appendChild(endpointGroup.group);
+
+    const apiKeyGroup = ui.createFormGroup("Runpod API Key (write-only):", "", `api-key-${worker.id}`, "password", worker.api_key_configured ? "Leave blank to keep saved API key" : "Runpod API key");
+    apiKeyGroup.group.id = `api-key-group-${worker.id}`;
+    apiKeyGroup.input.autocomplete = "new-password";
+    apiKeyGroup.input.spellcheck = false;
+    apiKeyGroup.group.style.display = "none";
+    form.appendChild(apiKeyGroup.group);
+
+    const clearApiKeyGroup = document.createElement("div");
+    clearApiKeyGroup.id = `clear-api-key-group-${worker.id}`;
+    clearApiKeyGroup.style.cssText = "display: none; align-items: center; gap: 8px;";
+    const clearApiKeyInput = document.createElement("input");
+    clearApiKeyInput.type = "checkbox";
+    clearApiKeyInput.id = `clear-api-key-${worker.id}`;
+    const clearApiKeyLabel = document.createElement("label");
+    clearApiKeyLabel.htmlFor = clearApiKeyInput.id;
+    clearApiKeyLabel.textContent = "Clear saved API key (disable pool first)";
+    clearApiKeyGroup.appendChild(clearApiKeyInput);
+    clearApiKeyGroup.appendChild(clearApiKeyLabel);
+    clearApiKeyInput.onchange = () => {
+        if (clearApiKeyInput.checked) apiKeyGroup.input.value = "";
+        apiKeyGroup.input.disabled = clearApiKeyInput.checked;
+    };
+    form.appendChild(clearApiKeyGroup);
+
+    const jobsPerRunGroup = ui.createFormGroup("Jobs per run:", worker.jobs_per_run ?? 1, `jobs-per-run-${worker.id}`, "number");
+    jobsPerRunGroup.group.id = `jobs-per-run-group-${worker.id}`;
+    jobsPerRunGroup.input.min = "1";
+    jobsPerRunGroup.input.max = "16";
+    jobsPerRunGroup.input.step = "1";
+    jobsPerRunGroup.input.title = "Maximum jobs submitted in one run";
+    jobsPerRunGroup.group.style.display = "none";
+    form.appendChild(jobsPerRunGroup.group);
+
+    const concurrencyGroup = ui.createFormGroup("Concurrent jobs (slots):", worker.concurrency ?? 1, `concurrency-${worker.id}`, "number");
+    concurrencyGroup.group.id = `concurrency-group-${worker.id}`;
+    concurrencyGroup.input.min = "1";
+    concurrencyGroup.input.max = "16";
+    concurrencyGroup.input.step = "1";
+    concurrencyGroup.input.title = "Maximum concurrent jobs per serverless worker";
+    concurrencyGroup.group.style.display = "none";
+    form.appendChild(concurrencyGroup.group);
+
+    const timeoutGroup = ui.createFormGroup("Timeout (seconds):", worker.timeout_seconds ?? 1800, `timeout-seconds-${worker.id}`, "number");
+    timeoutGroup.group.id = `timeout-seconds-group-${worker.id}`;
+    timeoutGroup.input.min = "30";
+    timeoutGroup.input.max = "86400";
+    timeoutGroup.input.step = "1";
+    timeoutGroup.group.style.display = "none";
+    form.appendChild(timeoutGroup.group);
+
+    const testServerlessButton = ui.createButton("Test Saved Endpoint", () => testServerlessWorker(extension, worker.id));
+    testServerlessButton.id = `test-serverless-${worker.id}`;
+    testServerlessButton.title = "Test the saved Runpod endpoint without submitting inference";
+    testServerlessButton.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl;
+    const testServerlessGroup = document.createElement("div");
+    testServerlessGroup.id = `serverless-test-group-${worker.id}`;
+    testServerlessGroup.style.cssText = "display: none;";
+    testServerlessGroup.appendChild(testServerlessButton);
+    form.appendChild(testServerlessGroup);
+
     const saveBtn = ui.createButton("Save", () => saveWorkerSettings(extension, worker.id), "background-color: #4a7c4a;");
     saveBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.success;
 
@@ -128,7 +226,9 @@ export function createWorkerSettingsForm(ui, extension, worker) {
 
     typeSelect.onchange = createOnChangeHandler();
 
-    if (worker.type === "cloud") {
+    if (worker.type === "serverless") {
+        typeSelect.value = "serverless";
+    } else if (worker.type === "cloud") {
         typeSelect.value = "cloud";
         runpodText.style.display = "block";
     } else if (isRemoteWorker(extension, worker)) {

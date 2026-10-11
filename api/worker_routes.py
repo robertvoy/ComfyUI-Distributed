@@ -460,6 +460,9 @@ async def launch_worker_endpoint(request):
         if not worker:
             return await handle_api_error(request, f"Worker {worker_id} not found", 404)
         
+        if worker.get("type") == "serverless":
+            return await handle_api_error(request, "Serverless pools are managed by Runpod, not local processes", 400)
+
         # Ensure consistent string ID
         worker_id_str = worker_id
         
@@ -554,6 +557,9 @@ async def get_local_worker_status_endpoint(request):
         worker_statuses = {}
         
         for worker in config.get("workers", []):
+            # Serverless pools have no host, port, or local process.
+            if worker.get("type") == "serverless":
+                continue
             # Only check local workers
             host = normalize_host(worker.get("host")) or ""
             if not host or host in ["localhost", "127.0.0.1"]:

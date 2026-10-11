@@ -2,6 +2,7 @@
 Configuration management for ComfyUI-Distributed.
 """
 import asyncio
+import copy
 import os
 import json
 from contextlib import asynccontextmanager
@@ -14,6 +15,57 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "gpu_conf
 _config_cache = None
 _config_mtime = 0.0
 _config_lock = asyncio.Lock()
+
+_SERVERLESS_OBSOLETE_WORKER_FIELDS = {"host", "port", "listen_port", "cuda_device", "extra_args"}
+
+
+def _contains_serverless_secret(value):
+    if isinstance(value, dict):
+        return any(
+            (isinstance(key, str) and _is_secret_field_name(key))
+            or _contains_serverless_secret(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_serverless_secret(item) for item in value)
+    return False
+
+
+def _is_secret_field_name(key):
+    normalized = "".join(character for character in key.casefold() if character.isalnum())
+    return normalized in {"apikey", "clearapikey"} or "credential" in normalized
+
+
+def _normalize_serverless_workers(config):
+    """Remove obsolete local-worker fields without adding local defaults."""
+    if not isinstance(config, dict):
+        return config
+    workers = config.get("workers")
+    if isinstance(workers, list):
+        for worker in workers:
+            if isinstance(worker, dict) and worker.get("type") == "serverless":
+                for field in _SERVERLESS_OBSOLETE_WORKER_FIELDS:
+                    worker.pop(field, None)
+    return config
+
+
+def _validated_config_for_save(config):
+    """Return a safe normalized copy ready for gpu_config.json."""
+    if _contains_serverless_secret(config):
+        raise ValueError("API keys must be stored outside the config file")
+    saved = _normalize_serverless_workers(copy.deepcopy(config))
+    workers = saved.get("workers") if isinstance(saved, dict) else None
+    if isinstance(workers, list) and any(
+        isinstance(worker, dict) and worker.get("type") == "serverless" for worker in workers
+    ):
+        from .serverless_config import validate_serverless_worker
+        for index, worker in enumerate(workers):
+            if isinstance(worker, dict) and worker.get("type") == "serverless":
+                saved_worker = validate_serverless_worker(worker)
+                for field in _SERVERLESS_OBSOLETE_WORKER_FIELDS:
+                    saved_worker.pop(field, None)
+                workers[index] = saved_worker
+    return saved
 
 
 def _config_path():
@@ -62,7 +114,7 @@ def _merge_with_defaults(data, defaults):
         if key not in merged:
             merged[key] = value
 
-    return merged
+    return _normalize_serverless_workers(merged)
 
 
 def invalidate_config_cache():
@@ -97,11 +149,12 @@ def load_config():
     return _config_cache
 
 def save_config(config):
-    """Saves the configuration to file."""
+    """Saves normalized configuration without allowing API keys in the config file."""
     tmp_path = f"{_config_path()}.tmp"
     try:
+        saved_config = _validated_config_for_save(config)
         with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2)
+            json.dump(saved_config, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, _config_path())
@@ -121,12 +174,21 @@ async def config_transaction():
     """Acquire config lock, yield loaded config, and save if changed."""
     async with _config_lock:
         config = load_config()
+        original_config = copy.deepcopy(config)
         original_snapshot = json.dumps(config, sort_keys=True)
-        yield config
+        try:
+            yield config
+        except BaseException:
+            if isinstance(config, dict):
+                config.clear()
+                config.update(original_config)
+            raise
         updated_snapshot = json.dumps(config, sort_keys=True)
-        if updated_snapshot != original_snapshot:
-            if not save_config(config):
-                raise RuntimeError("Failed to save config")
+        if updated_snapshot != original_snapshot and not save_config(config):
+            if isinstance(config, dict):
+                config.clear()
+                config.update(original_config)
+            raise RuntimeError("Failed to save config")
 
 def ensure_config_exists():
     """Creates default config file if it doesn't exist. Used by __init__.py"""

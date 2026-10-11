@@ -74,6 +74,14 @@ def _resolve_enabled_workers(config, requested_ids=None):
         elif not worker.get("enabled", False):
             continue
 
+        if worker.get("type") == "serverless":
+            from ..utils.serverless_config import validate_serverless_worker
+            pool = validate_serverless_worker(worker)
+            for slot in range(pool["jobs_per_run"]):
+                workers.append(dict(pool, pool_id=worker_id, id=f"serverless:{worker_id}:{slot + 1}",
+                                    name=f"{pool.get('name', worker_id)} / job {slot + 1}"))
+            continue
+
         raw_port = worker.get("port", worker.get("listen_port", 8188))
         try:
             port = int(raw_port or 8188)
@@ -154,6 +162,17 @@ async def _prepare_worker_payload(
     """Prepare one worker prompt payload with bounded concurrency and media-sync timeout."""
     async with worker_prep_semaphore:
         worker_prompt = prompt_index.copy_prompt()
+        if worker.get("type") == "serverless":
+            from .orchestration.serverless_prompt import compile_serverless_prompt
+            from .orchestration.serverless_media import prepare_images
+            worker_prompt = apply_participant_overrides(
+                prune_prompt_for_worker(worker_prompt), worker["id"], enabled_ids,
+                job_id_map, "", delegate_master, prompt_index,
+            )
+            workflow, manifest = compile_serverless_prompt(worker_prompt)
+            images = await prepare_images(workflow)
+            return worker, {"worker": worker, "workflow": workflow, "manifest": manifest, "images": images}
+
         worker_master_url = build_master_callback_url(
             worker,
             config=config,
@@ -330,9 +349,6 @@ async def orchestrate_distributed_execution(
             queue_result.get("node_errors", {}),
         )
 
-    for job_id in job_id_map.values():
-        await _ensure_distributed_queue(job_id)
-
     master_prompt = prompt_index.copy_prompt()
     master_prompt = apply_participant_overrides(
         master_prompt,
@@ -387,7 +403,19 @@ async def orchestrate_distributed_execution(
             ]
         )
 
-    if worker_payloads:
+    serverless_jobs = [payload for worker, payload in worker_payloads if worker.get("type") == "serverless"]
+    regular_payloads = [(worker, payload) for worker, payload in worker_payloads if worker.get("type") != "serverless"]
+    manager = None
+    if serverless_jobs:
+        from .orchestration.serverless_runtime import get_manager
+        manager = get_manager()
+        manager.ensure_capacity(len(serverless_jobs))
+
+    # Do not leave collector queues behind when offline compilation/media validation fails.
+    for job_id in job_id_map.values():
+        await _ensure_distributed_queue(job_id)
+
+    if regular_payloads:
         await asyncio.gather(
             *[
                 dispatch_worker_prompt(
@@ -398,17 +426,38 @@ async def orchestrate_distributed_execution(
                     use_websocket=use_websocket,
                     trace_execution_id=execution_trace_id,
                 )
-                for worker, wprompt in worker_payloads
+                for worker, wprompt in regular_payloads
             ]
         )
 
-    queue_result = await queue_prompt_payload(
-        master_prompt,
-        workflow_meta,
-        client_id,
-        include_queue_metadata=True,
-    )
+    try:
+        queue_result = await queue_prompt_payload(
+            master_prompt,
+            workflow_meta,
+            client_id,
+            include_queue_metadata=True,
+        )
+    except Exception:
+        if serverless_jobs:
+            async with prompt_server.distributed_jobs_lock:
+                for job_id in job_id_map.values():
+                    prompt_server.distributed_pending_jobs.pop(job_id, None)
+        raise
     prompt_id = queue_result["prompt_id"]
+    if manager is not None:
+        try:
+            await manager.start(execution_trace_id, prompt_id, serverless_jobs)
+        except Exception:
+            # Wake queued collectors with an explicit error if journal/capacity setup failed.
+            await manager.cancel(execution_id=execution_trace_id)
+            async with prompt_server.distributed_jobs_lock:
+                for prepared in serverless_jobs:
+                    for binding in prepared["manifest"]:
+                        q = prompt_server.distributed_pending_jobs.get(binding["job_id"])
+                        if q is not None:
+                            q.put_nowait({"worker_id": prepared["worker"]["id"], "is_last": True,
+                                          "serverless_error": "Serverless job setup failed; no automatic retry was attempted"})
+            raise
     prompt_number = queue_result["number"]
     node_errors = queue_result.get("node_errors", {})
     trace_debug(

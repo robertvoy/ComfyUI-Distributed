@@ -18,7 +18,7 @@ export function isRemoteWorker(extension, worker) {
     const workerType = String(worker?.type || "").toLowerCase();
 
     // Explicit type always wins over host heuristics.
-    if (workerType === "cloud" || workerType === "remote") {
+    if (workerType === "cloud" || workerType === "remote" || workerType === "serverless") {
         return true;
     }
     if (workerType === "local") {
@@ -37,6 +37,134 @@ export function isCloudWorker(extension, worker) {
     return worker.type === "cloud";
 }
 
+function showServerlessValidationError(extension, detail) {
+    extension.app.extensionManager.toast.add({
+        severity: "error",
+        summary: "Validation Error",
+        detail,
+        life: 3000,
+    });
+}
+
+async function saveServerlessWorkerSettings(extension, worker, workerId, name) {
+    const endpointId = String(document.getElementById(`endpoint-id-${workerId}`).value || "").trim();
+    const apiKey = document.getElementById(`api-key-${workerId}`).value || "";
+    const clearApiKey = Boolean(document.getElementById(`clear-api-key-${workerId}`).checked);
+    const jobsPerRun = Number(document.getElementById(`jobs-per-run-${workerId}`).value);
+    const concurrency = Number(document.getElementById(`concurrency-${workerId}`).value);
+    const timeoutSeconds = Number(document.getElementById(`timeout-seconds-${workerId}`).value);
+
+    if (!name.trim()) {
+        showServerlessValidationError(extension, "Worker name is required");
+        return;
+    }
+    if (!endpointId) {
+        showServerlessValidationError(extension, "Endpoint ID is required for Runpod serverless workers");
+        return;
+    }
+    if (!Number.isInteger(jobsPerRun) || jobsPerRun < 1 || jobsPerRun > 16) {
+        showServerlessValidationError(extension, "Jobs per run must be an integer between 1 and 16");
+        return;
+    }
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 16) {
+        showServerlessValidationError(extension, "Concurrency must be an integer between 1 and 16");
+        return;
+    }
+    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 30 || timeoutSeconds > 86400) {
+        showServerlessValidationError(extension, "Timeout must be an integer between 30 and 86400 seconds");
+        return;
+    }
+
+    const updateData = {
+        name: name.trim(),
+        type: "serverless",
+        provider: "runpod",
+        endpoint_id: endpointId,
+        ...(apiKey.length > 0 && !clearApiKey ? { api_key: apiKey } : {}),
+        ...(clearApiKey ? { clear_api_key: true } : {}),
+        jobs_per_run: jobsPerRun,
+        concurrency,
+        timeout_seconds: timeoutSeconds,
+        // Never enable a serverless worker as a side effect of saving credentials.
+        enabled: worker.enabled,
+    };
+
+    try {
+        await extension.api.updateWorker(workerId, updateData);
+        document.getElementById(`api-key-${workerId}`).value = "";
+
+        worker.name = name.trim();
+        worker.type = "serverless";
+        worker.provider = "runpod";
+        worker.endpoint_id = endpointId;
+        worker.jobs_per_run = jobsPerRun;
+        worker.concurrency = concurrency;
+        worker.timeout_seconds = timeoutSeconds;
+        worker.api_key_configured = clearApiKey
+            ? false
+            : apiKey.length > 0 || Boolean(worker.api_key_configured);
+        // The credential is write-only: never copy it into extension config/state.
+        delete worker.api_key;
+        delete worker.host;
+        delete worker.port;
+        delete worker.cuda_device;
+        delete worker.extra_args;
+
+        extension.state.updateWorker(workerId, { enabled: worker.enabled });
+        emitWorkersChanged(extension);
+        extension.app.extensionManager.toast.add({
+            severity: "success",
+            summary: "Settings Saved",
+            detail: `Worker ${worker.name} settings updated`,
+            life: 3000,
+        });
+        extension.state.setWorkerExpanded(workerId, false);
+        if (extension.panelElement) {
+            renderSidebarContent(extension, extension.panelElement);
+        }
+    } catch (error) {
+        extension.app.extensionManager.toast.add({
+            severity: "error",
+            summary: "Save Failed",
+            detail: error.message,
+            life: 5000,
+        });
+    }
+}
+
+export async function testServerlessWorker(extension, workerId) {
+    const button = document.getElementById(`test-serverless-${workerId}`);
+    const originalText = button?.textContent;
+    if (button) {
+        button.disabled = true;
+        button.textContent = "Testing...";
+    }
+    try {
+        // This endpoint only checks the saved endpoint configuration; it does not enqueue inference.
+        const result = await extension.api.testServerlessWorker(workerId);
+        extension.app.extensionManager.toast.add({
+            severity: result?.ok ? "success" : "error",
+            summary: result?.ok ? "Runpod Endpoint Ready" : "Runpod Endpoint Test Failed",
+            detail: result?.message || (result?.ok ? "Saved endpoint is reachable" : "Endpoint test failed"),
+            life: 4000,
+        });
+        return result;
+    } catch (error) {
+        extension.app.extensionManager.toast.add({
+            severity: "error",
+            summary: "Runpod Endpoint Test Failed",
+            detail: error.message,
+            life: 5000,
+        });
+        return null;
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = originalText;
+        }
+    }
+}
+
 export async function saveWorkerSettings(extension, workerId) {
     const worker = extension.config.workers.find((w) => w.id === workerId);
     if (!worker) {
@@ -44,8 +172,12 @@ export async function saveWorkerSettings(extension, workerId) {
     }
 
     // Get form values
-    const name = document.getElementById(`name-${workerId}`).value;
     const workerType = document.getElementById(`worker-type-${workerId}`).value;
+    if (workerType === "serverless") {
+        await saveServerlessWorkerSettings(extension, worker, workerId, document.getElementById(`name-${workerId}`).value);
+        return;
+    }
+    const name = document.getElementById(`name-${workerId}`).value;
     const isRemote = workerType === "remote" || workerType === "cloud";
     const isCloud = workerType === "cloud";
     const rawHost = isRemote ? document.getElementById(`host-${workerId}`).value : window.location.hostname;
@@ -209,6 +341,21 @@ export function cancelWorkerSettings(extension, workerId) {
         document.getElementById(`port-${workerId}`).value = worker.port;
         document.getElementById(`cuda-${workerId}`).value = worker.cuda_device || 0;
         document.getElementById(`args-${workerId}`).value = worker.extra_args || "";
+        const endpointInput = document.getElementById(`endpoint-id-${workerId}`);
+        if (endpointInput) endpointInput.value = worker.endpoint_id || "";
+        const apiKeyInput = document.getElementById(`api-key-${workerId}`);
+        if (apiKeyInput) {
+            apiKeyInput.value = "";
+            apiKeyInput.disabled = false;
+        }
+        const clearApiKeyInput = document.getElementById(`clear-api-key-${workerId}`);
+        if (clearApiKeyInput) clearApiKeyInput.checked = false;
+        const jobsPerRunInput = document.getElementById(`jobs-per-run-${workerId}`);
+        if (jobsPerRunInput) jobsPerRunInput.value = worker.jobs_per_run ?? 1;
+        const concurrencyInput = document.getElementById(`concurrency-${workerId}`);
+        if (concurrencyInput) concurrencyInput.value = worker.concurrency ?? 1;
+        const timeoutInput = document.getElementById(`timeout-seconds-${workerId}`);
+        if (timeoutInput) timeoutInput.value = worker.timeout_seconds ?? 1800;
 
         // Reset remote checkbox
         const remoteCheckbox = document.getElementById(`remote-${workerId}`);

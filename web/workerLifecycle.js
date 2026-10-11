@@ -41,6 +41,28 @@ function setButtonVisibility(button, visible) {
     button.style.display = visible ? "" : "none";
 }
 
+function updateServerlessStatusMessage(workerId, status) {
+    const messageElement = document.getElementById(`serverless-status-${workerId}`);
+    if (!messageElement) return;
+
+    const message = typeof status?.message === "string" && status.message
+        ? status.message
+        : status?.ok ? "Ready to scale" : "Runpod status unavailable";
+    const queueRemaining = Number(status?.queueRemaining);
+    const parts = [message];
+    if (Number.isFinite(queueRemaining)) {
+        parts.push(`${Math.max(0, queueRemaining)} queued`);
+    }
+    const jobStatuses = (Array.isArray(status?.jobs) ? status.jobs : [])
+        .slice(0, 2)
+        .map((job) => String(job?.status || "").trim())
+        .filter(Boolean);
+    if (jobStatuses.length) {
+        parts.push(`Jobs: ${jobStatuses.join(", ")}`);
+    }
+    messageElement.textContent = parts.join(" • ");
+}
+
 export async function checkAllWorkerStatuses(extension) {
     if (_statusCheckRunning || !extension.panelElement) {
         return;
@@ -136,11 +158,60 @@ export async function checkMasterStatus(extension) {
 
 // Helper to build worker URL
 export function getWorkerUrl(extension, worker, endpoint = "") {
+    if (worker?.type === "serverless") {
+        return null;
+    }
     return buildWorkerUrl(worker, endpoint, window.location);
 }
 
 export async function checkWorkerStatus(extension, worker) {
     // Assume caller ensured enabled; proceed with check
+    if (worker.type === "serverless") {
+        try {
+            const result = await extension.api.getServerlessStatus(worker.id);
+            const queueRemaining = Number(result?.queueRemaining);
+            const normalizedQueue = Number.isFinite(queueRemaining) ? Math.max(0, queueRemaining) : 0;
+            const normalizedStatus = {
+                ok: Boolean(result?.ok),
+                queueRemaining: normalizedQueue,
+                message: typeof result?.message === "string" ? result.message : "",
+                jobs: (Array.isArray(result?.jobs) ? result.jobs : []).map((job) => ({
+                    job_id: String(job?.job_id || ""),
+                    status: String(job?.status || ""),
+                    worker_id: String(job?.worker_id || ""),
+                    execution_id: String(job?.execution_id || ""),
+                })),
+            };
+            const hasActiveJobs = normalizedStatus.jobs.some((job) =>
+                /^(waiting|submitting|in_queue|queued|pending|running|processing|starting|in_progress|downloading|cancel_requested)$/i.test(job.status.trim())
+            );
+            const status = {
+                online: normalizedStatus.ok,
+                processing: normalizedQueue > 0 || hasActiveJobs,
+                queueCount: normalizedQueue,
+            };
+            extension.state.updateWorker(worker.id, { serverlessStatus: normalizedStatus });
+            extension.state.setWorkerStatus(worker.id, status);
+            updateServerlessStatusMessage(worker.id, normalizedStatus);
+            const updatedInPlace = extension.updateWorkerCard?.(worker.id, status);
+            if (!updatedInPlace) {
+                updateWorkerControls(extension, worker.id);
+            }
+        } catch (error) {
+            if (error?.name === "AbortError") return;
+            const failedStatus = { ok: false, queueRemaining: 0, message: error?.message || "Runpod status unavailable", jobs: [] };
+            extension.state.updateWorker(worker.id, { serverlessStatus: failedStatus });
+            extension.state.setWorkerStatus(worker.id, { online: false, processing: false, queueCount: 0 });
+            updateServerlessStatusMessage(worker.id, failedStatus);
+            const updatedInPlace = extension.updateWorkerCard?.(worker.id, extension.state.getWorkerStatus(worker.id));
+            if (!updatedInPlace) {
+                updateWorkerControls(extension, worker.id);
+            }
+            extension.log(`Serverless worker ${worker.id} status check failed: ${error.message}`, "debug");
+        }
+        return;
+    }
+
     const workerUrl = getWorkerUrl(extension, worker);
 
     try {
@@ -206,6 +277,9 @@ export async function checkWorkerStatus(extension, worker) {
 
 export async function launchWorker(extension, workerId) {
     const worker = extension.config.workers.find((w) => w.id === workerId);
+    if (!worker || worker.type === "serverless") {
+        return;
+    }
 
     // If worker is disabled, enable it first
     if (!worker.enabled) {
@@ -273,6 +347,9 @@ export async function launchWorker(extension, workerId) {
 
 export async function stopWorker(extension, workerId) {
     const worker = extension.config.workers.find((w) => w.id === workerId);
+    if (!worker || worker.type === "serverless") {
+        return;
+    }
     const stopBtn = document.querySelectorAll(`#controls-${workerId} button`)[1];
 
     // Provide immediate feedback
@@ -349,8 +426,12 @@ export async function loadManagedWorkers(extension) {
     try {
         const result = await extension.api.getManagedWorkers();
 
-        // Check for launching workers
+        const serverlessWorkerIds = new Set(
+            (extension.config?.workers || []).filter((worker) => worker.type === "serverless").map((worker) => String(worker.id))
+        );
+        // Managed-worker lifecycle state is ComfyUI-process-only; serverless is provider-managed.
         for (const [workerId, info] of Object.entries(result.managed_workers)) {
+            if (serverlessWorkerIds.has(String(workerId))) continue;
             extension.state.setWorkerManaged(workerId, info);
 
             // If worker is marked as launching, add to launchingWorkers set
@@ -385,6 +466,13 @@ export function updateWorkerControls(extension, workerId) {
     const launchBtn = document.getElementById(`launch-${workerId}`);
     const stopBtn = document.getElementById(`stop-${workerId}`);
     const logBtn = document.getElementById(`log-${workerId}`);
+
+    if (worker.type === "serverless") {
+        setButtonVisibility(launchBtn, false);
+        setButtonVisibility(stopBtn, false);
+        setButtonVisibility(logBtn, false);
+        return;
+    }
 
     if (isRemoteWorker(extension, worker)) {
         setButtonVisibility(launchBtn, false);
@@ -438,6 +526,9 @@ export function updateWorkerControls(extension, workerId) {
 
 export async function viewWorkerLog(extension, workerId, isRemote = false) {
     const worker = extension.config.workers.find((w) => w.id === workerId);
+    if (worker?.type === "serverless") {
+        return;
+    }
     const isRemoteLog = isRemote || (worker ? isRemoteWorker(extension, worker) : false);
     const managedInfo = extension.state.getWorker(workerId).managed;
     if (!isRemoteLog && !managedInfo?.log_file) {
@@ -498,6 +589,7 @@ export async function refreshLog(extension, workerId, silent = false) {
 
     try {
         const worker = extension.config.workers.find((w) => w.id === workerId);
+        if (worker?.type === "serverless") return;
         const isRemoteLog = worker ? isRemoteWorker(extension, worker) : false;
         const data = isRemoteLog
             ? await extension.api.getRemoteWorkerLog(workerId, 300)

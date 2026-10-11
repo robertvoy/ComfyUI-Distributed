@@ -35,6 +35,8 @@ def auto_launch_workers():
             launched_count = 0
             
             for worker in workers:
+                if worker.get('type') == 'serverless':
+                    continue
                 if worker.get('enabled', False):
                     worker_id = worker.get('id')
                     worker_name = worker.get('name', f'Worker {worker_id}')

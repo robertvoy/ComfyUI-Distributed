@@ -22,6 +22,8 @@ class WorkerProcessManager:
         return self._launch_builder.build_launch_command(worker_config, comfy_root)
 
     def launch_worker(self, worker_config, show_window=False):
+        if worker_config.get("type") == "serverless":
+            raise ValueError("Serverless pools cannot be launched as local processes")
         return self._lifecycle.launch_worker(worker_config, show_window=show_window)
 
     def stop_worker(self, worker_id):

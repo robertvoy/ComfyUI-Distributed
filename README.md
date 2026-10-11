@@ -38,11 +38,12 @@
 
 <img width="200" align="right" alt="ComfyUI_temp_khvcc_00034_@0 25x" src="https://github.com/user-attachments/assets/651e4912-7c23-4e32-bd88-250f5175e129" />
 
-ComfyUI Distributed supports three types of workers:
+ComfyUI Distributed supports four types of workers:
 
 - **Local Workers** - Additional GPUs on the same machine (auto-configured on first launch)
 - **Remote Workers** - GPUs on other computers in your network
 - **Cloud Workers** - GPUs hosted on a cloud service like Runpod, accessible via secure tunnels
+- **Serverless (Runpod)** - Queue-based endpoint pools for image Collector jobs; no Distributed install or inbound tunnel on workers. [Setup, endpoint contract, and preview limitations](/docs/serverless-workers.md).
 
 > For detailed setup instructions, see the [setup guide](/docs/worker-setup-guides.md)
 
