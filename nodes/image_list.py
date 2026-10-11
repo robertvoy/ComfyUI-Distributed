@@ -12,6 +12,7 @@ from ..image_list.runtime import (
     normalize_worker_result,
     run_image_list_job,
     encode_result,
+    encode_request_payload,
     unwrap_single,
 )
 
@@ -96,10 +97,13 @@ class DistributedImageListStart(io.ComfyNode):
         region = next((row for row in regions if row["start_id"] == start_id), None)
         if region is None:
             raise RuntimeError(f"No safe paired Image List End was found for Start node {start_id}")
+        from comfy_execution.utils import get_executing_context
+        executing = get_executing_context()
         context_id = create_master_job(
             start_id, region["end_id"], prompt, items, worker_ids,
             str(unwrap_single(image_list_master_callback or "")),
             image_list_workflow_meta if isinstance(image_list_workflow_meta, dict) else None,
+            prompt_id=executing.prompt_id if executing is not None else None,
         )
         return io.NodeOutput(
             [item["image"] for item in items],
@@ -196,9 +200,8 @@ class DistributedImageListEnd(io.ComfyNode):
         context_id = context_values[0]
         from ..image_list.runtime import ImageListCancelledError
         try:
-            # Put the deadline inside the coroutine so timeout cancels owned remote work.
-            import asyncio
-            result_lists = run_async_in_server_loop(asyncio.wait_for(run_image_list_job(context_id), 3600))
+            # The runtime owns the configurable deadline and bounded remote cleanup.
+            result_lists = run_async_in_server_loop(run_image_list_job(context_id))
         except ImageListCancelledError:
             import comfy.model_management
             raise comfy.model_management.InterruptProcessingException()
@@ -218,7 +221,8 @@ async def submit_worker_result(callback_url, item_token, context_id, item_index,
                "item_index": item_index, "result": result}
     async with session.post(
         f"{callback_url.rstrip('/')}/distributed/image-list/result",
-        json=payload,
+        data=encode_request_payload(payload),
+        headers={"Content-Type": "application/json"},
         timeout=aiohttp.ClientTimeout(total=60),
     ) as response:
         if response.status >= 400:

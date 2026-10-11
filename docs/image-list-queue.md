@@ -44,19 +44,35 @@ Start outputs, in order: `image`, `reference_image`, `mask`, `text`, `strength`,
 
 End accepts `images`, optional `masks` / `texts`, and `context`. It returns `image_list`, `masks`, and `texts` in original item order. Each job must produce exactly one image, at most one mask, and at most one text value. Unconnected optional outputs contain `None` entries.
 
-Models are **loaded and cached on workers**, not serialized from the master. Connect loader outputs directly to the processing nodes. Each worker needs the region's node packs and model files. Per-image data must pass through Start; do not bypass it with a second image list connected directly into the processing region.
+Models are **loaded and cached on workers**, not serialized from the master. Connect loader outputs directly to the processing nodes. Each worker needs the region's node packs and model files. **The master still validates the prompt:** it needs the relevant node definitions and any model-name/file availability required by their validation (including combo lists). This is not a model-free-master guarantee.
+
+Per-image data must pass through Start; do not bypass it with upstream images, latents or generated batches connected directly into the processing region. Shared dependencies across Start are restricted to registered model outputs or scalar constants, not arbitrary image-producing leaf nodes.
+
+End's optional `texts` is a connection-only socket. For workflows saved before this fix, recreate End and reconnect its wires if an old text widget or literal `texts: ""` remains in the compiled prompt. Arbitrary text literals are not accepted at End.
+
+File-based dependencies keep ComfyUI's `[output]` / `[temp]` root annotations while being read on the master. Their worker copies use separate content-addressed paths under `input/distributed-media/`; each worker's rewritten prompt is reused across items without reusing item tokens.
 
 ## Scope and failure behavior
 
 - This version supports direct workers only, not Runpod serverless pools. Unsupported pools are excluded without contacting the provider for this job.
-- Worker eligibility is determined before execution and checked again before dispatch. Busy workers are excluded. Workers joining later are not added to an already-running region.
+- Worker eligibility is determined before execution and checked again before dispatch. Busy or transiently unreachable workers are excluded; healthy candidates can continue. Malformed capability/queue responses and incompatible versions fail explicitly. Workers joining later are not added to an already-running region.
+- Omitted worker IDs select enabled direct workers. Explicit IDs select the named configured direct workers, including disabled ones; an empty list stays empty, unknown IDs fail, and serverless workers are excluded. Local workers use the master's loopback callback; remote workers use its configured public address.
 - Only the enclosed processing is distributed. List creation and downstream saving run on the master, even when master-delegate-only is enabled. There is no master fallback when workers are unavailable.
 - Start/End regions may be chained sequentially and share model-loader dependencies. Nested/overlapping per-image regions and data escaping a region without End are rejected. Collector and distributed-upscaler nodes cannot be mixed into the same prompt in this first version.
 - Output nodes inside a region are rejected because ComfyUI would execute them independently on the master. Avoid other side-effecting processing nodes as well; save after End.
 - The entire input list is materialized before scheduling; this is not streaming input. The limit is 4,096 frames. Transport preserves floating-point tensor dtype and values rather than encoding to lossy images. Each tensor is limited to 50 MiB, and the complete JSON/base64 HTTP request to 101 MiB; image/reference/mask combinations can hit the aggregate request limit first.
 - Results are accepted once per item using assignment tokens. Missing, duplicate, malformed and wrong-index results fail rather than silently returning a partial list. No failed or ambiguous submission is retried automatically.
-- Worker errors and the configured worker timeout fail the region. User interruption stops further scheduling and issues targeted queue deletion/interruption for this region's acknowledged prompts. An in-progress submission is allowed to resolve so its prompt ID can be cleaned up. Unreachable workers or a lost submission acknowledgement can require checking that worker manually; cancellation is not a guarantee of remote termination through a broken network.
-- State is in memory. Restarting the master does not resume an interrupted region. A region also has a one-hour overall deadline.
+- Worker errors fail the region. The worker timeout measures loss of evidence for the **owned prompt ID**, not maximum render duration. Pending/running evidence refreshes liveness; unrelated busy jobs and failed polls do not. Healthy cold loads and long renders can continue.
+- User interruption is checked during submission and result waiting. Cleanup targets only this region's acknowledged prompt IDs and staged input tokens. Submission may wait briefly for an acknowledgement before cancellation; transport and cleanup have finite time limits. Lost acknowledgements are **ambiguous**, never retried automatically. Unreachable cleanup is logged as unconfirmed and may require checking the worker manually; cancellation does not guarantee remote termination through a broken network.
+- State is in memory. Restarting the master does not resume an interrupted region. Abandoned master contexts and expired worker staging are actively swept on the server loop; active/queued master work is protected from age-only expiry. End also removes its context on success, failure or interruption. This releases feature-owned references, not ComfyUI's separate execution cache.
+
+### Time and size limits
+
+`settings.image_list_job_timeout_seconds` defaults to `0` (no arbitrary total-run cap). A positive finite number opts into an overall deadline with owned-work cleanup; negative, non-finite or malformed settings fail explicitly. There is no fixed one-hour region deadline. The setting is separate from the existing worker liveness timeout.
+
+Uploads, media preparation and submission acknowledgements are independently bounded. WebSocket acknowledgement waiting includes connect/send/receive and is not extended by heartbeats or unrelated messages. A user interrupt allows up to one second for a late acknowledgement; cleanup requests use five-second bounds each.
+
+**4K float32 RGB outputs are not supported by these transport limits.** A 3840×2160 RGB float32 tensor exceeds 50 MiB before base64 encoding. 1080p-to-4K upscaling therefore cannot use this configuration. Dtypes/values are never silently reduced to fit. Complete encoded input requests are checked before upload, including image/reference/mask combinations; output limits are checked when the worker has computed the result. Reverse proxies may impose lower HTTP limits.
 
 Use trusted workers and trusted workflows, as with the existing ComfyUI API. Capability tokens protect assignment/result matching; they are not a replacement for network access control.
 

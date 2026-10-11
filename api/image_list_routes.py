@@ -5,7 +5,7 @@ from aiohttp import web
 import server
 
 from ..image_list.runtime import (
-    MAX_PAYLOAD_BYTES,
+    MAX_REQUEST_BYTES,
     decode_result,
     delete_worker_item,
     set_master_result,
@@ -13,7 +13,6 @@ from ..image_list.runtime import (
 )
 
 prompt_server = server.PromptServer.instance
-MAX_REQUEST_BYTES = MAX_PAYLOAD_BYTES * 2 + 1024 * 1024
 
 
 async def _json_body(request):

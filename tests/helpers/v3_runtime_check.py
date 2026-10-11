@@ -214,7 +214,12 @@ async def check_image_list_lazy_executor(mapping, module, prompt_server, asset_m
     runtime = sys.modules[module.__name__ + '.image_list.runtime']
     original_contexts = set(runtime._MASTER_JOBS)
     image_list_nodes = sys.modules[module.__name__ + '.nodes.image_list']
+    workflow_meta = {'nodes': [{'id': 2, 'type': 'DistributedImageListStart'}], 'extra': {'acceptance': True}}
     async def fake_worker_results(_context_id):
+        state = runtime.get_master_job(_context_id)
+        assert state.prompt_id == 'image-list-lazy', state.prompt_id
+        assert state.workflow_meta == workflow_meta, state.workflow_meta
+        assert len(prompt_server.app.cleanup_ctx) >= 1, 'lifecycle cleanup was not registered'
         return (
             [torch.full((1, 8, 8, 3), value, dtype=torch.float32) for value in (0.125, 0.5, 0.875)],
             [None, None, None], [None, None, None],
@@ -227,6 +232,7 @@ async def check_image_list_lazy_executor(mapping, module, prompt_server, asset_m
             'text_mode': 'shared', 'strength': 1.0, 'strength_mode': 'shared',
             'seed': 17, 'seed_mode': 'shared', 'image_list_enabled_worker_ids': '["test-worker"]',
             'image_list_master_callback': 'http://127.0.0.1:1',
+            'image_list_workflow_meta': workflow_meta,
         }},
         '3': {'class_type': 'ImageListTestProbe', 'inputs': {'image': ['2', 0]}},
         '4': {'class_type': 'DistributedImageListEnd', 'inputs': {
@@ -258,6 +264,21 @@ async def check_image_list_lazy_executor(mapping, module, prompt_server, asset_m
     import folder_paths
     scratch = Path(os.environ.get('TMPDIR', Path.home() / '.hermes/cache/scratch'))
     try:
+        # Resolve genuine Comfy output/temp annotations against the pinned core,
+        # not only the controlled folder_paths seam in unit tests.
+        media = sys.modules[module.__name__ + '.api.orchestration.media_sync']
+        with tempfile.TemporaryDirectory(prefix='media-roots-', dir=scratch) as media_root:
+            for kind in ('input', 'output', 'temp'):
+                source = Path(media_root) / kind / 'shared/ref.png'
+                source.parent.mkdir(parents=True)
+                source.write_bytes(kind.encode())
+            with patch.object(folder_paths, 'input_directory', str(Path(media_root) / 'input')), \
+                 patch.object(folder_paths, 'output_directory', str(Path(media_root) / 'output')), \
+                 patch.object(folder_paths, 'temp_directory', str(Path(media_root) / 'temp')):
+                for kind in ('output', 'temp'):
+                    refs = media._find_media_references({'1': {'inputs': {'image': f'shared/ref.png [{kind}]'}}})
+                    assert len(refs) == 1
+                    assert media._load_media_file_sync(refs[0])[0] == kind.encode()
         with tempfile.TemporaryDirectory(prefix='image-list-lazy-', dir=scratch) as temp:
             with patch.object(folder_paths, 'temp_directory', temp), \
                  patch.object(image_list_nodes, 'run_image_list_job', fake_worker_results):

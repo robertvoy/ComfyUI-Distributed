@@ -413,6 +413,7 @@ async def orchestrate_distributed_execution(
         master_url,
         delegate_master,
         prompt_index,
+        workflow_meta=workflow_meta,
     )
 
     if delegate_master:

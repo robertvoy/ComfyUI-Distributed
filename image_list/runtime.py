@@ -23,7 +23,11 @@ END_NODE_ID = "DistributedImageListEnd"
 # Start output indexes are a stable internal prompt protocol.
 IMAGE_OUT, REFERENCE_OUT, MASK_OUT, TEXT_OUT, STRENGTH_OUT, SEED_OUT, INDEX_OUT, CONTEXT_OUT = range(8)
 MAX_PAYLOAD_BYTES = 50 * 1024 * 1024
+MAX_REQUEST_BYTES = MAX_PAYLOAD_BYTES * 2 + 1024 * 1024
 MAX_ITEMS = 4096
+SUBMISSION_TIMEOUT_SECONDS = 190.0
+SUBMISSION_CANCEL_GRACE_SECONDS = 1.0
+CLEANUP_TIMEOUT_SECONDS = 16.0
 _ALLOWED_FLOAT_DTYPES = {"float16", "bfloat16", "float32", "float64"}
 
 _LOCK = threading.RLock()
@@ -53,6 +57,8 @@ class ImageListJob:
     event: asyncio.Event | None = None
     created_at: float = field(default_factory=time.monotonic)
     failed: str | None = None
+    prompt_id: str | None = None
+    active: bool = False
 
 
 def _torch():
@@ -241,6 +247,17 @@ def decode_value(data: Any, expected_kind: str) -> Any:
     return encode_value(value, expected_kind) and value
 
 
+def encode_request_payload(payload: dict[str, Any]) -> bytes:
+    """Budget the final JSON envelope, including base64, before HTTP upload."""
+    body = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if len(body) > MAX_REQUEST_BYTES:
+        raise ValueError(
+            f"Image-list complete JSON/base64 request is {len(body)} bytes; "
+            f"limit is {MAX_REQUEST_BYTES} bytes (image/reference/mask combined)"
+        )
+    return body
+
+
 def encode_item(item: dict[str, Any]) -> dict[str, Any]:
     return {"image": encode_value(item["image"], "IMAGE"),
             "reference_image": encode_value(item.get("reference_image"), "IMAGE"),
@@ -311,7 +328,8 @@ def delete_worker_item(token: str) -> bool:
 
 def create_master_job(start_id: str, end_id: str, prompt: dict[str, Any], items: list[dict[str, Any]],
                       worker_ids: list[str], master_callback_url: str,
-                      workflow_meta: dict[str, Any] | None = None) -> str:
+                      workflow_meta: dict[str, Any] | None = None,
+                      prompt_id: str | None = None) -> str:
     if not isinstance(prompt, dict):
         raise ValueError("Image List Start requires the original ComfyUI prompt for region extraction")
     if not worker_ids:
@@ -319,7 +337,7 @@ def create_master_job(start_id: str, end_id: str, prompt: dict[str, Any], items:
     context_id = secrets.token_urlsafe(36)
     state = ImageListJob(context_id, str(start_id), str(end_id), prompt, items,
                          [str(worker_id) for worker_id in worker_ids], master_callback_url,
-                         workflow_meta)
+                         workflow_meta, prompt_id=prompt_id)
     with _LOCK:
         _MASTER_JOBS[context_id] = state
     return context_id
@@ -556,16 +574,30 @@ async def dynamic_schedule(item_count: int, workers: list[str], dispatch, wait_n
             await asyncio.gather(waiter, return_exceptions=True)
 
     async def submit(worker, index):
-        # An outer timeout must not discard an acknowledgement for a job we own.
-        task = asyncio.create_task(dispatch(worker, index))
+        # Bound the shield itself, and inspect the real Comfy interrupt flag while
+        # awaiting an acknowledgement. Briefly retain a late acknowledged handle.
+        task = asyncio.create_task(asyncio.wait_for(
+            dispatch(worker, index), SUBMISSION_TIMEOUT_SECONDS))
         try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
+            while True:
+                check_interrupted()
+                done, _ = await asyncio.wait({task}, timeout=0.1)
+                if done:
+                    handle = task.result()
+                    inflight[worker] = handle
+                    check_interrupted()
+                    return handle
+        except (asyncio.CancelledError, ImageListCancelledError):
             try:
-                inflight[worker] = await task
-            except Exception:
+                inflight[worker] = await asyncio.wait_for(
+                    asyncio.shield(task), SUBMISSION_CANCEL_GRACE_SECONDS)
+            except (Exception, asyncio.CancelledError):
                 pass
             raise
+        finally:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     try:
         for worker in workers:
@@ -594,7 +626,8 @@ async def dynamic_schedule(item_count: int, workers: list[str], dispatch, wait_n
         return [results[i] for i in range(item_count)]
     except BaseException:
         if inflight:
-            await asyncio.gather(*(cleanup(worker, handle) for worker, handle in inflight.items()), return_exceptions=True)
+            await asyncio.gather(*(asyncio.wait_for(cleanup(worker, handle), CLEANUP_TIMEOUT_SECONDS)
+                                   for worker, handle in inflight.items()), return_exceptions=True)
         raise
 
 
@@ -690,8 +723,19 @@ async def run_image_list_job(context_id: str) -> tuple[list[Any], list[Any], lis
     state = get_master_job(context_id)
     if state is None:
         raise RuntimeError("Distributed Image List context is missing or expired")
+    with _LOCK:
+        state.active = True
     try:
-        return await _run_image_list_job(state)
+        from ..utils.config import get_image_list_job_timeout_seconds
+        deadline = get_image_list_job_timeout_seconds()
+        timer = asyncio.timeout(deadline if deadline > 0 else None)
+        try:
+            async with timer:
+                return await _run_image_list_job(state)
+        except TimeoutError:
+            if timer.expired():
+                raise TimeoutError(f"Image-list total deadline exceeded ({deadline:g}s); cleanup attempted") from None
+            raise
     finally:
         remove_master_job(context_id)
 
@@ -704,7 +748,7 @@ async def _run_image_list_job(state: ImageListJob):
     )
     from ..api.orchestration.prompt_transform import _resolve_direct_workers_for_image_list
     from ..utils.config import load_config, get_worker_timeout_seconds
-    from ..utils.network import build_master_url, build_worker_url, get_client_session
+    from ..utils.network import build_master_callback_url, build_worker_url, get_client_session
     from ..utils.logging import log
     import aiohttp
 
@@ -718,15 +762,14 @@ async def _run_image_list_job(state: ImageListJob):
     if not workers:
         raise RuntimeError("No free, reachable, feature-compatible direct workers are available; master execution is disabled")
     session = await get_client_session()
-    callback_url = state.master_callback_url or build_master_url(config=config)
     regions = validate_image_list_regions(state.original_prompt)
     region = next((entry for entry in regions if entry["start_id"] == state.start_id and entry["end_id"] == state.end_id), None)
     if region is None:
         raise RuntimeError("Image-list region no longer matches the submitted prompt")
     timeout_seconds = max(5.0, float(get_worker_timeout_seconds()))
     use_websocket = bool((config.get("settings", {}) or {}).get("websocket_orchestration", False))
-    prepared_worker_ids: set[str] = set()
-    worker_path_separators: dict[str, str | None] = {}
+    prepared_worker_prompts: dict[str, dict[str, Any]] = {}
+    owned_uploads: dict[str, dict[str, Any]] = {}
 
     async def dispatch(worker_id: str, index: int) -> dict[str, Any]:
         worker = next((entry for entry in workers if entry["id"] == worker_id), None)
@@ -735,26 +778,32 @@ async def _run_image_list_job(state: ImageListJob):
         token = create_worker_task_token()
         register_assignment(context_id, index, worker_id, token)
         item_payload = {"context_id": context_id, "item": encode_item(state.items[index])}
+        body = encode_request_payload({"token": token, **item_payload})
+        handle = {"prompt_id": None, "token": token, "index": index, "worker": worker,
+                  "submission_pending": False}
+        # Own even a lost upload response; DELETE is idempotent.
+        owned_uploads[token] = handle
         input_url = build_worker_url(worker, "/distributed/image-list/item")
-        async with session.post(input_url, json={"token": token, **item_payload},
+        async with session.post(input_url, data=body, headers={"Content-Type": "application/json"},
                                 timeout=aiohttp.ClientTimeout(total=60)) as response:
             if response.status >= 400:
                 raise RuntimeError(f"Worker {worker_id} rejected image-list item {index}: HTTP {response.status}")
-        worker_prompt = build_worker_prompt(state.original_prompt, region, token, context_id,
-                                            index, callback_url)
-        if worker_id not in worker_path_separators:
-            worker_path_separators[worker_id] = None
+        callback_url = build_master_callback_url(worker, config=config)
+        if worker_id not in prepared_worker_prompts:
+            worker_prompt = build_worker_prompt(state.original_prompt, region, token, context_id,
+                                                index, callback_url)
             if worker.get("host") and str(worker.get("type") or "local").lower() != "local":
-                from ..api.orchestration.media_sync import fetch_worker_path_separator
-                worker_path_separators[worker_id] = await fetch_worker_path_separator(worker)
-        separator = worker_path_separators[worker_id]
-        if separator:
-            from ..api.orchestration.media_sync import convert_paths_for_platform
-            worker_prompt = convert_paths_for_platform(worker_prompt, separator)
-        if worker_id not in prepared_worker_ids:
+                from ..api.orchestration.media_sync import fetch_worker_path_separator, convert_paths_for_platform
+                separator = await fetch_worker_path_separator(worker)
+                if separator:
+                    worker_prompt = convert_paths_for_platform(worker_prompt, separator)
             from ..api.orchestration.media_sync import sync_worker_media
             await asyncio.wait_for(sync_worker_media(worker, worker_prompt), timeout=60)
-            prepared_worker_ids.add(worker_id)
+            prepared_worker_prompts[worker_id] = worker_prompt
+        # Reuse media rewrites, never assignment identity or a mutable submitted graph.
+        worker_prompt = build_worker_prompt(prepared_worker_prompts[worker_id], region, token,
+                                            context_id, index, callback_url)
+        handle["submission_pending"] = True
         prompt_id = await dispatch_worker_prompt(
             worker, worker_prompt, state.workflow_meta,
             client_id=f"image-list-{context_id[:20]}", use_websocket=use_websocket,
@@ -762,18 +811,13 @@ async def _run_image_list_job(state: ImageListJob):
         )
         if not isinstance(prompt_id, str) or not prompt_id:
             raise RuntimeError(f"Worker {worker_id} did not return a prompt_id; submission status is ambiguous")
-        return {"prompt_id": prompt_id, "token": token, "index": index,
-                "started_at": time.monotonic(), "worker": worker}
+        handle.update(prompt_id=prompt_id, last_seen=time.monotonic(), submission_pending=False)
+        return handle
 
     async def wait_next(inflight: dict[str, Any]):
         while True:
             if state.failed:
                 raise RuntimeError(state.failed)
-            now = time.monotonic()
-            expired = [f"{wid}/item {handle['index']}" for wid, handle in inflight.items()
-                       if now - handle["started_at"] > timeout_seconds]
-            if expired:
-                raise TimeoutError(f"Image-list worker timeout after {timeout_seconds:.1f}s: {', '.join(expired)}")
             # Treat worker-side execution errors as failures even when End never posts a result.
             async def history_status(worker_id, handle):
                 url = build_worker_url(handle["worker"], f"/history/{handle['prompt_id']}")
@@ -784,6 +828,16 @@ async def _run_image_list_job(state: ImageListJob):
                         data = await response.json()
                     entry = data.get(handle["prompt_id"])
                     if not isinstance(entry, dict):
+                        async with session.get(build_worker_url(handle["worker"], "/queue"),
+                                               timeout=aiohttp.ClientTimeout(total=3)) as response:
+                            response.raise_for_status()
+                            queue = await response.json()
+                        if isinstance(queue, dict) and any(
+                            isinstance(row, (list, tuple)) and len(row) > 1 and row[1] == handle["prompt_id"]
+                            for key in ("queue_running", "queue_pending")
+                            for row in (queue.get(key) if isinstance(queue.get(key), list) else [])
+                        ):
+                            handle["last_seen"] = time.monotonic()
                         return None
                     status = entry.get("status", {}) or {}
                     if status.get("status_str") == "error":
@@ -809,29 +863,40 @@ async def _run_image_list_job(state: ImageListJob):
                 # successful history before releasing the slot / next region.
                 with _LOCK:
                     state.results.pop(completed[1], None)
+                owned_uploads.pop(inflight[completed[0]]["token"], None)
                 return completed
+            now = time.monotonic()
+            expired = [f"{wid}/item {handle['index']}" for wid, handle in inflight.items()
+                       if now - handle["last_seen"] > timeout_seconds]
+            if expired:
+                raise TimeoutError(f"Image-list owned-prompt liveness timeout after {timeout_seconds:.1f}s: {', '.join(expired)}")
             await asyncio.sleep(0.25)
 
     async def cleanup(worker_id: str, handle: dict[str, Any]) -> None:
         worker = handle["worker"]
-        try:
-            prompt_id = handle["prompt_id"]
-            # Delete if still queued, then interrupt only this prompt if it began
-            # running meanwhile. Never send a global interrupt or clear a queue.
-            async with session.post(build_worker_url(worker, "/queue"), json={"delete": [prompt_id]},
-                                    timeout=aiohttp.ClientTimeout(total=5)) as response:
-                response.raise_for_status()
-            async with session.post(build_worker_url(worker, "/interrupt"), json={"prompt_id": prompt_id},
-                                    timeout=aiohttp.ClientTimeout(total=5)) as response:
-                response.raise_for_status()
-        except Exception as exc:
-            log(f"[Distributed Image List] Owned prompt cleanup failed for worker {worker_id}: {exc}")
+        prompt_id = handle.get("prompt_id")
+        if prompt_id:
+            # Try both independently: failure of queue deletion must not suppress
+            # the targeted interrupt. No global interrupt or queue clearing.
+            for route, body in (("/queue", {"delete": [prompt_id]}),
+                                ("/interrupt", {"prompt_id": prompt_id})):
+                try:
+                    async with session.post(build_worker_url(worker, route), json=body,
+                                            timeout=aiohttp.ClientTimeout(total=5)) as response:
+                        response.raise_for_status()
+                except Exception as exc:
+                    log(f"[Distributed Image List] Owned prompt cleanup unconfirmed for worker {worker_id} ({route}): {exc}")
+        elif handle.get("submission_pending"):
+            log(f"[Distributed Image List] Worker {worker_id} submission status is ambiguous; "
+                "no prompt ID to target. Check worker manually; not retrying.")
         try:
             async with session.delete(build_worker_url(worker, f"/distributed/image-list/item/{handle['token']}"),
-                                      timeout=aiohttp.ClientTimeout(total=5)):
-                pass
-        except Exception:
-            pass
+                                      timeout=aiohttp.ClientTimeout(total=5)) as response:
+                response.raise_for_status()
+        except Exception as exc:
+            log(f"[Distributed Image List] Staged input cleanup unconfirmed for worker {worker_id}: {exc}")
+        finally:
+            owned_uploads.pop(handle["token"], None)
 
     def interrupted() -> bool:
         try:
@@ -840,6 +905,17 @@ async def _run_image_list_job(state: ImageListJob):
         except Exception:
             return False
 
-    results = await dynamic_schedule(len(state.items), [worker["id"] for worker in workers],
-                                     dispatch, wait_next, cleanup, interrupted)
-    return _collect_output_lists(results)
+    try:
+        results = await dynamic_schedule(len(state.items), [worker["id"] for worker in workers],
+                                         dispatch, wait_next, cleanup, interrupted)
+        return _collect_output_lists(results)
+    finally:
+        # Upload ownership exists before dynamic_schedule has an acknowledged
+        # handle. Cover rejection/lost upload responses as well as cancellation.
+        pending = list(owned_uploads.values())
+        outcomes = await asyncio.gather(*(
+            asyncio.wait_for(cleanup(handle["worker"]["id"], handle), CLEANUP_TIMEOUT_SECONDS)
+            for handle in pending), return_exceptions=True)
+        for handle, outcome in zip(pending, outcomes):
+            if isinstance(outcome, BaseException):
+                log(f"[Distributed Image List] Cleanup unconfirmed for worker {handle['worker']['id']}: {outcome}")

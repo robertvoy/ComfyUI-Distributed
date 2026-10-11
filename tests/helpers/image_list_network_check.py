@@ -106,7 +106,8 @@ async def setup():
     module = sys.modules[str(ROOT).replace('.', '_x_')]
     nodes.NODE_CLASS_MAPPINGS.update(TestImageSource=TestImageSource,
                                    TestImageOperation=TestImageOperation, TestCapture=TestCapture)
-    app = web.Application()
+    # Match the CORS-enabled direct-worker launch contract for canvas probes.
+    app = web.Application(middlewares=[server.create_cors_middleware('*')])
     # Register the actual feature routes, not test replacements.
     app.add_routes([route for route in ps.routes if route.path.startswith('/distributed/image-list/')])
     return ps, assets, module, app
@@ -212,6 +213,7 @@ async def coordinator():
     config_mod = importlib.import_module(module.__name__ + '.utils.config')
     orchestration = importlib.import_module(module.__name__ + '.api.queue_orchestration')
     runner, port = await listen(app)
+    ps.port = port  # Match the listener used by local-worker callback resolution.
     processes, stderr_files = [], []
     # Old worker capability refusal is read-only and precedes input evaluation.
     legacy_app = web.Application()

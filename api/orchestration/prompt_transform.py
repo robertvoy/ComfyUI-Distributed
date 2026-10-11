@@ -607,6 +607,7 @@ def apply_participant_overrides(
     master_url,
     delegate_master,
     prompt_index,
+    workflow_meta=None,
 ):
     """Return a prompt copy with hidden inputs configured for master/worker."""
     is_master = participant_id == "master"
@@ -641,6 +642,7 @@ def apply_participant_overrides(
         enabled_worker_ids,
         job_id_map,
         master_url,
+        workflow_meta=workflow_meta,
     )
 
     return prompt_copy
