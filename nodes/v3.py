@@ -9,6 +9,7 @@ from comfy_api.v0_0_2 import io
 from . import utilities as _utilities
 from .collector import DistributedCollectorNode as _CollectorRuntime
 from .distributed_upscale import UltimateSDUpscaleDistributed as _UpscaleRuntime
+from .image_list import DistributedImageListEnd, DistributedImageListStart
 
 
 class DistributedSeed(io.ComfyNode):
@@ -178,4 +179,5 @@ class UltimateSDUpscaleDistributed(io.ComfyNode):
 
 
 NODES = [DistributedCollector, DistributedSeed, DistributedModelName, DistributedValue,
-         ImageBatchDivider, AudioBatchDivider, DistributedEmptyImage, UltimateSDUpscaleDistributed]
+         ImageBatchDivider, AudioBatchDivider, DistributedEmptyImage, UltimateSDUpscaleDistributed,
+         DistributedImageListStart, DistributedImageListEnd]

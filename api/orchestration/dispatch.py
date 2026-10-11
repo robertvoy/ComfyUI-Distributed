@@ -85,7 +85,7 @@ async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
                 data = json.loads(msg.data or "{}")
                 if data.get("type") == "dispatch_ack" and data.get("request_id") == request_id:
                     if data.get("ok"):
-                        return
+                        return data.get("prompt_id")
                     error_text = data.get("error") or "Worker rejected websocket dispatch."
                     validation_error = data.get("validation_error")
                     node_errors = data.get("node_errors")
@@ -107,6 +107,7 @@ async def dispatch_worker_prompt(
     client_id=None,
     use_websocket=False,
     trace_execution_id=None,
+    return_prompt_id=False,
 ):
     """Send the prepared prompt to a worker ComfyUI instance."""
     worker_url = build_worker_url(worker)
@@ -120,7 +121,7 @@ async def dispatch_worker_prompt(
 
     if use_websocket:
         try:
-            await _dispatch_via_websocket(
+            prompt_id = await _dispatch_via_websocket(
                 worker_url,
                 {
                     "prompt": prompt_obj,
@@ -128,7 +129,9 @@ async def dispatch_worker_prompt(
                 },
                 client_id,
             )
-            return
+            if return_prompt_id and (not isinstance(prompt_id, str) or not prompt_id):
+                raise RuntimeError("Worker websocket acknowledgement omitted prompt_id")
+            return prompt_id if return_prompt_id else None
         except Exception as exc:
             worker_id = worker.get("id")
             if trace_execution_id:
@@ -144,6 +147,73 @@ async def dispatch_worker_prompt(
         timeout=aiohttp.ClientTimeout(total=60),
     ) as resp:
         resp.raise_for_status()
+        if not return_prompt_id:
+            return None
+        try:
+            response_data = await resp.json()
+        except Exception as exc:
+            raise RuntimeError("Worker /prompt response did not contain JSON acknowledgement") from exc
+        prompt_id = response_data.get("prompt_id") if isinstance(response_data, dict) else None
+        if not isinstance(prompt_id, str) or not prompt_id:
+            raise RuntimeError("Worker /prompt response omitted prompt_id")
+        return prompt_id if return_prompt_id else None
+
+
+async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0):
+    """Require protocol/node support and report which direct workers are idle.
+
+    This performs read-only GETs only; it never submits a prompt or contacts a
+    serverless provider. Unsupported worker releases fail before master inputs run.
+    """
+    if not workers:
+        raise RuntimeError("Distributed Image List requires at least one selected direct worker")
+    session = await get_client_session()
+    required_nodes = {"DistributedImageListStart", "DistributedImageListEnd"}
+    semaphore = asyncio.Semaphore(8)
+
+    async def inspect(worker):
+        worker_id = str(worker.get("id") or "unknown")
+        async with semaphore:
+            cap_url = build_worker_url(worker, "/distributed/image-list/capabilities")
+            try:
+                async with session.get(cap_url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                    if response.status != 200:
+                        raise RuntimeError(
+                            f"Image-list worker {worker_id} does not expose the capability endpoint "
+                            f"(HTTP {response.status}); upgrade that worker before running this feature"
+                        )
+                    capability = await response.json()
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(f"Image-list worker {worker_id} capability check timed out") from exc
+            except aiohttp.ClientError as exc:
+                raise RuntimeError(f"Image-list worker {worker_id} capability check failed: {exc}") from exc
+            nodes = set(capability.get("node_ids", [])) if isinstance(capability, dict) else set()
+            if (not isinstance(capability, dict) or capability.get("supported") is not True
+                    or capability.get("protocol_version") != 1 or not required_nodes.issubset(nodes)):
+                raise RuntimeError(
+                    f"Image-list worker {worker_id} is incompatible: requires protocol v1 and nodes "
+                    f"{sorted(required_nodes)}; no work was submitted"
+                )
+            queue_url = build_worker_url(worker, "/queue")
+            try:
+                async with session.get(queue_url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"Image-list worker {worker_id} queue preflight returned HTTP {response.status}")
+                    queue = await response.json()
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(f"Image-list worker {worker_id} queue preflight timed out") from exc
+            except aiohttp.ClientError as exc:
+                raise RuntimeError(f"Image-list worker {worker_id} queue preflight failed: {exc}") from exc
+            if not isinstance(queue, dict) or not isinstance(queue.get("queue_running"), list) or not isinstance(queue.get("queue_pending"), list):
+                raise RuntimeError(f"Image-list worker {worker_id} returned malformed /queue state")
+            idle = not queue["queue_running"] and not queue["queue_pending"]
+            return worker_id, idle
+
+    statuses = await asyncio.gather(*(inspect(worker) for worker in workers))
+    result = {worker_id: idle for worker_id, idle in statuses}
+    if require_idle and not any(result.values()):
+        raise RuntimeError("No selected feature-compatible direct worker is idle; unrelated worker prompts were left untouched")
+    return {worker_id: True for worker_id, idle in result.items() if idle}
 
 
 async def select_active_workers(

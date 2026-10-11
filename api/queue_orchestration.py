@@ -29,7 +29,9 @@ from .orchestration.prompt_transform import (
     generate_job_id_map,
     prepare_delegate_master_prompt,
     prune_prompt_for_worker,
+    _resolve_direct_workers_for_image_list,
 )
+from ..image_list.runtime import validate_image_list_regions
 
 
 prompt_server = server.PromptServer.instance
@@ -246,8 +248,42 @@ async def orchestrate_distributed_execution(
         media_sync_timeout_seconds,
     ) = _resolve_orchestration_limits(config)
     requested_ids = enabled_worker_ids if enabled_worker_ids is not None else None
-    workers = _resolve_enabled_workers(config, requested_ids)
     prompt_index = PromptIndex(prompt_obj)
+    image_list_start_ids = prompt_index.nodes_for_class("DistributedImageListStart")
+    image_list_mode = bool(image_list_start_ids)
+    if image_list_mode:
+        # Validate before probing or queueing anything so malformed boundaries and
+        # old worker releases fail before any upstream image is materialized.
+        validate_image_list_regions(prompt_obj)
+        other_distributed = (
+            prompt_index.nodes_for_class("DistributedCollector")
+            + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
+        )
+        if other_distributed:
+            raise ValueError(
+                "Distributed Image List v1 cannot be mixed with Distributed Collector or "
+                "Ultimate SD Upscale nodes in one prompt"
+            )
+        configured_serverless = [
+            str(worker.get("id")) for worker in config.get("workers", [])
+            if worker.get("enabled", False)
+            and str(worker.get("type") or "local").lower() == "serverless"
+            and (requested_ids is None or str(worker.get("id")) in {str(x) for x in requested_ids})
+        ]
+        if configured_serverless:
+            trace_debug(
+                execution_trace_id,
+                "Image List v1 explicitly excludes unsupported serverless pools: "
+                + ", ".join(configured_serverless),
+            )
+        workers = _resolve_direct_workers_for_image_list(config, requested_ids)
+        if not workers:
+            raise RuntimeError(
+                "Distributed Image List v1 requires an enabled selected direct local/remote worker; "
+                "serverless pools and master-only execution are unsupported"
+            )
+    else:
+        workers = _resolve_enabled_workers(config, requested_ids)
     load_balance_requested = _prompt_requests_load_balance(prompt_index)
     trace_debug(
         execution_trace_id,
@@ -266,6 +302,10 @@ async def orchestrate_distributed_execution(
     # Respect master delegate-only configuration
     if delegate_master is None:
         delegate_master = bool(config.get("settings", {}).get("master_delegate_only", False))
+    if image_list_mode:
+        # The master must execute each upstream dependency once to obtain the
+        # full typed lists; only the enclosed branch is delegated.
+        delegate_master = False
 
     if not workers and delegate_master:
         trace_debug(
@@ -281,8 +321,19 @@ async def orchestrate_distributed_execution(
         trace_execution_id=execution_trace_id,
         probe_concurrency=worker_probe_concurrency,
     )
+    if image_list_mode:
+        from .orchestration.dispatch import preflight_image_list_workers
+        if not active_workers:
+            raise RuntimeError(
+                "No selected direct worker is reachable for Distributed Image List; "
+                "the master will not duplicate per-image processing"
+            )
+        idle_ids = await preflight_image_list_workers(active_workers, require_idle=True)
+        active_workers = [worker for worker in active_workers if worker["id"] in idle_ids]
+        if not active_workers:
+            raise RuntimeError("No feature-compatible direct worker is idle; no master job was queued")
 
-    if load_balance_requested:
+    if load_balance_requested and not image_list_mode:
         candidate_workers = list(active_workers)
         if not delegate_master:
             # Include master in load balancing only when master participation is enabled.
@@ -385,7 +436,7 @@ async def orchestrate_distributed_execution(
             + ", ".join(f"{worker['name']} ({worker['id']})" for worker in active_workers),
         )
     worker_payloads = []
-    if active_workers:
+    if active_workers and not image_list_mode:
         worker_prep_semaphore = asyncio.Semaphore(worker_prep_concurrency)
         media_sync_semaphore = asyncio.Semaphore(media_sync_concurrency)
         worker_payloads = await asyncio.gather(
@@ -416,8 +467,9 @@ async def orchestrate_distributed_execution(
         manager.ensure_capacity(len(serverless_jobs))
 
     # Do not leave collector queues behind when offline compilation/media validation fails.
-    for job_id in job_id_map.values():
-        await _ensure_distributed_queue(job_id)
+    if not image_list_mode:
+        for job_id in job_id_map.values():
+            await _ensure_distributed_queue(job_id)
 
     if regular_payloads:
         await asyncio.gather(
@@ -468,4 +520,4 @@ async def orchestrate_distributed_execution(
         execution_trace_id,
         f"Orchestration complete: prompt_id={prompt_id}, dispatched_workers={len(worker_payloads)}, delegate_master={delegate_master}",
     )
-    return prompt_id, prompt_number, len(worker_payloads), node_errors
+    return prompt_id, prompt_number, (len(active_workers) if image_list_mode else len(worker_payloads)), node_errors

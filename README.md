@@ -27,6 +27,11 @@
 - Intelligent distribution
 - Handles single images and videos
 
+#### Dynamic Image-List Processing
+- Schedule one image at a time to the next available direct worker; collect results in input order
+- Use **Distributed Image List Start / End** around a per-image processing region
+- [Wiring, supported inputs, and first-version limits](/docs/image-list-queue.md)
+
 #### Ease of Use
 - Auto-setup local workers; easily add remote/cloud ones
 - Convert any workflow to distributed with 2 nodes
