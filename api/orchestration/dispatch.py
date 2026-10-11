@@ -173,9 +173,10 @@ async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0):
 
     async def inspect(worker):
         worker_id = str(worker.get("id") or "unknown")
-        async with semaphore:
-            cap_url = build_worker_url(worker, "/distributed/image-list/capabilities")
-            try:
+        check = "capability"
+        try:
+            async with semaphore:
+                cap_url = build_worker_url(worker, "/distributed/image-list/capabilities")
                 async with session.get(cap_url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
                     if response.status != 200:
                         raise RuntimeError(
@@ -183,37 +184,58 @@ async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0):
                             f"(HTTP {response.status}); upgrade that worker before running this feature"
                         )
                     capability = await response.json()
-            except asyncio.TimeoutError as exc:
-                raise RuntimeError(f"Image-list worker {worker_id} capability check timed out") from exc
-            except aiohttp.ClientError as exc:
-                raise RuntimeError(f"Image-list worker {worker_id} capability check failed: {exc}") from exc
-            nodes = set(capability.get("node_ids", [])) if isinstance(capability, dict) else set()
-            if (not isinstance(capability, dict) or capability.get("supported") is not True
-                    or capability.get("protocol_version") != 1 or not required_nodes.issubset(nodes)):
-                raise RuntimeError(
-                    f"Image-list worker {worker_id} is incompatible: requires protocol v1 and nodes "
-                    f"{sorted(required_nodes)}; no work was submitted"
-                )
-            queue_url = build_worker_url(worker, "/queue")
-            try:
+                if not isinstance(capability, dict):
+                    raise RuntimeError(f"Image-list worker {worker_id} returned malformed capability data")
+                supported = capability.get("supported")
+                protocol_version = capability.get("protocol_version")
+                nodes = capability.get("node_ids")
+                if (
+                    not isinstance(supported, bool)
+                    or type(protocol_version) is not int
+                    or not isinstance(nodes, list)
+                    or any(not isinstance(node_id, str) for node_id in nodes)
+                ):
+                    raise RuntimeError(f"Image-list worker {worker_id} returned malformed capability data")
+                if (
+                    supported is not True
+                    or protocol_version != 1
+                    or not required_nodes.issubset(nodes)
+                ):
+                    raise RuntimeError(
+                        f"Image-list worker {worker_id} is incompatible: requires protocol v1 and nodes "
+                        f"{sorted(required_nodes)}; no work was submitted"
+                    )
+
+                check = "queue"
+                queue_url = build_worker_url(worker, "/queue")
                 async with session.get(queue_url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
                     if response.status != 200:
                         raise RuntimeError(f"Image-list worker {worker_id} queue preflight returned HTTP {response.status}")
                     queue = await response.json()
-            except asyncio.TimeoutError as exc:
-                raise RuntimeError(f"Image-list worker {worker_id} queue preflight timed out") from exc
-            except aiohttp.ClientError as exc:
-                raise RuntimeError(f"Image-list worker {worker_id} queue preflight failed: {exc}") from exc
-            if not isinstance(queue, dict) or not isinstance(queue.get("queue_running"), list) or not isinstance(queue.get("queue_pending"), list):
-                raise RuntimeError(f"Image-list worker {worker_id} returned malformed /queue state")
-            idle = not queue["queue_running"] and not queue["queue_pending"]
-            return worker_id, idle
+                if (
+                    not isinstance(queue, dict)
+                    or not isinstance(queue.get("queue_running"), list)
+                    or not isinstance(queue.get("queue_pending"), list)
+                ):
+                    raise RuntimeError(f"Image-list worker {worker_id} returned malformed /queue state")
+                idle = not queue["queue_running"] and not queue["queue_pending"]
+                return worker_id, idle
+        except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as exc:
+            log(
+                f"[Distributed] Image-list worker {worker_id} unavailable during {check} check; "
+                f"skipping: {exc}"
+            )
+            return worker_id, None
 
     statuses = await asyncio.gather(*(inspect(worker) for worker in workers))
-    result = {worker_id: idle for worker_id, idle in statuses}
-    if require_idle and not any(result.values()):
+    idle_workers = {
+        worker_id: True
+        for worker_id, idle in statuses
+        if idle is True
+    }
+    if require_idle and not idle_workers:
         raise RuntimeError("No selected feature-compatible direct worker is idle; unrelated worker prompts were left untouched")
-    return {worker_id: True for worker_id, idle in result.items() if idle}
+    return idle_workers
 
 
 async def select_active_workers(

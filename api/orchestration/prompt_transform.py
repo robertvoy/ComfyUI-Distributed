@@ -442,14 +442,30 @@ def prepare_delegate_master_prompt(prompt_obj, collector_ids):
 
 
 def _resolve_direct_workers_for_image_list(config, requested_ids):
-    """Resolve only enabled direct workers already selected by orchestration."""
+    """Resolve enabled workers by default, or exact explicitly selected direct workers."""
     requested = None if requested_ids is None else {str(worker_id) for worker_id in requested_ids}
+    configured_workers = (config or {}).get("workers", [])
+    configured_ids = {
+        str(worker.get("id") or "").strip()
+        for worker in configured_workers
+        if str(worker.get("id") or "").strip()
+    }
+    if requested is not None:
+        unknown_ids = requested - configured_ids
+        if unknown_ids:
+            raise RuntimeError(
+                "Unknown explicitly selected image-list worker ID(s): "
+                + ", ".join(sorted(unknown_ids))
+            )
     direct = []
-    for worker in (config or {}).get("workers", []):
+    for worker in configured_workers:
         worker_id = str(worker.get("id") or "").strip()
-        if not worker_id or not worker.get("enabled", False):
+        if not worker_id:
             continue
-        if requested is not None and worker_id not in requested:
+        if requested is None:
+            if not worker.get("enabled", False):
+                continue
+        elif worker_id not in requested:
             continue
         if str(worker.get("type") or "local").strip().lower() == "serverless":
             continue
