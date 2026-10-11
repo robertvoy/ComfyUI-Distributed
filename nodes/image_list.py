@@ -132,7 +132,7 @@ class DistributedImageListEnd(io.ComfyNode):
             inputs=[
                 io.Image.Input("images", lazy=True),
                 io.Mask.Input("masks", optional=True, lazy=True),
-                io.String.Input("texts", optional=True, lazy=True),
+                io.String.Input("texts", optional=True, lazy=True, force_input=True),
                 io.Custom("DISTRIBUTED_IMAGE_LIST_CONTEXT").Input("context"),
             ],
             outputs=[

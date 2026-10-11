@@ -236,6 +236,25 @@ async def check_image_list_lazy_executor(mapping, module, prompt_server, asset_m
     }
     valid = await execution.validate_prompt('image-list-lazy', graph, None)
     assert valid[0], valid
+    validator = runtime.validate_image_list_regions
+    assert 'texts' not in graph['4']['inputs']
+    assert len(validator(graph)) == 1
+    connected_text_graph = json.loads(json.dumps(graph))
+    connected_text_graph['6'] = {
+        'class_type': 'ImageListTextProbe', 'inputs': {'text': ['2', 3]},
+    }
+    connected_text_graph['4']['inputs']['texts'] = ['6', 0]
+    assert len(validator(connected_text_graph)) == 1
+    for literal_text in ('', 'per-item text'):
+        literal_text_graph = json.loads(json.dumps(graph))
+        literal_text_graph['4']['inputs']['texts'] = literal_text
+        try:
+            validator(literal_text_graph)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'End accepted unconnected literal text: {literal_text!r}')
+    print('IMAGE_LIST_END_TEXT_INPUT_OK native forceInput; unconnected omitted; linked accepted; literals rejected')
     import folder_paths
     scratch = Path(os.environ.get('TMPDIR', Path.home() / '.hermes/cache/scratch'))
     try:
@@ -314,6 +333,10 @@ async def main():
     assert start_schema.display_name == 'Distributed Image List Start'
     assert end_schema.node_id == 'DistributedImageListEnd'
     assert end_schema.display_name == 'Distributed Image List End'
+    texts_input = next(input for input in end_schema.inputs if input.id == 'texts')
+    texts_schema = texts_input.as_dict()
+    assert texts_schema.get('forceInput') is True, texts_schema
+    assert 'default' not in texts_schema, texts_schema
     assert [out.io_type for out in start_schema.outputs] == [
         'IMAGE', 'IMAGE', 'MASK', 'STRING', 'FLOAT', 'INT', 'INT', 'DISTRIBUTED_IMAGE_LIST_CONTEXT']
     assert all(out.is_output_list for out in start_schema.outputs)
