@@ -4,6 +4,8 @@ import types
 import unittest
 import asyncio
 import base64
+import io
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -26,6 +28,17 @@ class _FakeRequest:
         return self._payload
 
 
+def _register_real_transfer_codec(package_name, utils_pkg):
+    """Load the real utils/transfer_codec.py into the synthetic test package."""
+    codec_path = Path(__file__).resolve().parents[2] / "utils" / "transfer_codec.py"
+    codec_spec = importlib.util.spec_from_file_location(f"{package_name}.utils.transfer_codec", codec_path)
+    codec_module = importlib.util.module_from_spec(codec_spec)
+    sys.modules[f"{package_name}.utils.transfer_codec"] = codec_module
+    codec_spec.loader.exec_module(codec_module)
+    utils_pkg.transfer_codec = codec_module
+    return codec_module
+
+
 def _load_job_routes_module():
     module_path = Path(__file__).resolve().parents[2] / "api" / "job_routes.py"
     package_name = "dist_api_queue_testpkg"
@@ -46,6 +59,7 @@ def _load_job_routes_module():
     utils_pkg = types.ModuleType(f"{package_name}.utils")
     utils_pkg.__path__ = []
     sys.modules[f"{package_name}.utils"] = utils_pkg
+    _register_real_transfer_codec(package_name, utils_pkg)
 
     # aiohttp.web stub
     created_aiohttp_stub = False
@@ -392,6 +406,145 @@ class JobCompleteAudioPayloadTests(unittest.IsolatedAsyncioTestCase):
         }
         with self.assertRaises(ValueError):
             job_routes._decode_audio_payload(payload)
+
+
+class _FakeFileField:
+    def __init__(self, data):
+        self.file = io.BytesIO(data)
+
+
+class _FakeMultipartRequest:
+    content_type = "multipart/form-data"
+
+    def __init__(self, envelope, parts):
+        from multidict import MultiDict
+
+        fields = [("envelope", envelope if isinstance(envelope, str) else json.dumps(envelope))]
+        fields += [("media", _FakeFileField(part)) for part in parts]
+        self._form = MultiDict(fields)
+
+    async def post(self):
+        return self._form
+
+    async def json(self):
+        raise ValueError("not JSON")
+
+
+class JobCompleteCompressedPayloadTests(unittest.IsolatedAsyncioTestCase):
+    codec = job_routes.transfer_codec
+
+    def setUp(self):
+        self.queue = asyncio.Queue()
+        job_routes.prompt_server.distributed_jobs_lock = asyncio.Lock()
+        job_routes.prompt_server.distributed_pending_jobs = {"job-z": self.queue}
+
+    def _frames(self, count=4, height=20, width=30):
+        rng = np.random.default_rng(1)
+        return rng.integers(0, 256, (count, height, width, 3), dtype=np.uint8)
+
+    def _request_for(self, frames, fmt, *, start_offset=0, is_last=True, audio=None, **overrides):
+        chunk = next(self.codec.encode_chunks(frames, fmt, 90, 10**9))
+        parts = chunk.pop("parts")
+        envelope = {
+            "job_id": "job-z",
+            "worker_id": "worker-1",
+            "is_last": is_last,
+            **chunk,
+            "start_index": chunk["start_index"] + start_offset,
+        }
+        if audio is not None:
+            envelope["audio"] = audio
+        envelope.update(overrides)
+        return _FakeMultipartRequest(envelope, parts)
+
+    async def _drain(self):
+        items = []
+        while not self.queue.empty():
+            items.append(await self.queue.get())
+        return items
+
+    async def test_lossless_chunk_enqueues_one_item_per_frame_bit_exact(self):
+        frames = self._frames()
+        response = await job_routes.job_complete_endpoint(self._request_for(frames, "ffv1", start_offset=10))
+
+        self.assertEqual(response.status, 200)
+        items = await self._drain()
+        self.assertEqual([item["image_index"] for item in items], [10, 11, 12, 13])
+        self.assertEqual([item["is_last"] for item in items], [False, False, False, True])
+        self.assertEqual({item["worker_id"] for item in items}, {"worker-1"})
+        for item, frame in zip(items, frames):
+            self.assertEqual(tuple(item["tensor"].shape), (1, 20, 30, 3))
+            self.assertEqual(item["tensor"].dtype, torch.float32)
+            expected = frame.astype(np.float32) / 255.0
+            self.assertTrue(np.array_equal(item["tensor"][0].numpy(), expected))
+
+    async def test_non_final_chunk_never_marks_worker_done(self):
+        response = await job_routes.job_complete_endpoint(
+            self._request_for(self._frames(count=2), "png", is_last=False)
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertFalse(any(item["is_last"] for item in await self._drain()))
+
+    async def test_audio_is_attached_only_to_final_frame(self):
+        audio = JobCompleteAudioPayloadTests._encoded_audio_payload(None)
+        response = await job_routes.job_complete_endpoint(
+            self._request_for(self._frames(count=3), "jpeg", audio=audio)
+        )
+
+        self.assertEqual(response.status, 200)
+        items = await self._drain()
+        self.assertEqual([item["audio"] is not None for item in items], [False, False, True])
+        self.assertEqual(tuple(items[-1]["audio"]["waveform"].shape), (1, 2, 4))
+
+    async def test_rejects_frame_count_mismatch(self):
+        response = await job_routes.job_complete_endpoint(
+            self._request_for(self._frames(count=2), "ffv1", count=5)
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("frames", response.payload["message"])
+        self.assertTrue(self.queue.empty())
+
+    async def test_rejects_bad_envelope(self):
+        response = await job_routes.job_complete_endpoint(
+            self._request_for(self._frames(count=1), "png", format="gif", is_last="yes")
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("format", response.payload["message"])
+        self.assertIn("is_last", response.payload["message"])
+
+    async def test_rejects_invalid_envelope_json(self):
+        response = await job_routes.job_complete_endpoint(_FakeMultipartRequest("{not json", [b"x"]))
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("envelope", response.payload["message"])
+
+    async def test_unknown_job_returns_404(self):
+        job_routes.prompt_server.distributed_pending_jobs = {}
+        with patch.object(job_routes, "JOB_INIT_GRACE_PERIOD", 0.0):
+            response = await job_routes.job_complete_endpoint(self._request_for(self._frames(count=1), "png"))
+
+        self.assertEqual(response.status, 404)
+
+    async def test_legacy_json_payload_still_accepted(self):
+        request = _FakeRequest(
+            {
+                "job_id": "job-z",
+                "worker_id": "worker-1",
+                "batch_idx": 3,
+                "image": "data:image/png;base64,AAAA",
+                "is_last": True,
+            }
+        )
+        with patch.object(job_routes, "_decode_canonical_png_tensor", return_value="tensor-data"):
+            response = await job_routes.job_complete_endpoint(request)
+
+        self.assertEqual(response.status, 200)
+        items = await self._drain()
+        self.assertEqual(len(items), 1)
+        self.assertEqual((items[0]["image_index"], items[0]["tensor"]), (3, "tensor-data"))
 
 
 if __name__ == "__main__":
