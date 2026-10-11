@@ -333,3 +333,60 @@ def test_resolves_boolean_and_float_primitive_links():
 
     assert graph["5"]["inputs"] == {"enabled": True, "cfg": 2.5}
     assert not {"1", "2", "3", "4"}.intersection(graph)
+
+
+def test_compiled_graph_matches_golden_prompt_and_manifest():
+    prompt = _prepared_prompt()
+    prompt["3"]["inputs"]["seed"] = ["10", 0]
+    prompt["10"] = {"class_type": "PrimitiveInt", "inputs": {"value": 40}}
+    prompt["11"] = {"class_type": "PrimitiveFloat", "inputs": {"value": 1.25}}
+    prompt["12"] = {
+        "class_type": "DistributedValue",
+        "inputs": {
+            "default_value": ["11", 0],
+            "worker_values": json.dumps({"_type": "FLOAT", "1": "2.5"}),
+            "is_worker": True,
+            "worker_id": "worker_0",
+        },
+    }
+    prompt["13"] = {"class_type": "PrimitiveString", "inputs": {"value": "model.safetensors"}}
+    prompt["14"] = {"class_type": "DistributedModelName", "inputs": {"text": ["13", 0]}}
+    prompt["2"]["inputs"].update(cfg=["12", 0], model_name=["14", 0])
+
+    graph, manifest = _run(prompt)
+
+    expected_prefix = (
+        "serverless_job_42_worker_0_4_image_"
+        "1c81da108a2eb60282bd436512acfc59903aba73e49b19b6f47bbdcafd30d244"
+    )
+    assert list(graph) == ["1", "2", "15"]
+    assert graph == {
+        "1": {
+            "class_type": "CheckpointLoaderSimple",
+            "inputs": {},
+            "_meta": {"title": "source"},
+        },
+        "2": {
+            "class_type": "KSampler",
+            "inputs": {
+                "model": ["1", 0],
+                "seed": 41,
+                "cfg": 2.5,
+                "model_name": "model.safetensors",
+            },
+        },
+        "15": {
+            "class_type": "SaveImage",
+            "inputs": {"images": ["2", 0], "filename_prefix": expected_prefix},
+            "_meta": {"title": "Serverless output: collector 4 (image)"},
+        },
+    }
+    assert manifest == [
+        {
+            "collector_id": "4",
+            "job_id": "job/42",
+            "node_id": "15",
+            "kind": "image",
+            "prefix": expected_prefix,
+        }
+    ]

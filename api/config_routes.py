@@ -25,7 +25,12 @@ except ImportError:
             save_config(config)
 from ..utils.logging import debug_log, log
 from ..utils.network import handle_api_error, normalize_host
-from ..utils.serverless_config import public_config, validate_serverless_worker
+from ..utils.secret_fields import is_secret_field_name
+from ..utils.serverless_config import (
+    ServerlessSecretChanges,
+    public_config,
+    validate_serverless_worker,
+)
 
 
 def _positive_int(value):
@@ -107,16 +112,11 @@ def _error_response(message, status):
     return web.json_response({"status": "error", "message": message}, status=status)
 
 
-def _is_secret_field_name(key):
-    normalized = "".join(character for character in key.casefold() if character.isalnum())
-    return normalized in {"apikey", "clearapikey"} or "credential" in normalized
-
-
 def _contains_secret_fields(value, *, allow_root_serverless_secrets=False, depth=0):
     if isinstance(value, dict):
         for key, item in value.items():
             field_name = key.casefold() if isinstance(key, str) else ""
-            if field_name and _is_secret_field_name(field_name):
+            if is_secret_field_name(field_name):
                 if not (allow_root_serverless_secrets and depth == 0 and key in _SECRET_FIELDS):
                     return True
             if _contains_secret_fields(
@@ -140,20 +140,7 @@ def _serverless_secret_store():
 
 def _serverless_pool_is_active(worker_id):
     from .orchestration.serverless_runtime import get_manager
-    manager = get_manager()
-    tasks = getattr(manager, "tasks", {})
-    runs = getattr(manager, "runs", {})
-    for run_id, task in tasks.items():
-        if task.done():
-            continue
-        run = runs.get(run_id)
-        worker = run.get("worker") if isinstance(run, dict) else None
-        if not isinstance(worker, dict):
-            continue
-        pool_id = worker.get("pool_id", worker.get("id"))
-        if str(pool_id) == str(worker_id):
-            return True
-    return False
+    return get_manager().pool_is_active(worker_id)
 
 
 def _ensure_pool_idle(worker_id):
@@ -181,7 +168,7 @@ def _strip_sensitive_fields(value: Any) -> Any:
         return {
             key: _strip_sensitive_fields(item)
             for key, item in value.items()
-            if not (isinstance(key, str) and _is_secret_field_name(key))
+            if not is_secret_field_name(key)
         }
     if isinstance(value, list):
         return [_strip_sensitive_fields(item) for item in value]
@@ -237,16 +224,6 @@ def _bulk_serverless_changes(old_workers, new_workers):
         elif new is not None and new.get("type") == "serverless":
             secret_ids.add(worker_id)
     return secret_ids
-
-
-def _restore_secret(store, worker_id, prior_secret):
-    try:
-        if prior_secret is None:
-            store.delete(worker_id)
-        else:
-            store.set(worker_id, prior_secret)
-    except Exception:
-        pass
 
 
 @server.PromptServer.instance.routes.get("/distributed/config")
@@ -308,43 +285,39 @@ async def update_config_endpoint(request):
         }, status=400)
 
     store = None
-    changed_secrets = []
-    secret_changes_applied = False
+    response_config = None
     try:
-        async with config_transaction() as config:
-            if "workers" in validated_root:
-                old_workers = config.get("workers", [])
-                validated_root["workers"] = _clean_bulk_type_conversions(
-                    old_workers, validated_root["workers"]
-                )
-                changed_ids = _bulk_serverless_changes(old_workers, validated_root["workers"])
-                for worker in validated_root["workers"]:
-                    if isinstance(worker, dict) and worker.get("type") == "serverless" and worker.get("enabled", False):
+        with ServerlessSecretChanges() as secret_changes:
+            async with config_transaction() as config:
+                if "workers" in validated_root:
+                    old_workers = config.get("workers", [])
+                    validated_root["workers"] = _clean_bulk_type_conversions(
+                        old_workers, validated_root["workers"]
+                    )
+                    changed_ids = _bulk_serverless_changes(old_workers, validated_root["workers"])
+                    for worker in validated_root["workers"]:
+                        if isinstance(worker, dict) and worker.get("type") == "serverless" and worker.get("enabled", False):
+                            store = store or _serverless_secret_store()
+                            if worker["id"] in changed_ids or not store.has(worker["id"]):
+                                return _error_response("Save an API key before enabling this pool", 400)
+                    if changed_ids:
                         store = store or _serverless_secret_store()
-                        if worker["id"] in changed_ids or not store.has(worker["id"]):
-                            return _error_response("Save an API key before enabling this pool", 400)
-                if changed_ids:
-                    store = store or _serverless_secret_store()
-                    for worker_id in sorted(changed_ids):
-                        prior_secret = store.get(worker_id)
-                        changed_secrets.append((worker_id, prior_secret))
-                        if prior_secret is not None:
-                            store.delete(worker_id)
-                            secret_changes_applied = True
+                        for worker_id in sorted(changed_ids):
+                            prior_secret = secret_changes.capture(store, worker_id)
+                            if prior_secret is not None:
+                                secret_changes.delete(store, worker_id)
 
-            settings = config.setdefault("settings", {})
-            settings.update(validated_settings)
-            for key, value in validated_root.items():
-                config[key] = value
-            response_config = public_config(config, store or _serverless_secret_store())
-
-        return web.json_response({"status": "success", "config": response_config})
+                settings = config.setdefault("settings", {})
+                settings.update(validated_settings)
+                for key, value in validated_root.items():
+                    config[key] = value
+                response_config = public_config(config, store or _serverless_secret_store())
+            response = web.json_response({"status": "success", "config": response_config})
+            secret_changes.commit()
+            return response
     except _ActivePoolCheckError:
-        return _error_response("Wait for active serverless jobs before changing this pool", 409)
+        return _error_response("Finish or reconcile unresolved serverless jobs before changing this pool", 409)
     except Exception:
-        if secret_changes_applied and store is not None:
-            for worker_id, prior_secret in changed_secrets:
-                _restore_secret(store, worker_id, prior_secret)
         return _error_response("Unable to update config", 500)
 
 
@@ -368,9 +341,19 @@ async def queue_status_endpoint(request):
 
 @server.PromptServer.instance.routes.post("/distributed/config/update_worker")
 async def update_worker_endpoint(request):
+    return await _run_with_serverless_secret_changes(_update_worker_endpoint, request)
+
+
+async def _run_with_serverless_secret_changes(endpoint, request):
+    with ServerlessSecretChanges() as secret_changes:
+        response = await endpoint(request, secret_changes)
+        if response.status < 400:
+            secret_changes.commit()
+        return response
+
+
+async def _update_worker_endpoint(request, secret_changes):
     store = None
-    prior_secret = None
-    secret_changed = False
     worker_id = None
     try:
         try:
@@ -429,7 +412,7 @@ async def update_worker_endpoint(request):
                     return _error_response("name must be a string", 400)
 
                 store = _serverless_secret_store()
-                prior_secret = store.get(worker_id)
+                prior_secret = secret_changes.capture(store, worker_id)
                 converting_to_serverless = current_type != "serverless"
                 next_secret = None if converting_to_serverless else prior_secret
                 if supplied_key:
@@ -455,10 +438,9 @@ async def update_worker_endpoint(request):
 
                 if next_secret != prior_secret:
                     if next_secret is None:
-                        store.delete(worker_id)
+                        secret_changes.delete(store, worker_id)
                     else:
-                        store.set(worker_id, next_secret)
-                    secret_changed = True
+                        secret_changes.set(store, worker_id, next_secret)
 
                 if existing is None:
                     workers.append(validated)
@@ -476,10 +458,9 @@ async def update_worker_endpoint(request):
                         return _error_response("Invalid worker credentials", 400)
                     _ensure_pool_idle(worker_id)
                     store = _serverless_secret_store()
-                    prior_secret = store.get(worker_id)
+                    prior_secret = secret_changes.capture(store, worker_id)
                     if prior_secret is not None:
-                        store.delete(worker_id)
-                        secret_changed = True
+                        secret_changes.delete(store, worker_id)
                     for field in _SERVERLESS_ONLY_FIELDS:
                         existing.pop(field, None)
                 elif _contains_secret_fields(data):
@@ -508,24 +489,20 @@ async def update_worker_endpoint(request):
 
         return web.json_response(result)
     except _ActivePoolCheckError:
-        if secret_changed and store is not None:
-            _restore_secret(store, worker_id, prior_secret)
-        return _error_response("Wait for active serverless jobs before changing this pool", 409)
+        return _error_response("Finish or reconcile unresolved serverless jobs before changing this pool", 409)
     except ValueError:
-        if secret_changed and store is not None:
-            _restore_secret(store, worker_id, prior_secret)
         return _error_response("Invalid worker configuration", 400)
     except Exception:
-        if secret_changed and store is not None:
-            _restore_secret(store, worker_id, prior_secret)
         return _error_response("Unable to update worker configuration", 500)
 
 
 @server.PromptServer.instance.routes.post("/distributed/config/delete_worker")
 async def delete_worker_endpoint(request):
+    return await _run_with_serverless_secret_changes(_delete_worker_endpoint, request)
+
+
+async def _delete_worker_endpoint(request, secret_changes):
     store = None
-    prior_secret = None
-    secret_changed = False
     worker_id = None
     try:
         try:
@@ -547,10 +524,10 @@ async def delete_worker_endpoint(request):
             if _worker_type(removed) == "serverless":
                 _ensure_pool_idle(worker_id)
                 store = _serverless_secret_store()
-                prior_secret = store.get(str(worker_id))
+                secret_worker_id = str(worker_id)
+                prior_secret = secret_changes.capture(store, secret_worker_id)
                 if prior_secret is not None:
-                    store.delete(str(worker_id))
-                    secret_changed = True
+                    secret_changes.delete(store, secret_worker_id)
             workers.remove(removed)
             result = {
                 "status": "success",
@@ -560,12 +537,8 @@ async def delete_worker_endpoint(request):
 
         return web.json_response(result)
     except _ActivePoolCheckError:
-        if secret_changed and store is not None:
-            _restore_secret(store, str(worker_id), prior_secret)
-        return _error_response("Wait for active serverless jobs before changing this pool", 409)
+        return _error_response("Finish or reconcile unresolved serverless jobs before changing this pool", 409)
     except Exception:
-        if secret_changed and store is not None:
-            _restore_secret(store, str(worker_id), prior_secret)
         return _error_response("Unable to delete worker", 500)
 
 @server.PromptServer.instance.routes.post("/distributed/config/update_setting")

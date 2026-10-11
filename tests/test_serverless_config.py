@@ -5,6 +5,7 @@ import stat
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,6 +18,11 @@ def _load_serverless_config_module(*, without_fcntl=False):
         if without_fcntl
         else "dist_serverless_config_test_module"
     )
+    package_name = module_name + "_pkg"
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(module_path.parent)]
+    sys.modules[package_name] = package
+    module_name = package_name + ".serverless_config"
     sys.modules.pop(module_name, None)
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     assert spec is not None and spec.loader is not None
@@ -319,6 +325,34 @@ class PublicConfigTests(unittest.TestCase):
         self.assertEqual(config, original)
         self.assertIsNot(result, config)
         self.assertIsNot(result["workers"], config["workers"])
+
+    def test_redacts_normalized_secret_field_aliases(self):
+        config = {
+            "workers": [{
+                "id": "serverless-1",
+                "type": "serverless",
+                "apiKey": "camel-api-key",
+                "APIKEY": "upper-api-key",
+                "clearApiKey": "camel-clear-key",
+                "CLEAR_API_KEY": "upper-clear-key",
+                "runpod_CREDENTIAL": "provider-credential",
+                "nested": {"credential_note": "nested-credential"},
+                "safe": "preserved",
+            }]
+        }
+
+        result = serverless_config.public_config(
+            config, serverless_config.SecretStore(self.root_path())
+        )
+
+        worker = result["workers"][0]
+        self.assertEqual(worker, {
+            "id": "serverless-1",
+            "type": "serverless",
+            "nested": {},
+            "safe": "preserved",
+            "api_key_configured": False,
+        })
 
     def test_handles_non_dict_config_without_mutating_it(self):
         config = ["safe", {"api_key": "secret"}]

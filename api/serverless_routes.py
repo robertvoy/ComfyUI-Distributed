@@ -16,13 +16,15 @@ async def _status(worker_id, fresh=False):
     worker = _pool(worker_id)
     if worker is None:
         return web.json_response({"ok": False, "message": "Serverless worker not found"}, status=404)
+    jobs = []
     try:
         manager = get_manager()
+        jobs = manager.public_jobs(worker_id)
         result = await manager.health(worker, fresh=fresh)
-        return web.json_response(dict(result, jobs=manager.public_jobs(worker_id)))
+        return web.json_response(dict(result, jobs=jobs))
     except Exception as exc:
         message = str(exc) if isinstance(exc, RunpodError) else "Check the saved endpoint ID and API key"
-        return web.json_response({"ok": False, "queueRemaining": 0, "message": message})
+        return web.json_response({"ok": False, "queueRemaining": 0, "message": message, "jobs": jobs})
 
 
 @server.PromptServer.instance.routes.post("/distributed/serverless/test")
@@ -56,3 +58,41 @@ async def cancel_serverless_endpoint(request):
                                   "message": "Cancellation requested for this master's jobs only"})
     except Exception:
         return web.json_response({"ok": False, "message": "Cancellation could not be confirmed; check provider jobs"}, status=502)
+
+
+async def _recover(request, *, acknowledge=False):
+    try:
+        data = await request.json()
+        worker_id = data.get("worker_id")
+        if not isinstance(worker_id, str) or not worker_id.strip():
+            raise ValueError()
+        record_id = data.get("record_id")
+        if acknowledge:
+            if not isinstance(record_id, str) or not record_id.strip() or data.get("provider_checked") is not True:
+                raise ValueError()
+    except Exception:
+        return web.json_response({"ok": False, "message": "Provide a worker ID; manual resolution also requires a record ID and provider_checked: true"}, status=400)
+    if _pool(worker_id) is None:
+        return web.json_response({"ok": False, "message": "Serverless worker not found"}, status=404)
+    try:
+        manager = get_manager()
+        if acknowledge:
+            await manager.acknowledge_recovery(worker_id, record_id, provider_checked=True)
+            result = {"message": "Recovery acknowledged by operator; not provider-confirmed cancellation"}
+        else:
+            result = {"resolved": await manager.reconcile(worker_id=worker_id)}
+        return web.json_response(dict(result, ok=True, jobs=manager.public_jobs(worker_id)))
+    except ValueError:
+        return web.json_response({"ok": False, "message": "Unresolved inactive job not found for this pool"}, status=409)
+    except Exception:
+        return web.json_response({"ok": False, "message": "Recovery could not be confirmed; retained jobs remain protected"}, status=502)
+
+
+@server.PromptServer.instance.routes.post("/distributed/serverless/reconcile")
+async def reconcile_serverless_endpoint(request):
+    return await _recover(request)
+
+
+@server.PromptServer.instance.routes.post("/distributed/serverless/resolve")
+async def resolve_serverless_endpoint(request):
+    return await _recover(request, acknowledge=True)

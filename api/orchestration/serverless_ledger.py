@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import threading
 
-TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}
+from .serverless_state import TERMINAL
 FIELDS = {"record_id", "execution_id", "worker_id", "participant_id", "endpoint_id", "job_id", "status", "created_at", "updated_at", "error", "prompt_id"}
 
 

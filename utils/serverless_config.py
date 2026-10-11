@@ -18,6 +18,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from .secret_fields import is_secret_field_name
+
 try:
     import fcntl
 except ImportError:  # Windows and other platforms without POSIX file locking.
@@ -41,7 +43,6 @@ _NUMERIC_FIELDS = {
     "concurrency": (1, 16, 1),
     "timeout_seconds": (30, 86400, 1800),
 }
-_SENSITIVE_FIELD_NAMES = {"api_key", "clear_api_key"}
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
 
@@ -344,12 +345,72 @@ class SecretStore:
                 pass
 
 
+class ServerlessSecretChanges:
+    """Apply serverless secret changes and restore them unless committed.
+
+    Use this around the associated config transaction so a failed config save
+    compensates any secret-store writes or deletions made along the way.
+    """
+
+    def __init__(self):
+        self._originals: dict[tuple[int, str], tuple[SecretStore, str, str | None]] = {}
+        self._mutations: list[tuple[int, str]] = []
+        self._committed = False
+
+    def __enter__(self) -> "ServerlessSecretChanges":
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> bool:
+        if not self._committed:
+            self.rollback()
+        return False
+
+    def capture(self, store: SecretStore, worker_id: str) -> str | None:
+        """Capture and return the original key once per store/worker pair."""
+        mutation_id = (id(store), worker_id)
+        if mutation_id not in self._originals:
+            self._originals[mutation_id] = (store, worker_id, store.get(worker_id))
+        return self._originals[mutation_id][2]
+
+    def set(self, store: SecretStore, worker_id: str, key: str) -> None:
+        self._prepare_mutation(store, worker_id)
+        store.set(worker_id, key)
+
+    def delete(self, store: SecretStore, worker_id: str) -> None:
+        self._prepare_mutation(store, worker_id)
+        store.delete(worker_id)
+
+    def commit(self) -> None:
+        """Keep the secret changes after the corresponding config save."""
+        self._committed = True
+
+    def rollback(self) -> None:
+        """Best-effort restoration without masking the original route error."""
+        for mutation_id in reversed(self._mutations):
+            store, worker_id, prior_secret = self._originals[mutation_id]
+            try:
+                if prior_secret is None:
+                    store.delete(worker_id)
+                else:
+                    store.set(worker_id, prior_secret)
+            except Exception:
+                pass
+        self._mutations.clear()
+
+    def _prepare_mutation(self, store: SecretStore, worker_id: str) -> None:
+        self.capture(store, worker_id)
+        mutation_id = (id(store), worker_id)
+        if mutation_id not in self._mutations:
+            # Record before applying: a store operation may fail after replacing
+            # its file, so the exception path must still attempt compensation.
+            self._mutations.append(mutation_id)
+
+
 def _redact_credentials(value):
     if isinstance(value, dict):
         redacted = {}
         for key, item in value.items():
-            field_name = key.casefold() if isinstance(key, str) else ""
-            if field_name in _SENSITIVE_FIELD_NAMES or "credential" in field_name:
+            if is_secret_field_name(key):
                 continue
             redacted[key] = _redact_credentials(item)
         return redacted

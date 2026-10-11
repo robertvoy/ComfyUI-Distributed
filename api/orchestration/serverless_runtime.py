@@ -5,7 +5,11 @@ import uuid
 from pathlib import Path
 
 from .runpod_client import RunpodClient, RunpodError, AmbiguousSubmission
-from .serverless_ledger import JobLedger, TERMINAL
+from .serverless_ledger import JobLedger
+from .serverless_state import (
+    PROVIDER_STATES, PROVIDER_TERMINAL, belongs_to_pool, is_unresolved,
+    occupies_capacity, terminal_provider_status,
+)
 
 
 async def decode_results(output, manifest):
@@ -48,6 +52,48 @@ class ServerlessManager:
         self.health_cache = {}
         self.health_locks = {}
         self.poll_seconds = 2.0
+        self.capacity_changed = asyncio.Condition()
+        self.recovery_lock = asyncio.Lock()
+        self._recover_local_records()
+
+    def _recover_local_records(self):
+        # WAITING is committed before admission; it cannot have reached Runpod.
+        # SUBMITTING is an intent record, so a lost ID must remain reserved.
+        for record in self.ledger.all():
+            if record.get("status") == "WAITING" and not record.get("job_id"):
+                self.ledger.update(record["record_id"], status="CANCELLED", updated_at=time.time())
+            elif record.get("status") == "SUBMITTING" and not record.get("job_id"):
+                self.ledger.update(record["record_id"], status="UNKNOWN", updated_at=time.time())
+
+    def _task_is_active(self, record_id):
+        task = self.tasks.get(record_id)
+        return task is not None and not task.done()
+
+    def pool_is_active(self, worker_id):
+        """Protect both live local work and unresolved pre-restart provider work."""
+        for rid, run in self.runs.items():
+            pool_id = run["worker"].get("pool_id", run["worker"]["id"])
+            if str(pool_id) == str(worker_id) and self._task_is_active(rid):
+                return True
+        return any(belongs_to_pool(record, worker_id) and is_unresolved(record)
+                   for record in self.ledger.all())
+
+    async def _reserve_provider_capacity(self, run):
+        pool_id = run["worker"].get("pool_id", run["worker"]["id"])
+        async with self.capacity_changed:
+            while True:
+                self._check_master(run)
+                outstanding = sum(belongs_to_pool(record, pool_id) and occupies_capacity(record)
+                                  for record in self.ledger.all())
+                if outstanding < run["worker"]["concurrency"]:
+                    # Claim atomically before any await that could submit a billed job.
+                    self.ledger.update(run["record_id"], status="SUBMITTING", updated_at=time.time())
+                    return
+                await self.capacity_changed.wait()
+
+    async def _notify_capacity(self):
+        async with self.capacity_changed:
+            self.capacity_changed.notify_all()
 
     async def _client(self, worker):
         pool_id = worker.get("pool_id", worker["id"])
@@ -83,7 +129,7 @@ class ServerlessManager:
             current = (limit, asyncio.Semaphore(limit))
             self.pool_limits[pool_id] = current
         elif current[0] != limit:
-            if any(not task.done() and self.runs[rid]["worker"].get("pool_id", self.runs[rid]["worker"]["id"]) == pool_id for rid, task in self.tasks.items()):
+            if self.pool_is_active(pool_id):
                 raise ValueError("Wait for this serverless pool's current jobs before changing concurrency")
             current = (limit, asyncio.Semaphore(limit))
             self.pool_limits[pool_id] = current
@@ -144,10 +190,10 @@ class ServerlessManager:
         if run["provider_job_id"] and run["client"]:
             try:
                 result = await run["client"].cancel(run["provider_job_id"])
-                return isinstance(result, dict) and result.get("status") == "CANCELLED"
+                return terminal_provider_status(result)
             except Exception:
-                return False
-        return False
+                return None
+        return None
 
     def _check_master(self, run):
         queue = getattr(self.server, "prompt_queue", None)
@@ -169,10 +215,9 @@ class ServerlessManager:
         try:
             async with asyncio.timeout(max(0, run["deadline"] - time.monotonic())):
                 async with semaphore:
-                    self._check_master(run)
+                    await self._reserve_provider_capacity(run)
                     client = await self._client(run["worker"])
                     run["client"] = client
-                    self.ledger.update(rid, status="SUBMITTING", updated_at=time.time())
                     submitted = True
                     job_id = await client.submit(run["workflow"], run["images"], run["worker"]["timeout_seconds"])
                     run["provider_job_id"] = job_id
@@ -182,9 +227,9 @@ class ServerlessManager:
                         self._check_master(run)
                         response = await client.status(job_id)
                         status = response.get("status")
-                        if status not in {"IN_QUEUE", "IN_PROGRESS", "COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT"}:
+                        if not isinstance(status, str) or status not in PROVIDER_STATES:
                             raise RunpodError("Runpod returned an unknown job state")
-                        provider_terminal = status in TERMINAL
+                        provider_terminal = status in PROVIDER_TERMINAL
                         if status == "COMPLETED":
                             output = response.get("output")
                             if not isinstance(output, dict) or output.get("error") or output.get("errors"):
@@ -195,30 +240,30 @@ class ServerlessManager:
                             self.ledger.update(rid, status="COMPLETED", updated_at=time.time())
                             return
                         self.ledger.update(rid, status=status, updated_at=time.time())
-                        if status in TERMINAL:
+                        if provider_terminal:
                             raise RunpodError(f"Serverless job ended with {status}")
                         await asyncio.sleep(self.poll_seconds)
         except AmbiguousSubmission as exc:
             self.ledger.update(rid, status="UNKNOWN", error=str(exc), updated_at=time.time())
             await self._deliver(run, error=str(exc))
         except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
-            confirmed = await self._cancel_provider(run)
+            terminal = "FAILED" if provider_terminal else await self._cancel_provider(run)
             if submitted and not run["provider_job_id"]:
                 status = "UNKNOWN"
                 error = "Submission interrupted before its job ID was received; check Runpod before retrying"
             elif isinstance(exc, asyncio.TimeoutError):
-                status = "TIMED_OUT" if not run["provider_job_id"] or confirmed else "CANCEL_REQUESTED"
+                status = terminal or ("CANCEL_REQUESTED" if run["provider_job_id"] else "TIMED_OUT")
                 error = "Serverless job exceeded its queue/execution deadline"
             else:
-                status = "CANCELLED" if not run["provider_job_id"] or confirmed else "CANCEL_REQUESTED"
-                error = "Serverless job cancelled" if confirmed or not submitted else "Serverless cancellation requested; provider confirmation is pending"
+                status = terminal or ("CANCEL_REQUESTED" if run["provider_job_id"] else "CANCELLED")
+                error = "Serverless work stopped" if terminal or not submitted else "Serverless cancellation requested; provider confirmation is pending"
             self.ledger.update(rid, status=status, error=error, updated_at=time.time())
             await self._deliver(run, error=error)
         except Exception as exc:
             # If polling/decoding failed, stop only our own provider job, never the pool.
-            confirmed = await self._cancel_provider(run) if not provider_terminal else True
+            terminal = "FAILED" if provider_terminal else await self._cancel_provider(run)
             error = str(exc) if isinstance(exc, RunpodError) else "Serverless processing failed; check the workflow and endpoint contract"
-            status = "CANCEL_REQUESTED" if run["provider_job_id"] and not confirmed else "FAILED"
+            status = terminal or ("CANCEL_REQUESTED" if run["provider_job_id"] else "FAILED")
             self.ledger.update(rid, status=status, error=error, updated_at=time.time())
             await self._deliver(run, error=error)
         finally:
@@ -227,13 +272,61 @@ class ServerlessManager:
             run.pop("workflow", None)
             run.pop("images", None)
             run["client"] = None
+            # A released local semaphore alone cannot release a durable reservation.
+            await self._notify_capacity()
 
     async def wait_for_execution(self, execution_id):
         tasks = [task for rid, task in self.tasks.items() if self.runs[rid]["execution_id"] == execution_id]
         await asyncio.gather(*tasks, return_exceptions=False)
 
+    def _detached_records(self, worker_id=None, execution_id=None):
+        return [record for record in self.ledger.all()
+                if is_unresolved(record) and not self._task_is_active(record["record_id"])
+                and (worker_id is None or belongs_to_pool(record, worker_id))
+                and (execution_id is None or record.get("execution_id") == execution_id)]
+
+    async def _recover_provider_record(self, record, *, cancel=False):
+        """Reconcile an exact saved ID, never submit or resume a workflow."""
+        if not record.get("job_id"):
+            return False
+        status = None
+        try:
+            client = await self._client({"id": record["worker_id"], "endpoint_id": record["endpoint_id"]})
+            response = await (client.cancel(record["job_id"]) if cancel else client.status(record["job_id"]))
+            status = terminal_provider_status(response)
+        except Exception:
+            pass  # Unreachable/expired is not proof of provider termination.
+        if status is not None or cancel:
+            self.ledger.update(record["record_id"], status=status or "CANCEL_REQUESTED", updated_at=time.time())
+        return status is not None
+
+    async def reconcile(self, worker_id=None):
+        """Read terminal states for detached jobs and release only proven capacity."""
+        resolved = 0
+        async with self.recovery_lock:
+            for record in self._detached_records(worker_id):
+                resolved += await self._recover_provider_record(record)
+        await self._notify_capacity()
+        return resolved
+
+    async def acknowledge_recovery(self, worker_id, record_id, *, provider_checked=False):
+        """Explicit operator escape hatch for lost IDs/expired provider records.
+
+        This records a human's verification, not a cancellation or provider
+        status. It is never called automatically or allowed for live tasks.
+        """
+        if provider_checked is not True:
+            raise ValueError("Check Runpod and confirm that this job is no longer running before resolving it")
+        async with self.recovery_lock:
+            record = next((r for r in self._detached_records(worker_id) if r["record_id"] == record_id), None)
+            if record is None:
+                raise ValueError("Unresolved inactive job not found for this pool")
+            self.ledger.update(record_id, status="RESOLVED", updated_at=time.time(),
+                               error="Recovery explicitly acknowledged after operator checked Runpod; not provider-confirmed")
+        await self._notify_capacity()
+
     async def cancel(self, worker_id=None, execution_id=None, collector_job_id=None):
-        targets = []
+        targets = {}
         for rid, task in self.tasks.items():
             run = self.runs[rid]
             if worker_id and run["worker"].get("pool_id", run["worker"]["id"]) != worker_id:
@@ -243,33 +336,40 @@ class ServerlessManager:
             if collector_job_id and not any(m["job_id"] == collector_job_id for m in run["manifest"]):
                 continue
             if not task.done():
-                task.cancel()
-                targets.append(task)
+                # Repeated requests must not interrupt the first cancellation's cleanup.
+                if not task.cancelling():
+                    task.cancel()
+                targets[rid] = task
         if targets:
-            await asyncio.gather(*targets, return_exceptions=True)
-        # A restarted master must still be able to cancel IDs it journalled.
-        # No workflow payloads are persisted, so never resume or resubmit them.
+            await asyncio.gather(*targets.values(), return_exceptions=True)
         recovered = 0
-        for rec in self.ledger.all():
-            task = self.tasks.get(rec["record_id"])
-            if (task is not None and not task.done()) or rec.get("status") in TERMINAL:
-                continue
-            if worker_id and rec.get("worker_id") != worker_id:
-                continue
-            if execution_id and rec.get("execution_id") != execution_id:
-                continue
-            if collector_job_id or not rec.get("job_id"):
-                continue
-            try:
-                client = await self._client({"id": rec["worker_id"], "endpoint_id": rec["endpoint_id"]})
-                result = await client.cancel(rec["job_id"])
-                status = "CANCELLED" if result.get("status") == "CANCELLED" else "CANCEL_REQUESTED"
-            except Exception:
-                status = "CANCEL_REQUESTED"
-            self.ledger.update(rec["record_id"], status=status, updated_at=time.time())
-            recovered += 1
+        async with self.recovery_lock:
+            for record in self._detached_records(worker_id, execution_id):
+                rid = record["record_id"]
+                # A task cancelled before its first step never enters _run's handlers.
+                # A failed start() may also leave a journalled but unstarted local slot.
+                if record.get("status") == "WAITING" and not record.get("job_id"):
+                    run = self.runs.get(rid)
+                    if run is not None and (collector_job_id is None or any(m["job_id"] == collector_job_id for m in run["manifest"])):
+                        self.ledger.update(rid, status="CANCELLED", updated_at=time.time())
+                        run.pop("workflow", None)
+                        run.pop("images", None)
+                        await self._deliver(run, error="Serverless job cancelled before submission")
+                    continue
+                # Do not send two cancellation requests for the same live job in
+                # one action. Its unresolved reservation survives for later recovery.
+                if rid in targets or collector_job_id or not record.get("job_id"):
+                    continue
+                await self._recover_provider_record(record, cancel=True)
+                recovered += 1
+        await self._notify_capacity()
         return len(targets) + recovered
 
     def public_jobs(self, worker_id):
-        return [{key: rec.get(key) for key in ("job_id", "status", "worker_id", "execution_id", "error")}
-                for rec in reversed(self.ledger.all()) if rec.get("worker_id") == worker_id][:20]
+        records = [record for record in reversed(self.ledger.all()) if belongs_to_pool(record, worker_id)]
+        # Never hide unresolved IDs behind the bounded completed history.
+        visible = [record for record in records if is_unresolved(record)]
+        visible.extend(record for record in records if not is_unresolved(record))
+        unresolved_count = sum(is_unresolved(record) for record in records)
+        return [{key: record.get(key) for key in ("record_id", "job_id", "status", "worker_id", "execution_id", "error")}
+                for record in visible[:max(20, unresolved_count)]]

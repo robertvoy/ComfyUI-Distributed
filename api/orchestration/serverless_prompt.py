@@ -115,14 +115,8 @@ def _model_name_result(text):
     return _stringify_model_name(text)
 
 
-def compile_serverless_prompt(prepared_prompt: dict) -> tuple[dict, list[dict]]:
-    """Compile a prepared worker prompt to an image-only serverless graph.
-
-    Every DistributedCollector's original ``images`` input is connected to a
-    new SaveImage node. Only those savers and their upstream dependencies are
-    retained. DistributedSeed/Value/ModelName links are resolved as scalar
-    literals; unsupported node execution is never attempted.
-    """
+def _validate_prepared_prompt(prepared_prompt):
+    """Validate graph shape, links, collectors, and supported topology."""
     if not isinstance(prepared_prompt, dict):
         raise ValueError("prepared prompt must be an API graph mapping")
 
@@ -207,6 +201,11 @@ def compile_serverless_prompt(prepared_prompt: dict) -> tuple[dict, list[dict]]:
                 if _is_link(value):
                     pending.append(str(value[0]))
 
+    return source_nodes, collector_ids
+
+
+def _make_scalar_resolver(source_nodes):
+    """Build pure resolvers for distributed scalar nodes and stock primitives."""
     # Resolve only stock primitive nodes. A visited set makes malformed
     # primitive-to-primitive cycles fail clearly instead of recursing forever.
     def resolve_primitive(node_id, visiting=None):
@@ -309,6 +308,11 @@ def compile_serverless_prompt(prepared_prompt: dict) -> tuple[dict, list[dict]]:
         resolved_distributed[cache_key] = copy.deepcopy(result)
         return result
 
+    return resolve_distributed
+
+
+def _build_savers(source_nodes, collector_ids):
+    """Construct stable SaveImage nodes and their collector metadata."""
     # The prepared collector values define the artifact identity. The fallback
     # for absent hidden values is stable and retains the collector's job scope.
     collector_specs = []
@@ -354,6 +358,11 @@ def compile_serverless_prompt(prepared_prompt: dict) -> tuple[dict, list[dict]]:
             "_meta": {"title": f"Serverless output: collector {spec['collector_id']} (image)"},
         }
 
+    return collector_specs, saver_nodes
+
+
+def _prune_graph(source_nodes, collector_specs, saver_nodes, resolve_distributed):
+    """Keep saver ancestors, replacing distributed scalar links with literals."""
     all_nodes = {node_id: copy.deepcopy(node) for node_id, node in source_nodes.items()}
     all_nodes.update(copy.deepcopy(saver_nodes))
     needed = set()
@@ -384,6 +393,26 @@ def compile_serverless_prompt(prepared_prompt: dict) -> tuple[dict, list[dict]]:
     if any("distributed" in node["class_type"].lower() for node in compiled.values()):
         raise ValueError("compiled prompt still contains a distributed dependency")
 
+    return compiled
+
+
+def compile_serverless_prompt(prepared_prompt: dict) -> tuple[dict, list[dict]]:
+    """Compile a prepared worker prompt to an image-only serverless graph.
+
+    Every DistributedCollector's original ``images`` input is connected to a
+    new SaveImage node. Only those savers and their upstream dependencies are
+    retained. DistributedSeed/Value/ModelName links are resolved as scalar
+    literals; unsupported node execution is never attempted.
+    """
+    source_nodes, collector_ids = _validate_prepared_prompt(prepared_prompt)
+    resolve_distributed = _make_scalar_resolver(source_nodes)
+    collector_specs, saver_nodes = _build_savers(source_nodes, collector_ids)
+    compiled = _prune_graph(
+        source_nodes,
+        collector_specs,
+        saver_nodes,
+        resolve_distributed,
+    )
     manifest = [
         {key: spec[key] for key in ("collector_id", "job_id", "node_id", "kind", "prefix")}
         for spec in collector_specs

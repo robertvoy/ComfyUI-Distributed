@@ -77,7 +77,7 @@ def _load_modules():
 
     runtime = types.ModuleType(f"{package_name}.api.orchestration.serverless_runtime")
     runtime.secret_store = None
-    runtime.manager = types.SimpleNamespace(tasks={}, runs={})
+    runtime.manager = types.SimpleNamespace(tasks={}, runs={}, pool_is_active=lambda _: False)
     runtime.get_secret_store = lambda: runtime.secret_store
     runtime.get_manager = lambda: runtime.manager
     sys.modules[runtime.__name__] = runtime
@@ -117,7 +117,7 @@ class _RunningTask:
         return False
 
 
-class ServerlessConfigRouteTests(unittest.IsolatedAsyncioTestCase):
+class _ConfigRouteFixture(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
@@ -128,7 +128,7 @@ class ServerlessConfigRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(config_module.save_config(self.config))
         self.secrets = serverless_config.SecretStore(self.root / "private" / "credentials.json")
         runtime_module.secret_store = self.secrets
-        runtime_module.manager = types.SimpleNamespace(tasks={}, runs={})
+        runtime_module.manager = types.SimpleNamespace(tasks={}, runs={}, pool_is_active=lambda _: False)
 
     def tearDown(self):
         config_module.invalidate_config_cache()
@@ -137,6 +137,8 @@ class ServerlessConfigRouteTests(unittest.IsolatedAsyncioTestCase):
     def read_config_file(self):
         return json.loads(Path(config_module.CONFIG_FILE).read_text(encoding="utf-8"))
 
+
+class ServerlessConfigRouteTests(_ConfigRouteFixture):
     async def test_get_config_redacts_keys_and_reports_only_configured_boolean(self):
         self.secrets.set("pool-1", "private-api-key")
         self.config["workers"] = [
@@ -154,6 +156,43 @@ class ServerlessConfigRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("api_key", worker)
         self.assertNotIn("private-api-key", json.dumps(response.payload))
         self.assertNotIn("inline-api-key", json.dumps(response.payload))
+
+    async def test_get_config_redacts_normalized_secret_field_aliases(self):
+        aliases = {
+            "apiKey": "camel-api-key",
+            "APIKEY": "upper-api-key",
+            "clearApiKey": "camel-clear-key",
+            "CLEAR_API_KEY": "upper-clear-key",
+            "runpod_CREDENTIAL": "provider-credential",
+        }
+        self.config["workers"] = [{
+            "id": "pool-1", "type": "serverless", "endpoint_id": "ep-123",
+            **aliases,
+            "nested": {"credential_note": "nested-credential"},
+        }]
+        Path(config_module.CONFIG_FILE).write_text(json.dumps(self.config), encoding="utf-8")
+        config_module.invalidate_config_cache()
+
+        response = await config_routes.get_config_endpoint(_FakeRequest())
+
+        self.assertEqual(response.status, 200)
+        worker = response.payload["workers"][0]
+        for alias, value in aliases.items():
+            self.assertNotIn(alias, worker)
+            self.assertNotIn(value, json.dumps(response.payload))
+        self.assertNotIn("credential_note", worker["nested"])
+        self.assertNotIn("nested-credential", json.dumps(response.payload))
+
+    async def test_bulk_config_rejects_normalized_secret_field_aliases(self):
+        for secret_field in ("apiKey", "APIKEY", "clearApiKey", "RUNPOD_CREDENTIAL"):
+            with self.subTest(secret_field=secret_field):
+                secret = f"private-{secret_field}"
+                response = await config_routes.update_config_endpoint(_FakeRequest({
+                    "workers": [{"id": "pool-1", "type": "local", secret_field: secret}]
+                }))
+                self.assertEqual(response.status, 400)
+                self.assertNotIn(secret, json.dumps(response.payload))
+        self.assertEqual(self.read_config_file()["workers"], [])
 
     async def test_create_serverless_worker_without_local_fields_and_store_key_privately(self):
         secret = "runpod-secret-never-returned"
@@ -326,6 +365,7 @@ class ServerlessConfigRouteTests(unittest.IsolatedAsyncioTestCase):
         runtime_module.manager = types.SimpleNamespace(
             tasks={"run-1": _RunningTask()},
             runs={"run-1": {"worker": {"id": "serverless:pool-1:1", "pool_id": "pool-1"}}},
+            pool_is_active=lambda worker_id: worker_id == "pool-1",
         )
 
         enabled = await config_routes.update_worker_endpoint(
@@ -376,6 +416,7 @@ class ServerlessConfigRouteTests(unittest.IsolatedAsyncioTestCase):
         runtime_module.manager = types.SimpleNamespace(
             tasks={"run-1": _RunningTask()},
             runs={"run-1": {"worker": {"id": "serverless:pool-1:1", "pool_id": "pool-1"}}},
+            pool_is_active=lambda worker_id: worker_id == "pool-1",
         )
 
         credential_change = await config_routes.update_worker_endpoint(_FakeRequest({
@@ -405,6 +446,52 @@ class ServerlessConfigRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.read_config_file()["workers"], [])
         self.assertEqual(config_module.load_config()["workers"], [])
 
+    async def test_bulk_secret_delete_is_rolled_back_when_config_persistence_fails(self):
+        self.secrets.set("pool-1", "bulk-restore-key")
+        self.config["workers"] = [{
+            "id": "pool-1", "type": "serverless", "endpoint_id": "ep-123",
+        }]
+        self.assertTrue(config_module.save_config(self.config))
+
+        with patch.object(config_module, "save_config", return_value=False):
+            response = await config_routes.update_config_endpoint(_FakeRequest({
+                "workers": [{"id": "pool-1", "type": "local", "port": 8188}]
+            }))
+
+        self.assertEqual(response.status, 500)
+        self.assertEqual(self.secrets.get("pool-1"), "bulk-restore-key")
+        self.assertEqual(self.read_config_file()["workers"][0]["type"], "serverless")
+
+    async def test_secret_replacement_is_rolled_back_when_config_persistence_fails(self):
+        self.secrets.set("pool-1", "prior-key")
+        self.config["workers"] = [{
+            "id": "pool-1", "type": "serverless", "endpoint_id": "ep-123",
+        }]
+        self.assertTrue(config_module.save_config(self.config))
+
+        with patch.object(config_module, "save_config", return_value=False):
+            response = await config_routes.update_worker_endpoint(_FakeRequest({
+                "worker_id": "pool-1", "api_key": "replacement-key",
+            }))
+
+        self.assertEqual(response.status, 500)
+        self.assertEqual(self.secrets.get("pool-1"), "prior-key")
+        self.assertEqual(self.read_config_file()["workers"][0]["type"], "serverless")
+
+    async def test_delete_secret_is_rolled_back_when_config_persistence_fails(self):
+        self.secrets.set("pool-1", "delete-restore-key")
+        self.config["workers"] = [{
+            "id": "pool-1", "type": "serverless", "endpoint_id": "ep-123",
+        }]
+        self.assertTrue(config_module.save_config(self.config))
+
+        with patch.object(config_module, "save_config", return_value=False):
+            response = await config_routes.delete_worker_endpoint(_FakeRequest({"worker_id": "pool-1"}))
+
+        self.assertEqual(response.status, 500)
+        self.assertEqual(self.secrets.get("pool-1"), "delete-restore-key")
+        self.assertEqual(self.read_config_file()["workers"][0]["id"], "pool-1")
+
     async def test_regular_worker_delete_does_not_require_posix_secret_storage(self):
         self.config["workers"] = [{"id": "local-1", "type": "local", "port": 8188}]
         self.assertTrue(config_module.save_config(self.config))
@@ -426,6 +513,7 @@ class ServerlessConfigRouteTests(unittest.IsolatedAsyncioTestCase):
         runtime_module.manager = types.SimpleNamespace(
             tasks={"run-1": _RunningTask()},
             runs={"run-1": {"worker": {"id": "serverless:pool-1:1", "pool_id": "pool-1"}}},
+            pool_is_active=lambda worker_id: worker_id == "pool-1",
         )
         updated = copy.deepcopy(self.config["workers"])
         updated[0]["concurrency"] = 2
@@ -457,6 +545,63 @@ class ServerlessConfigRouteTests(unittest.IsolatedAsyncioTestCase):
         worker = normalized["workers"][0]
         for obsolete in ("host", "port", "cuda_device", "extra_args"):
             self.assertNotIn(obsolete, worker)
+
+
+class PersistedPoolGuardTests(_ConfigRouteFixture):
+    """Use the actual manager/ledger across restart, not a mocked idle result."""
+
+    def setUp(self):
+        super().setUp()
+        from test_serverless_runtime import runtime
+        from unittest.mock import AsyncMock
+        self.runtime = runtime
+        self.session_factory = AsyncMock()
+        self.ledger_path = self.root / "jobs.json"
+        self.manager = runtime.ServerlessManager(types.SimpleNamespace(), self.secrets, self.ledger_path, self.session_factory)
+        runtime_module.manager = self.manager
+        self.secrets.set("pool-1", "saved-key")
+        self.config["workers"] = [{"id": "pool-1", "type": "serverless", "endpoint_id": "ep-123", "concurrency": 1}]
+        self.assertTrue(config_module.save_config(self.config))
+
+    async def test_retained_jobs_block_destructive_changes_after_restart(self):
+        original = self.read_config_file()
+        for status in ("UNKNOWN", "CANCEL_REQUESTED", "IN_QUEUE", "IN_PROGRESS", "DOWNLOADING", "SUBMITTING"):
+            for restart in (False, True):
+                with self.subTest(status=status, restart=restart):
+                    self.manager.ledger.update("retained", worker_id="pool-1", endpoint_id="ep-123", status=status, job_id=None if status in {"UNKNOWN", "SUBMITTING"} else "owned-id")
+                    if restart:
+                        self.manager = self.runtime.ServerlessManager(types.SimpleNamespace(), self.secrets, self.ledger_path, self.session_factory)
+                        runtime_module.manager = self.manager
+                    else:
+                        self.manager.tasks["retained"] = types.SimpleNamespace(done=lambda: True)
+                    for fields in ({"api_key": "new-key"}, {"clear_api_key": True}, {"endpoint_id": "ep-other"}, {"concurrency": 2}, {"type": "local", "port": 8188}):
+                        response = await config_routes.update_worker_endpoint(_FakeRequest(dict(fields, worker_id="pool-1")))
+                        self.assertEqual(response.status, 409, fields)
+                    response = await config_routes.delete_worker_endpoint(_FakeRequest({"worker_id": "pool-1"}))
+                    self.assertEqual(response.status, 409)
+                    worker = original["workers"][0]
+                    for workers in ([], [dict(worker, type="local")], [dict(worker, endpoint_id="ep-other")], [dict(worker, concurrency=2)]):
+                        response = await config_routes.update_config_endpoint(_FakeRequest({"workers": workers}))
+                        self.assertEqual(response.status, 409, workers)
+                    self.assertEqual(self.read_config_file(), original)
+                    self.assertEqual(self.secrets.get("pool-1"), "saved-key")
+        self.session_factory.assert_not_awaited()
+
+    async def test_retained_job_allows_disable_and_rename_but_not_key_clear(self):
+        self.manager.ledger.update("retained", worker_id="pool-1", status="UNKNOWN")
+        response = await config_routes.update_worker_endpoint(_FakeRequest({"worker_id": "pool-1", "enabled": False, "name": "Paused"}))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.read_config_file()["workers"][0]["name"], "Paused")
+        response = await config_routes.update_worker_endpoint(_FakeRequest({"worker_id": "pool-1", "clear_api_key": True}))
+        self.assertEqual(response.status, 409)
+        self.assertEqual(self.secrets.get("pool-1"), "saved-key")
+
+    async def test_terminal_or_other_pool_records_do_not_block_deletion(self):
+        self.manager.ledger.update("done", worker_id="pool-1", status="RESOLVED")
+        self.manager.ledger.update("other", worker_id="other", status="UNKNOWN")
+        response = await config_routes.delete_worker_endpoint(_FakeRequest({"worker_id": "pool-1"}))
+        self.assertEqual(response.status, 200)
+        self.assertIsNone(self.secrets.get("pool-1"))
 
 
 if __name__ == "__main__":

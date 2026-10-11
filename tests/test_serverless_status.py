@@ -56,3 +56,43 @@ class StatusTests(unittest.IsolatedAsyncioTestCase):
         result = await self.routes.cancel_serverless_endpoint(request)
         self.assertEqual(result.status, 200)
         self.manager.cancel.assert_awaited_once_with(worker_id="pool")
+
+    async def test_reconcile_only_reads_the_requested_pools_jobs(self):
+        self.manager.reconcile = AsyncMock(return_value=2)
+        request = types.SimpleNamespace(json=AsyncMock(return_value={"worker_id": "pool"}))
+        result = await self.routes.reconcile_serverless_endpoint(request)
+        self.assertEqual(result.status, 200)
+        self.assertEqual(json.loads(result.text)["resolved"], 2)
+        self.manager.reconcile.assert_awaited_once_with(worker_id="pool")
+        self.manager.cancel.assert_not_awaited()
+
+    async def test_resolve_requires_explicit_boolean_confirmation_and_record_id(self):
+        self.manager.acknowledge_recovery = AsyncMock()
+        for payload in ({"worker_id": "pool", "record_id": "record"},
+                        {"worker_id": "pool", "record_id": "record", "provider_checked": "true"},
+                        {"worker_id": "pool", "provider_checked": True}):
+            with self.subTest(payload=payload):
+                result = await self.routes.resolve_serverless_endpoint(types.SimpleNamespace(json=AsyncMock(return_value=payload)))
+                self.assertEqual(result.status, 400)
+        self.manager.acknowledge_recovery.assert_not_awaited()
+
+    async def test_resolve_is_scoped_and_does_not_claim_provider_cancellation(self):
+        self.manager.acknowledge_recovery = AsyncMock()
+        request = types.SimpleNamespace(json=AsyncMock(return_value={"worker_id": "pool", "record_id": "record", "provider_checked": True}))
+        result = await self.routes.resolve_serverless_endpoint(request)
+        self.assertEqual(result.status, 200)
+        self.manager.acknowledge_recovery.assert_awaited_once_with("pool", "record", provider_checked=True)
+        self.assertIn("not provider-confirmed", json.loads(result.text)["message"])
+        self.manager.cancel.assert_not_awaited()
+
+    async def test_live_or_mismatched_record_refuses_manual_resolution(self):
+        self.manager.acknowledge_recovery = AsyncMock(side_effect=ValueError("Unresolved inactive job not found for this pool"))
+        request = types.SimpleNamespace(json=AsyncMock(return_value={"worker_id": "pool", "record_id": "record", "provider_checked": True}))
+        result = await self.routes.resolve_serverless_endpoint(request)
+        self.assertEqual(result.status, 409)
+
+    async def test_failed_health_still_exposes_recovery_ids(self):
+        self.manager.health.side_effect = RuntimeError("private transport error")
+        self.manager.public_jobs = lambda _: [{"record_id": "record", "status": "UNKNOWN"}]
+        result = await self.routes.serverless_status_endpoint(types.SimpleNamespace(match_info={"worker_id": "pool"}))
+        self.assertEqual(json.loads(result.text)["jobs"][0]["record_id"], "record")

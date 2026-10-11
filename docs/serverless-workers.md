@@ -73,8 +73,10 @@ incomplete serverless batch.
 
 - **Jobs per run** adds logical collector participants. Each receives its own
   Distributed Seed/Value overrides. It is not a physical GPU count.
-- **Concurrent jobs** bounds this master's outstanding submissions per pool.
-  Other applications using the same endpoint are unaffected.
+- **Concurrent jobs** bounds this master's outstanding submissions per pool,
+  including retained jobs after a restart. Ambiguous submissions and unconfirmed
+  cancellations keep their capacity reservation until reconciled. Other
+  applications using the same endpoint are unaffected.
 - **Load balance** selects one participant, so it does not fan out every pool slot.
 - **Timeout** includes waiting for a local slot, Runpod queue/cold-start time,
   execution, and output retrieval. Provider policy limits are submitted as well.
@@ -100,6 +102,45 @@ IDs are available through `/distributed/serverless/status/<worker_id>`; the pool
 cancel action can request cancellation of known pre-restart jobs. If no job ID
 was received, check Runpod manually. Cancellation is best-effort and may race
 with completion; `CANCEL_REQUESTED` is not a provider-confirmed cancellation.
+
+Unresolved records protect the pool's endpoint, concurrency, API key, worker type,
+and deletion even when no local task remains. Disabling a pool is still allowed;
+it does not cancel existing jobs. On restart, never-submitted `WAITING` slots are
+closed locally, while interrupted `SUBMITTING` records without IDs become
+`UNKNOWN` and remain protected.
+
+### Reconcile or acknowledge recovery
+
+Recovery uses the same trusted-master API as the panel; it never resubmits a job.
+
+1. Read `GET /distributed/serverless/status/<worker_id>`. The `jobs` list includes
+   every unresolved record with its local `record_id`, provider `job_id` (if
+   received), and state. These records remain visible if endpoint health fails.
+2. Request cancellation from the panel, or send
+   `POST /distributed/serverless/reconcile` with the body below to **read** the
+   retained provider IDs. Only a confirmed terminal state releases protection.
+   Network errors, expired IDs, or ambiguous responses do not.
+
+   ```json
+   {"worker_id": "YOUR_POOL_ID"}
+   ```
+
+3. If no ID was returned, or Runpod no longer retains its status, inspect Runpod
+   manually first. **Only after verifying that the job is no longer running or
+   queued**, send `POST /distributed/serverless/resolve` for that one record:
+
+   ```json
+   {"worker_id": "YOUR_POOL_ID", "record_id": "LOCAL_RECORD_ID", "provider_checked": true}
+   ```
+
+   This records `RESOLVED`: an explicit operator acknowledgment, **not** a
+   provider-confirmed cancellation. It cannot resolve a live local task and does
+   not stop remote compute. It releases the record's reservation and may let
+   already-waiting jobs proceed. Never automate this acknowledgment as a retry
+   mechanism; an unverified job can still be billable.
+
+Pool changes become available once all its local tasks and unresolved records
+are finished. No credentials or ledger files need to be edited by hand.
 
 ## First-version limits
 

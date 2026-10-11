@@ -7,6 +7,7 @@ import os
 import json
 from contextlib import asynccontextmanager
 from .logging import log
+from .secret_fields import is_secret_field_name as _is_secret_field_name
 
 # Import defaults for timeout fallbacks
 from .constants import HEARTBEAT_TIMEOUT
@@ -29,11 +30,6 @@ def _contains_serverless_secret(value):
     if isinstance(value, (list, tuple)):
         return any(_contains_serverless_secret(item) for item in value)
     return False
-
-
-def _is_secret_field_name(key):
-    normalized = "".join(character for character in key.casefold() if character.isalnum())
-    return normalized in {"apikey", "clearapikey"} or "credential" in normalized
 
 
 def _normalize_serverless_workers(config):

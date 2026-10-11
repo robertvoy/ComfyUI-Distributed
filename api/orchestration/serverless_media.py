@@ -491,8 +491,8 @@ def _decode_image_array(payload, total_array_bytes):
         raise ServerlessMediaError("Serverless image artifact could not be decoded") from None
 
 
-async def collect_images(output: dict, manifest: list, download=None) -> dict[str, list[np.ndarray]]:
-    """Validate and decode expected image artifacts, grouped by serverless job ID."""
+def _image_output(output):
+    """Unwrap handler output and reject explicit execution errors."""
     if not isinstance(output, dict):
         raise ServerlessMediaError("Serverless job output is invalid")
     nested = output.get("output")
@@ -501,9 +501,11 @@ async def collect_images(output: dict, manifest: list, download=None) -> dict[st
         if candidate.get("error") or candidate.get("errors"):
             raise ServerlessMediaError("Serverless job reported an execution error")
 
-    expected = _validated_manifest(manifest)
-    if not expected:
-        return {}
+    return data
+
+
+async def _select_image_payloads(data, expected, download):
+    """Match artifact identities and fetch bounded bytes, without image decoding."""
     artifacts = data.get("images", [])
     if not isinstance(artifacts, list) or len(artifacts) > MAX_OUTPUT_FILES:
         raise ServerlessMediaError("Serverless job returned too many image files")
@@ -565,7 +567,11 @@ async def collect_images(output: dict, manifest: list, download=None) -> dict[st
 
     if any(not selected[item["prefix"]] for item in expected):
         raise ServerlessMediaError("Serverless job is missing an expected collector image")
+    return selected
 
+
+def _decode_image_groups(selected, expected):
+    """Decode in stable counter order, bounding array memory across collectors."""
     result = {}
     total_array_bytes = 0
     for manifest_entry in expected:
@@ -583,3 +589,13 @@ async def collect_images(output: dict, manifest: list, download=None) -> dict[st
             arrays.append(array)
         result.setdefault(manifest_entry["job_id"], []).extend(arrays)
     return result
+
+
+async def collect_images(output: dict, manifest: list, download=None) -> dict[str, list[np.ndarray]]:
+    """Validate and decode expected image artifacts, grouped by serverless job ID."""
+    data = _image_output(output)
+    expected = _validated_manifest(manifest)
+    if not expected:
+        return {}
+    selected = await _select_image_payloads(data, expected, download)
+    return _decode_image_groups(selected, expected)
