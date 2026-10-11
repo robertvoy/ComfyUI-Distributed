@@ -279,7 +279,7 @@ describe("Runpod serverless worker panel", () => {
         expect(formatServerlessStatus(status)).toBe(expected);
     });
 
-    it("keeps the serverless card compact while retaining its expanded settings", () => {
+    it("keeps status above a consistent endpoint info box and retains expanded settings", () => {
         const ui = new DistributedUI();
         const worker = {
             id: "compact", name: "Used Car Inventory", type: "serverless", enabled: true,
@@ -295,13 +295,16 @@ describe("Runpod serverless worker panel", () => {
         const card = ui.renderEntityCard("worker", worker, extension);
         const collect = (element) => [element, ...(element.children || []).flatMap(collect)];
         const info = collect(card).find((element) => element.classList.values.has("dist-worker-info"));
-        expect(info.innerHTML).toContain("Runpod Serverless");
+        expect(info.innerHTML).not.toContain("Runpod Serverless");
         expect(info.innerHTML).not.toMatch(/ep_private_id|jobs\/run|slots/);
         expect(elements.get("serverless-status-compact").textContent).toBe("Queued");
         expect(elements.get("endpoint-id-compact").value).toBe("ep_private_id");
         expect(Number(elements.get("jobs-per-run-compact").value)).toBe(1);
         expect(Number(elements.get("concurrency-compact").value)).toBe(1);
-        expect(elements.has("controls-compact")).toBe(false);
+        const box = elements.get("controls-compact").children[0].children[0];
+        expect(box.textContent).toBe("Runpod Serverless endpoint");
+        expect(box.classList.values.has("dist-info-box")).toBe(true);
+        expect(box.style.cssText).toBe(ui.styles.infoBox);
         expect(elements.get("status-compact").style.cssText).toContain("flex: 0 0 10px");
     });
 
@@ -366,7 +369,10 @@ describe("Runpod serverless worker panel", () => {
             },
         };
 
-        expect(controls).toBeNull();
+        const box = controls.children[0].children[0];
+        expect(box.textContent).toBe("Runpod Serverless endpoint");
+        expect(box.tagName).toBe("div");
+        expect(controls.children[0].children).toHaveLength(1);
         await launchWorker(extension, worker.id);
         await stopWorker(extension, worker.id);
         await viewWorkerLog(extension, worker.id, true);

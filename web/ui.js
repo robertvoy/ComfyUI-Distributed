@@ -69,7 +69,7 @@ const cardConfigs = {
             const isServerless = data.type === 'serverless';
 
             if (isServerless) {
-                return `<span class="dist-worker-info__title">${escapeWorkerInfo(data.name)}</span><br><span class="dist-worker-info__meta">Runpod Serverless</span>`;
+                return `<span class="dist-worker-info__title">${escapeWorkerInfo(data.name)}</span>`;
             }
 
             if (isCloud) {
@@ -573,8 +573,6 @@ export class DistributedUI {
 
     createControlsSection(config, data, extension, isRemote) {
         if (!config) return null;
-        // Serverless has no direct-worker actions; its provider is already in the header.
-        if (config.dynamic && data?.type === "serverless") return null;
         
         const controlsDiv = document.createElement("div");
         controlsDiv.id = `controls-${data?.id || 'master'}`;
@@ -605,7 +603,10 @@ export class DistributedUI {
             }
             controlsWrapper.appendChild(badge);
         } else if (config.dynamic && data) {
-            if (isRemote) {
+            if (data.type === 'serverless') {
+                // Match the master/remote footer without exposing direct-worker actions.
+                controlsWrapper.appendChild(this.createInfoBox("Runpod Serverless endpoint"));
+            } else if (isRemote) {
                 const isCloud = data.type === 'cloud';
                 const workerTypeText = isCloud ? "Cloud worker" : "Remote worker";
                 const workerTypeBadge = this.createInfoBox(workerTypeText);
