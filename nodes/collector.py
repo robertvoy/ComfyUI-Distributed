@@ -12,7 +12,7 @@ from comfy.utils import ProgressBar
 
 from ..utils.logging import debug_log, log
 from ..utils.config import get_worker_timeout_seconds, load_config, is_master_delegate_only
-from ..utils.constants import HEARTBEAT_INTERVAL, TRANSFER_MAX_CHUNK_BYTES
+from ..utils.constants import HEARTBEAT_INTERVAL, TRANSFER_MAX_CHUNK_BYTES, TRANSFER_MAX_REQUEST_BYTES
 from ..utils.image import tensor_to_pil, pil_to_tensor, ensure_contiguous
 from ..utils.network import build_worker_url, get_client_session, probe_worker
 from ..utils.audio_payload import encode_audio_payload
@@ -20,6 +20,11 @@ from ..utils.async_helpers import run_async_in_server_loop
 from ..utils import transfer_codec
 
 prompt_server = _server.PromptServer.instance
+
+
+def _encode_all_chunks(frames, fmt, quality, max_chunk_bytes, max_frame_bytes):
+    """Materialize every transfer chunk (runs in an executor)."""
+    return list(transfer_codec.encode_chunks(frames, fmt, quality, max_chunk_bytes, max_frame_bytes))
 
 
 class DistributedCollectorNode:
@@ -45,13 +50,7 @@ class DistributedCollectorNode:
                     list(transfer_codec.TRANSFER_FORMATS),
                     {
                         "default": transfer_codec.DEFAULT_TRANSFER_FORMAT,
-                        "tooltip": (
-                            "How workers send images back to the master. "
-                            "legacy_png: original uncompressed PNG (largest). "
-                            "png / ffv1: lossless, identical result. "
-                            "jpeg / webp: lossy stills. "
-                            "h264 / h265 / av1: lossy video of the whole batch, smallest for frame sequences."
-                        ),
+                        "tooltip": transfer_codec.TRANSFER_FORMAT_TOOLTIP,
                     },
                 ),
                 "transfer_quality": (
@@ -61,11 +60,7 @@ class DistributedCollectorNode:
                         "min": 1,
                         "max": 100,
                         "step": 1,
-                        "tooltip": (
-                            "Quality for lossy transfer formats (ignored by lossless ones). "
-                            "JPEG/WebP use it directly; video codecs map it to CRF "
-                            "(90 -> h264/h265 CRF 13, av1 CRF 16)."
-                        ),
+                        "tooltip": transfer_codec.TRANSFER_QUALITY_TOOLTIP,
                     },
                 ),
             },
@@ -229,11 +224,23 @@ class DistributedCollectorNode:
             form.add_field("media", data, filename=f"{i}.bin", content_type="application/octet-stream")
         return form
 
+    # Room left in each request for the multipart envelope (ids, frame
+    # metadata, part headers). Audio is budgeted separately.
+    TRANSFER_ENVELOPE_RESERVE_BYTES = 256 * 1024
+    # Body of a 400 from a master without compressed-transfer support: it
+    # tries request.json() on the multipart body and fails.
+    _OLD_MASTER_REJECTION = "Invalid JSON payload"
+
     async def _send_compressed_batch(self, image_batch, audio, multi_job_id, master_url, worker_id, fmt, quality):
         """Send the batch as compressed multipart chunks.
 
+        All chunks are encoded before anything is sent, so a frame that cannot
+        fit in one request fails the transfer without delivering a partial
+        batch. Every request stays within TRANSFER_MAX_REQUEST_BYTES.
+
         Returns False (without having delivered anything) when the master
-        rejects the first chunk, so the caller can retry with legacy_png.
+        rejects the first chunk because it predates compressed transfer, so
+        the caller can retry with legacy_png. Any other rejection raises.
         """
         encoded_audio = encode_audio_payload(audio)
         session = await get_client_session()
@@ -243,25 +250,32 @@ class DistributedCollectorNode:
         frames = await loop.run_in_executor(None, transfer_codec.tensor_batch_to_uint8, image_batch)
         raw_bytes = int(frames.nbytes)
         total = int(frames.shape[0])
-        chunks = transfer_codec.encode_chunks(frames, fmt, quality, TRANSFER_MAX_CHUNK_BYTES)
+        media_limit = max(1, TRANSFER_MAX_REQUEST_BYTES - self.TRANSFER_ENVELOPE_RESERVE_BYTES)
         started = time.time()
-        sent_bytes = 0
-        chunk_count = 0
+        # Encoding is CPU-bound (seconds for video); keep the server loop responsive.
+        chunks = await loop.run_in_executor(
+            None, _encode_all_chunks, frames, fmt, quality, min(TRANSFER_MAX_CHUNK_BYTES, media_limit), media_limit,
+        )
+        del frames
 
-        while True:
-            # Encoding is CPU-bound (seconds for video); keep the server loop responsive.
-            chunk = await loop.run_in_executor(None, next, chunks, None)
-            if chunk is None:
-                break
+        # Attach audio to the final chunk only if the request stays in bounds;
+        # otherwise finish with a separate audio-only completion.
+        audio_bytes = len(json.dumps(encoded_audio)) if encoded_audio is not None else 0
+        last_media = sum(len(p) for p in chunks[-1]["parts"])
+        audio_inline = encoded_audio is not None and last_media + audio_bytes <= media_limit
+        audio_separate = encoded_audio is not None and not audio_inline
+
+        sent_bytes = 0
+        for index, chunk in enumerate(chunks):
             parts = chunk.pop("parts")
-            is_last = chunk["start_index"] + chunk["count"] >= total
+            is_final_chunk = index == len(chunks) - 1
             envelope = {
                 "job_id": str(multi_job_id),
                 "worker_id": str(worker_id),
-                "is_last": bool(is_last),
+                "is_last": bool(is_final_chunk and not audio_separate),
                 **chunk,
             }
-            if is_last and encoded_audio is not None:
+            if is_final_chunk and audio_inline:
                 envelope["audio"] = encoded_audio
             chunk_bytes = sum(len(p) for p in parts)
             timeout_seconds = min(600, 60 + chunk_bytes // (256 * 1024))
@@ -271,24 +285,56 @@ class DistributedCollectorNode:
                     data=self._build_multipart(envelope, parts),
                     timeout=aiohttp.ClientTimeout(total=timeout_seconds),
                 ) as response:
-                    if chunk_count == 0 and response.status == 400:
+                    if response.status >= 400:
                         body = await response.text()
-                        debug_log(f"Worker - Master rejected compressed chunk: {body[:300]}")
-                        return False
-                    response.raise_for_status()
+                        if index == 0 and response.status == 400 and self._OLD_MASTER_REJECTION in body:
+                            debug_log(f"Worker - Master rejected compressed chunk: {body[:300]}")
+                            return False
+                        raise RuntimeError(
+                            f"Master rejected {fmt} chunk {index + 1}/{len(chunks)} "
+                            f"({chunk_bytes} bytes) with HTTP {response.status}: {body[:300]}. "
+                            "If this is a size limit, make COMFYUI_DISTRIBUTED_TRANSFER_MAX_REQUEST_BYTES "
+                            "on the worker smaller than the master's --max-upload-size."
+                        )
             except Exception as e:
                 log(f"Worker - Failed to send {fmt} chunk to master: {e}")
                 debug_log(f"Worker - Full error details: URL={url}")
                 raise
             sent_bytes += chunk_bytes
-            chunk_count += 1
+
+        requests = len(chunks)
+        if audio_separate:
+            await self._post_json_completion(session, url, {
+                "job_id": str(multi_job_id),
+                "worker_id": str(worker_id),
+                "batch_idx": 0,
+                "audio": encoded_audio,
+                "is_last": True,
+            })
+            requests += 1
 
         log(
-            f"Worker - Sent {total} image(s) as {fmt} in {chunk_count} request(s): "
+            f"Worker - Sent {total} image(s) as {fmt} in {requests} request(s): "
             f"{sent_bytes / 1e6:.2f} MB (raw {raw_bytes / 1e6:.2f} MB, "
             f"{transfer_codec.describe_ratio(sent_bytes, raw_bytes)} smaller) in {time.time() - started:.1f}s"
         )
         return True
+
+    @staticmethod
+    async def _post_json_completion(session, url, payload):
+        timeout_seconds = 60 if "image" in payload else 600
+        try:
+            async with session.post(
+                url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+            ) as response:
+                response.raise_for_status()
+        except Exception as e:
+            media_type = "image/audio" if "image" in payload else "audio-only"
+            log(f"Worker - Failed to send canonical {media_type} envelope to master: {e}")
+            debug_log(f"Worker - Full error details: URL={url}")
+            raise
 
     async def _send_legacy_batch(self, image_batch, audio, multi_job_id, master_url, worker_id):
         """Original transfer: one JSON request per frame with a base64 PNG."""
@@ -328,19 +374,7 @@ class DistributedCollectorNode:
                 payloads.append(payload)
 
         for payload in payloads:
-            timeout_seconds = 60 if "image" in payload else 600
-            try:
-                async with session.post(
-                    url,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
-                ) as response:
-                    response.raise_for_status()
-            except Exception as e:
-                media_type = "image/audio" if "image" in payload else "audio-only"
-                log(f"Worker - Failed to send canonical {media_type} envelope to master: {e}")
-                debug_log(f"Worker - Full error details: URL={url}")
-                raise
+            await self._post_json_completion(session, url, payload)
 
     def _combine_audio(self, master_audio, worker_audio, empty_audio, worker_order=None):
         """Combine audio from master and workers into a single audio output.

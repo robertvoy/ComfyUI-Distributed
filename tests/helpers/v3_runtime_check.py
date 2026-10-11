@@ -30,6 +30,19 @@ import torch
 
 BASELINE = json.loads((ROOT / 'tests/fixtures/v1_node_contracts.json').read_text())
 
+# Inputs intentionally added after the V1 baseline was captured. They must be
+# optional, appended after the baseline inputs, and keep legacy behaviour as
+# their default so saved workflows are unaffected.
+ADDED_OPTIONAL_INPUTS = {
+    'DistributedCollector': {
+        'transfer_format': [
+            ['legacy_png', 'png', 'ffv1', 'jpeg', 'webp', 'h264', 'h265', 'av1'],
+            {'default': 'legacy_png'},
+        ],
+        'transfer_quality': ['INT', {'default': 90, 'min': 1, 'max': 100, 'step': 1}],
+    },
+}
+
 
 def normalized_input(value):
     kind = value[0]
@@ -134,6 +147,22 @@ async def check_execution(mapping, module, prompt_server, asset_manager):
     assert torch.equal(result[0].result[0], images[:3])
     assert 'v3-aggregate' not in prompt_server.distributed_pending_jobs
 
+    # The registered node must forward the transfer options to the runtime
+    # helper, and default to the legacy transfer when they are not set.
+    collector_runtime = sys.modules[module.__name__ + '.nodes.collector'].DistributedCollectorNode
+    forwarded = []
+    def fake_run(self, **kwargs):
+        forwarded.append(kwargs)
+        return (kwargs['images'], kwargs['audio'])
+    with patch.object(collector_runtime, 'run', fake_run):
+        await map_node(collector, {'images': images[:1], 'load_balance': False, 'pass_through': True,
+                                   'transfer_format': 'av1', 'transfer_quality': 70})
+        await map_node(collector, {'images': images[:1], 'load_balance': False, 'pass_through': True})
+    # Set values arrive list-wrapped (is_input_list); unset ones use the
+    # execute() defaults. The runtime helper unwraps both forms.
+    assert [(kw['transfer_format'], kw['transfer_quality']) for kw in forwarded] == [
+        (['av1'], [70]), ('legacy_png', 90)], forwarded
+
     # Prove V3's per-execution class clones do not leak helper instance state;
     # replace only the GPU/model boundary, not the input parser or executor.
     upscale_runtime = sys.modules[module.__name__ + '.nodes.distributed_upscale'].UltimateSDUpscaleDistributed
@@ -221,7 +250,15 @@ async def main():
         new = json.loads(json.dumps(cls.GET_NODE_INFO_V1()))
         for group in ('required', 'optional'):
             old_inputs = old['input'].get(group, {})
-            new_inputs = new['input'].get(group, {})
+            new_inputs = dict(new['input'].get(group, {}))
+            if group == 'optional':
+                for name, expected in ADDED_OPTIONAL_INPUTS.get(node_id, {}).items():
+                    assert name in new_inputs, (node_id, name, 'added input missing')
+                    actual = normalized_input(new_inputs.pop(name))
+                    kind, opts = normalized_input(expected)
+                    assert actual[0] == kind, (node_id, name, actual)
+                    for key, value in opts.items():
+                        assert actual[1].get(key) == value, (node_id, name, key, actual)
             assert list(old_inputs) == list(new_inputs), (node_id, group, 'input order')
             for name, original in old_inputs.items():
                 assert normalized_input(original) == normalized_input(new_inputs[name]), (node_id, name, original, new_inputs[name])

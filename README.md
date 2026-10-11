@@ -200,7 +200,9 @@ Notes:
 - The master must run this version to accept compressed results. A worker sending to an older master gets a 400 on its first request and automatically resends with `legacy_png`.
 - If a worker's PyAV build lacks the requested video encoder, it falls back to `h264` (lossy formats) or `png` (`ffv1`), and logs it.
 - Lossy formats only affect frames produced by workers; the master's own frames are never re-encoded.
-- Requests are capped at about 32 MB each (`COMFYUI_DISTRIBUTED_TRANSFER_CHUNK_BYTES`), comfortably below ComfyUI's default 100 MB upload limit.
+- Request size is bounded on the final encoded bytes. Frames are batched into requests of up to 32 MiB (`COMFYUI_DISTRIBUTED_TRANSFER_CHUNK_BYTES`); a single large frame may go alone in a request of up to 96 MiB (`COMFYUI_DISTRIBUTED_TRANSFER_MAX_REQUEST_BYTES`). Keep the latter below the master's `--max-upload-size` (default 100 MB) if you change either.
+- All chunks are encoded before anything is sent. If a single frame cannot fit within the request limit, the worker fails with an error and sends nothing; use a lossy format or raise both limits.
+- A rejection other than the older-master case above (for example the master's size limit, HTTP 413) is reported as an error rather than retried as `legacy_png`.
 - Each worker logs what it sent, e.g. `Sent 121 image(s) as h264 in 1 request(s): 2.40 MB (raw 334.49 MB, 139.4x smaller)`.
 
 ---

@@ -8,6 +8,7 @@ from comfy_api.v0_0_2 import io
 
 from . import utilities as _utilities
 from .collector import DistributedCollectorNode as _CollectorRuntime
+from ..utils import transfer_codec as _transfer_codec
 from .distributed_upscale import UltimateSDUpscaleDistributed as _UpscaleRuntime
 
 
@@ -121,7 +122,13 @@ class DistributedCollector(io.ComfyNode):
             node_id='DistributedCollector', display_name='Distributed Collector', category='image',
             inputs=[io.Boolean.Input('load_balance', default=False,
                                      tooltip='Run this workflow on one least-busy participant (master included when participating).'),
-                    io.Image.Input('images', optional=True), io.Audio.Input('audio', optional=True)],
+                    io.Image.Input('images', optional=True), io.Audio.Input('audio', optional=True),
+                    io.Combo.Input('transfer_format', options=list(_transfer_codec.TRANSFER_FORMATS),
+                                   default=_transfer_codec.DEFAULT_TRANSFER_FORMAT, optional=True,
+                                   tooltip=_transfer_codec.TRANSFER_FORMAT_TOOLTIP),
+                    io.Int.Input('transfer_quality', default=_transfer_codec.DEFAULT_TRANSFER_QUALITY,
+                                 min=1, max=100, step=1, optional=True,
+                                 tooltip=_transfer_codec.TRANSFER_QUALITY_TOOLTIP)],
             outputs=[io.Image.Output(display_name='images'), io.Audio.Output(display_name='audio')],
             is_input_list=True, accept_all_inputs=True,
         )
@@ -129,12 +136,15 @@ class DistributedCollector(io.ComfyNode):
     @classmethod
     def execute(cls, images=None, load_balance=False, audio=None, multi_job_id='',
                 is_worker=False, master_url='', enabled_worker_ids='[]', worker_batch_size=1,
-                worker_id='', pass_through=False, delegate_only=False):
+                worker_id='', pass_through=False, delegate_only=False,
+                transfer_format=_transfer_codec.DEFAULT_TRANSFER_FORMAT,
+                transfer_quality=_transfer_codec.DEFAULT_TRANSFER_QUALITY):
         return io.NodeOutput(*_CollectorRuntime().run(
             images=images, load_balance=load_balance, audio=audio, multi_job_id=multi_job_id,
             is_worker=is_worker, master_url=master_url, enabled_worker_ids=enabled_worker_ids,
             worker_batch_size=worker_batch_size, worker_id=worker_id,
-            pass_through=pass_through, delegate_only=delegate_only))
+            pass_through=pass_through, delegate_only=delegate_only,
+            transfer_format=transfer_format, transfer_quality=transfer_quality))
 
 
 class UltimateSDUpscaleDistributed(io.ComfyNode):

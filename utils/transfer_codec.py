@@ -37,6 +37,19 @@ TRANSFER_FORMATS = (LEGACY_FORMAT, "png", "ffv1", "jpeg", "webp", "h264", "h265"
 DEFAULT_TRANSFER_FORMAT = LEGACY_FORMAT
 DEFAULT_TRANSFER_QUALITY = 90
 
+TRANSFER_FORMAT_TOOLTIP = (
+    "How workers send images back to the master. "
+    "legacy_png: original uncompressed PNG (largest). "
+    "png / ffv1: lossless, identical result. "
+    "jpeg / webp: lossy stills. "
+    "h264 / h265 / av1: lossy video of the whole batch, smallest for frame sequences."
+)
+TRANSFER_QUALITY_TOOLTIP = (
+    "Quality for lossy transfer formats (ignored by lossless ones). "
+    "JPEG/WebP use it directly; video codecs map it to CRF "
+    "(90 -> h264/h265 CRF 13, av1 CRF 16)."
+)
+
 # encoder name, max CRF, container-friendly pixel format
 _VIDEO_CODECS = {
     "ffv1": ("ffv1", None, "bgr0"),
@@ -45,14 +58,25 @@ _VIDEO_CODECS = {
     "av1": ("libsvtav1", 63, "yuv420p"),
 }
 _VIDEO_RATE = 24
-# Encoders buffer frames (lookahead), so muxed size lags what has been fed.
-# Bound frames per video chunk too, so a single request cannot overshoot the
-# byte cap by more than this many frames' worth.
+# Upper bound on frames per video chunk, so one request never holds an
+# unbounded batch even when frames compress extremely well.
 MAX_VIDEO_CHUNK_FRAMES = 240
+# When sizing the next video chunk from observed bytes/frame, aim this far
+# below the limit so ordinary variation does not force a re-encode.
+VIDEO_CHUNK_SIZE_HEADROOM = 0.85
 
 
 class TransferCodecError(ValueError):
     """Raised when a transfer payload cannot be encoded or decoded."""
+
+
+class FrameTooLargeError(TransferCodecError):
+    """A single encoded frame does not fit in one request.
+
+    Raised by encode_chunks before anything has been yielded for that frame;
+    callers that materialize all chunks first can therefore fail without
+    having delivered a partial batch.
+    """
 
 
 def normalize_format(value):
@@ -252,15 +276,24 @@ def decode_video(data, width, height, expected_frames=None):
 # Chunking
 # --------------------------------------------------------------------------- #
 
-def encode_chunks(frames, fmt, quality, max_chunk_bytes):
+def encode_chunks(frames, fmt, quality, max_chunk_bytes, max_frame_bytes=None):
     """Yield transfer chunks for a uint8 frame batch [B,H,W,3].
 
     Each chunk is a dict:
         {"format", "start_index", "count", "width", "height", "parts": [bytes, ...]}
     Image formats carry one part per frame; video formats carry one part
-    (a Matroska file) holding `count` frames. Chunks are cut so a request
-    stays around `max_chunk_bytes` (a single frame larger than that is still
-    sent on its own).
+    (a Matroska file) holding `count` frames.
+
+    Size guarantees, measured on the finalized bytes (after encoder flush and
+    muxer finalization, not on encoder buffers):
+
+    * a chunk holding more than one frame never exceeds `max_chunk_bytes`;
+    * a chunk holding a single frame may exceed `max_chunk_bytes` but never
+      `max_frame_bytes` (defaults to `max_chunk_bytes`).
+
+    A frame that cannot fit in `max_frame_bytes` even on its own raises
+    FrameTooLargeError. Video chunks that come out too large are re-encoded
+    with fewer frames.
     """
     fmt = normalize_format(fmt)
     if fmt == LEGACY_FORMAT:
@@ -270,6 +303,7 @@ def encode_chunks(frames, fmt, quality, max_chunk_bytes):
         return
     height, width = int(frames.shape[1]), int(frames.shape[2])
     max_chunk_bytes = max(1, int(max_chunk_bytes))
+    max_frame_bytes = max_chunk_bytes if max_frame_bytes is None else max(max_chunk_bytes, int(max_frame_bytes))
 
     def _chunk(start, parts, count):
         return {
@@ -281,10 +315,19 @@ def encode_chunks(frames, fmt, quality, max_chunk_bytes):
             "parts": parts,
         }
 
+    def _too_large(index, size):
+        return FrameTooLargeError(
+            f"Frame {index} encodes to {size} bytes as {fmt}, above the {max_frame_bytes}-byte request limit. "
+            "Use a lossy format or lower quality, or raise the master's --max-upload-size together with "
+            "COMFYUI_DISTRIBUTED_TRANSFER_MAX_REQUEST_BYTES."
+        )
+
     if fmt in IMAGE_FORMATS:
         start, parts, size = 0, [], 0
         for i in range(total):
             data = encode_image_frame(frames[i], fmt, quality)
+            if len(data) > max_frame_bytes:
+                raise _too_large(i, len(data))
             if parts and size + len(data) > max_chunk_bytes:
                 yield _chunk(start, parts, len(parts))
                 start, parts, size = i, [], 0
@@ -294,18 +337,40 @@ def encode_chunks(frames, fmt, quality, max_chunk_bytes):
             yield _chunk(start, parts, len(parts))
         return
 
-    writer, start = None, 0
-    for i in range(total):
-        if writer is None:
-            writer, start = _VideoChunkWriter(fmt, quality, width, height), i
+    start = 0
+    budget = MAX_VIDEO_CHUNK_FRAMES
+    while start < total:
+        want = min(budget, total - start)
+        data, count = _encode_video_range(frames, start, want, fmt, quality, width, height, max_chunk_bytes)
+        if len(data) <= max_chunk_bytes or (count == 1 and len(data) <= max_frame_bytes):
+            yield _chunk(start, [data], count)
+            start += count
+            per_frame = len(data) / count
+            budget = max(1, min(MAX_VIDEO_CHUNK_FRAMES, int(max_chunk_bytes * VIDEO_CHUNK_SIZE_HEADROOM / per_frame)))
+            continue
+        if count == 1:
+            raise _too_large(start, len(data))
+        # Finalized chunk overshot: retry this range with proportionally fewer
+        # frames. Strictly fewer than `count`, so this always terminates.
+        estimate = int(count * max_chunk_bytes * VIDEO_CHUNK_SIZE_HEADROOM / len(data))
+        budget = max(1, min(count - 1, estimate))
+
+
+def _encode_video_range(frames, start, count, fmt, quality, width, height, stop_after_bytes):
+    """Encode frames[start:start+count] as one finalized video.
+
+    Stops feeding frames early once the muxed output already exceeds
+    `stop_after_bytes`, since the chunk is then known to be too large and will
+    be re-encoded smaller; this bounds wasted work. Encoder lookahead means the
+    pre-flush size underestimates the final size, so the caller must still
+    check the returned (finalized) bytes. Returns (bytes, frames_encoded).
+    """
+    writer = _VideoChunkWriter(fmt, quality, width, height)
+    for i in range(start, start + count):
         writer.add(frames[i])
-        # Muxed size lags the encoder lookahead a little; good enough for a soft cap.
-        full = writer.bytes_so_far() >= max_chunk_bytes or writer.count >= MAX_VIDEO_CHUNK_FRAMES
-        if full and i < total - 1:
-            yield _chunk(start, [writer.close()], writer.count)
-            writer = None
-    if writer is not None:
-        yield _chunk(start, [writer.close()], writer.count)
+        if writer.bytes_so_far() > stop_after_bytes:
+            break
+    return writer.close(), writer.count
 
 
 def decode_chunk(envelope, parts):

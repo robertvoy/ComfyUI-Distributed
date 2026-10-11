@@ -99,6 +99,7 @@ def _load_collector_module():
     constants_module = types.ModuleType(f"{package_name}.utils.constants")
     constants_module.HEARTBEAT_INTERVAL = 1.0
     constants_module.TRANSFER_MAX_CHUNK_BYTES = 32 * 1024 * 1024
+    constants_module.TRANSFER_MAX_REQUEST_BYTES = 96 * 1024 * 1024
     sys.modules[f"{package_name}.utils.constants"] = constants_module
 
     image_module = types.ModuleType(f"{package_name}.utils.image")
@@ -401,14 +402,15 @@ class _RecordingResponse:
 
 
 class _RecordingSession:
-    def __init__(self, statuses=None):
+    def __init__(self, statuses=None, text="Invalid JSON payload"):
         self.calls = []
         self._statuses = list(statuses or [])
+        self._text = text
 
     def post(self, url, timeout, json=None, data=None):
         self.calls.append({"url": url, "json": json, "data": data, "timeout": timeout.total})
         status = self._statuses.pop(0) if self._statuses else 200
-        return _RecordingResponse(status=status, text="Invalid JSON payload")
+        return _RecordingResponse(status=status, text=self._text)
 
 
 def _install_fake_transport(module, session):
@@ -545,3 +547,84 @@ def test_worker_falls_back_when_video_encoder_missing():
         codec.video_codec_available = original
 
     assert session.calls[0]["data"]["envelope"]["format"] == "h264"
+
+
+def test_worker_does_not_fall_back_on_non_legacy_rejection():
+    import pytest
+
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    session = _RecordingSession(statuses=[400], text="Invalid multipart payload: Request Entity Too Large")
+    _install_fake_transport(module, session)
+
+    with pytest.raises(RuntimeError, match="MAX_REQUEST_BYTES"):
+        _run_worker(collector, torch.rand(2, 8, 8, 3), transfer_format="png")
+
+    # One compressed attempt, no legacy resend of the batch.
+    assert len(session.calls) == 1
+    assert session.calls[0]["json"] is None
+
+
+def test_worker_sends_nothing_when_a_frame_cannot_fit():
+    import numpy as np
+    import pytest
+
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    session = _RecordingSession()
+    _install_fake_transport(module, session)
+    reserve = module.DistributedCollectorNode.TRANSFER_ENVELOPE_RESERVE_BYTES
+    module.TRANSFER_MAX_REQUEST_BYTES = reserve + 32 * 1024
+    module.TRANSFER_MAX_CHUNK_BYTES = 32 * 1024
+    # Frame 0 is tiny; frame 2 is noise that cannot fit in 32 KiB as PNG.
+    images = torch.zeros(3, 128, 128, 3)
+    images[2] = torch.from_numpy(np.random.default_rng(1).random((128, 128, 3), dtype=np.float32))
+
+    with pytest.raises(module.transfer_codec.FrameTooLargeError):
+        _run_worker(collector, images, transfer_format="png")
+
+    assert session.calls == []
+
+
+def test_worker_sends_audio_separately_when_it_would_overflow_last_request():
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    session = _RecordingSession()
+    _install_fake_transport(module, session)
+    reserve = module.DistributedCollectorNode.TRANSFER_ENVELOPE_RESERVE_BYTES
+    module.TRANSFER_MAX_REQUEST_BYTES = reserve + 64 * 1024
+    module.TRANSFER_MAX_CHUNK_BYTES = 64 * 1024
+    module.encode_audio_payload = lambda value: None if value is None else {"data": "x" * (128 * 1024)}
+
+    _run_worker(
+        collector,
+        torch.zeros(2, 16, 16, 3),
+        audio={"waveform": torch.ones(1, 2, 4), "sample_rate": 48000},
+        transfer_format="png",
+    )
+
+    multipart = [call["data"]["envelope"] for call in session.calls if call["data"] is not None]
+    assert [e["is_last"] for e in multipart] == [False]
+    assert all("audio" not in e for e in multipart)
+    final = session.calls[-1]["json"]
+    assert final["is_last"] is True and final["audio"]["data"].startswith("x")
+    assert "image" not in final
+
+
+def test_worker_attaches_audio_to_last_chunk_when_it_fits():
+    module = _load_collector_module()
+    collector = module.DistributedCollectorNode()
+    session = _RecordingSession()
+    _install_fake_transport(module, session)
+    module.encode_audio_payload = lambda value: None if value is None else {"data": "small"}
+
+    _run_worker(
+        collector,
+        torch.zeros(2, 16, 16, 3),
+        audio={"waveform": torch.ones(1, 2, 4), "sample_rate": 48000},
+        transfer_format="png",
+    )
+
+    assert len(session.calls) == 1
+    envelope = session.calls[0]["data"]["envelope"]
+    assert envelope["is_last"] is True and envelope["audio"] == {"data": "small"}

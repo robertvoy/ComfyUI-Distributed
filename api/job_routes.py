@@ -334,6 +334,10 @@ async def _job_complete_compressed(request):
     try:
         form = await request.post()
     except Exception as exc:
+        too_large = getattr(web, "HTTPRequestEntityTooLarge", None)
+        if too_large is not None and isinstance(exc, too_large):
+            return await handle_api_error(
+                request, f"Request body exceeds the master's upload limit (--max-upload-size): {exc}", 413)
         return await handle_api_error(request, f"Invalid multipart payload: {exc}", 400)
 
     raw_envelope = form.get("envelope")

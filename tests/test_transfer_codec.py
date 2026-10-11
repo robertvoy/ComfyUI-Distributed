@@ -162,3 +162,58 @@ def test_legacy_format_is_not_chunk_encoded():
     frames = tc.tensor_batch_to_uint8(_smooth_frames(count=1))
     with pytest.raises(tc.TransferCodecError):
         list(tc.encode_chunks(frames, "legacy_png", 90, 10**9))
+
+
+# --------------------------------------------------------------------------- #
+# Size bounds on finalized payloads
+# --------------------------------------------------------------------------- #
+
+def _noise_frames(count=30, height=360, width=640, seed=97):
+    """High-entropy frames: worst case for every codec, and enough encoder
+    lookahead that pre-flush buffer sizes badly underestimate final sizes."""
+    return np.random.default_rng(seed).integers(0, 256, size=(count, height, width, 3), dtype=np.uint8)
+
+
+@pytest.mark.parametrize("fmt", ["h264", "ffv1"])
+def test_video_chunks_are_bounded_after_encoder_flush(fmt):
+    frames = _noise_frames()
+    limit = 1024 * 1024
+    # Sanity: one unconstrained encode of this batch is far above the limit,
+    # so the bound below is actually being enforced.
+    unbounded = next(tc.encode_chunks(frames, fmt, 90, 10**12))
+    assert len(unbounded["parts"][0]) > 3 * limit
+
+    chunks = list(tc.encode_chunks(frames, fmt, 90, limit))
+
+    assert all(len(c["parts"]) == 1 and len(c["parts"][0]) <= limit for c in chunks)
+    assert [c["start_index"] for c in chunks] == list(np.cumsum([0] + [c["count"] for c in chunks[:-1]]))
+    assert sum(c["count"] for c in chunks) == len(frames)
+    decoded = [f for c in chunks for f in tc.decode_chunk(c, c["parts"])]
+    assert len(decoded) == len(frames)
+    if fmt == "ffv1":
+        assert np.array_equal(np.stack(decoded), frames)
+
+
+def test_single_video_frame_may_exceed_chunk_target_up_to_frame_limit():
+    frames = _noise_frames(count=3)
+    one_frame = len(next(tc.encode_chunks(frames[:1], "ffv1", 90, 10**12))["parts"][0])
+
+    chunks = list(tc.encode_chunks(frames, "ffv1", 90, one_frame // 2, one_frame * 2))
+
+    assert [c["count"] for c in chunks] == [1, 1, 1]
+    assert all(one_frame // 2 < len(c["parts"][0]) <= one_frame * 2 for c in chunks)
+
+
+@pytest.mark.parametrize("fmt", ["ffv1", "h264", "png"])
+def test_frame_that_cannot_fit_alone_raises(fmt):
+    frames = _noise_frames(count=2)
+    with pytest.raises(tc.FrameTooLargeError, match="request limit"):
+        list(tc.encode_chunks(frames, fmt, 90, 64 * 1024, 64 * 1024))
+
+
+def test_still_chunks_are_bounded():
+    frames = _noise_frames(count=10)
+    limit = 1024 * 1024
+    chunks = list(tc.encode_chunks(frames, "jpeg", 90, limit))
+    assert all(sum(len(p) for p in c["parts"]) <= limit for c in chunks)
+    assert sum(c["count"] for c in chunks) == 10

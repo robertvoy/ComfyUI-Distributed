@@ -43,8 +43,15 @@ MEMORY_CLEAR_DELAY = 0.5
 MAX_BATCH = int(os.environ.get('COMFYUI_MAX_BATCH', '20'))  # Maximum items per batch to prevent timeouts/OOM (~100MB chunks for 512x512 PNGs)
 
 # Compressed worker -> master result transfer (DistributedCollector)
-# Soft cap per multipart request; keep well under ComfyUI's --max-upload-size (100MB default).
-TRANSFER_MAX_CHUNK_BYTES = int(os.environ.get('COMFYUI_DISTRIBUTED_TRANSFER_CHUNK_BYTES', str(32 * 1024 * 1024)))
+# Hard cap on one multipart request body. Must not exceed the master's
+# --max-upload-size (ComfyUI default: 100 MiB), which rejects larger requests.
+TRANSFER_MAX_REQUEST_BYTES = int(os.environ.get('COMFYUI_DISTRIBUTED_TRANSFER_MAX_REQUEST_BYTES', str(96 * 1024 * 1024)))
+# Target media bytes per request when batching several frames into one
+# request; a single frame may exceed this up to the hard cap above.
+TRANSFER_MAX_CHUNK_BYTES = min(
+    int(os.environ.get('COMFYUI_DISTRIBUTED_TRANSFER_CHUNK_BYTES', str(32 * 1024 * 1024))),
+    TRANSFER_MAX_REQUEST_BYTES,
+)
 
 # Heartbeat monitoring
 HEARTBEAT_INTERVAL = float(os.environ.get('COMFYUI_HEARTBEAT_INTERVAL', '10'))  # Heartbeat/check interval in seconds
