@@ -108,6 +108,50 @@ describe("Runpod serverless worker panel", () => {
         expect(isRemoteWorker({}, { type: "serverless" })).toBe(true);
     });
 
+    it("initializes a saved serverless form before it is attached to the document", () => {
+        // Real document lookups cannot see a form while its card is being built.
+        vi.spyOn(document, "getElementById").mockReturnValue(null);
+        const worker = {
+            id: "saved", name: "Runpod", type: "serverless", endpoint_id: "ep_123",
+            jobs_per_run: 2, concurrency: 1, timeout_seconds: 900, api_key_configured: true,
+        };
+        const form = createWorkerSettingsForm(createFormUi(), {}, worker);
+
+        expect(form.parentNode).toBeUndefined();
+        expect(elements.get("worker-type-saved").value).toBe("serverless");
+        for (const field of ["host", "port", "cuda", "args"]) {
+            expect(elements.get(`${field}-group-saved`).style.display).toBe("none");
+        }
+        expect(elements.get("runpod-text-saved").style.display).toBe("none");
+        for (const field of ["endpoint-id", "api-key", "clear-api-key", "jobs-per-run", "concurrency", "timeout-seconds", "serverless-test"]) {
+            expect(elements.get(`${field}-group-saved`).style.display).toBe("flex");
+        }
+        expect(elements.get("endpoint-id-saved").value).toBe("ep_123");
+        expect(elements.get("jobs-per-run-saved").value).toBe("2");
+        expect(elements.get("concurrency-saved").value).toBe("1");
+        expect(elements.get("timeout-seconds-saved").value).toBe("900");
+        expect(elements.get("api-key-saved").value).toBe("");
+        expect(elements.get("api-key-saved").placeholder).toMatch(/leave blank/i);
+    });
+
+    it("preserves a saved cloud port on first render and applies defaults only on type changes", () => {
+        vi.spyOn(document, "getElementById").mockReturnValue(null);
+        createWorkerSettingsForm(createFormUi(), {}, {
+            id: "cloud", name: "Cloud", type: "cloud", host: "worker.example", port: 8443,
+        });
+        const type = elements.get("worker-type-cloud");
+        expect(type.value).toBe("cloud");
+        expect(elements.get("port-cloud").value).toBe("8443");
+        expect(elements.get("host-cloud").value).toBe("worker.example");
+        expect(elements.get("runpod-text-cloud").style.display).toBe("block");
+
+        type.value = "remote";
+        type.dispatchEvent();
+        type.value = "cloud";
+        type.dispatchEvent();
+        expect(elements.get("port-cloud").value).toBe("443");
+    });
+
     it("shows only serverless settings and keeps credentials write-only", () => {
         const worker = {
             id: "w1", name: "Runpod", type: "remote", host: "worker.example", port: 8188,

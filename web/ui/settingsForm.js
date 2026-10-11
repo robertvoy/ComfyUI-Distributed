@@ -49,71 +49,61 @@ export function createWorkerSettingsForm(ui, extension, worker) {
     runpodText.textContent = "Deploy Cloud Worker with Runpod";
     runpodText.style.cssText = "font-size: 12px; color: #4a90e2; text-decoration: none; margin-top: 4px; display: none; cursor: pointer;";
 
-    const createOnChangeHandler = () => {
-        return (e) => {
-            const workerType = e.target.value;
-            const hostGroup = document.getElementById(`host-group-${worker.id}`);
-            const hostInput = document.getElementById(`host-${worker.id}`);
-            const portGroup = document.getElementById(`port-group-${worker.id}`);
-            const portInput = document.getElementById(`port-${worker.id}`);
-            const cudaGroup = document.getElementById(`cuda-group-${worker.id}`);
-            const argsGroup = document.getElementById(`args-group-${worker.id}`);
-            const runpodTextElem = document.getElementById(`runpod-text-${worker.id}`);
-            const serverlessGroups = [
-                `endpoint-id-group-${worker.id}`,
-                `api-key-group-${worker.id}`,
-                `clear-api-key-group-${worker.id}`,
-                `jobs-per-run-group-${worker.id}`,
-                `concurrency-group-${worker.id}`,
-                `timeout-seconds-group-${worker.id}`,
-                `serverless-test-group-${worker.id}`,
-            ].map((id) => document.getElementById(id));
+    const updateWorkerType = (workerType, applyDefaults = false) => {
+        // The form is initialized before its card is attached to document.
+        // Use this form's own elements, not document-wide ID lookups.
+        const hostInput = hostGroup.input;
+        const portInput = portGroup.input;
+        const serverlessGroups = [
+            endpointGroup.group,
+            apiKeyGroup.group,
+            clearApiKeyGroup,
+            jobsPerRunGroup.group,
+            concurrencyGroup.group,
+            timeoutGroup.group,
+            testServerlessGroup,
+        ];
 
-            if (!hostGroup || !portGroup || !cudaGroup || !argsGroup || !runpodTextElem || !hostInput || !portInput || serverlessGroups.some((group) => !group)) {
-                return;
+        const hideServerless = () => serverlessGroups.forEach((group) => { group.style.display = "none"; });
+
+        if (workerType === "local") {
+            hideServerless();
+            hostGroup.group.style.display = "none";
+            portGroup.group.style.display = "flex";
+            cudaGroup.group.style.display = "flex";
+            argsGroup.group.style.display = "flex";
+            runpodText.style.display = "none";
+        } else if (workerType === "remote") {
+            hideServerless();
+            hostGroup.group.style.display = "flex";
+            portGroup.group.style.display = "flex";
+            cudaGroup.group.style.display = "none";
+            argsGroup.group.style.display = "none";
+            runpodText.style.display = "none";
+            hostInput.placeholder = "e.g., 192.168.1.100";
+            if (applyDefaults && (hostInput.value === "localhost" || hostInput.value === "127.0.0.1")) {
+                hostInput.value = "";
             }
-
-            const hideServerless = () => serverlessGroups.forEach((group) => { group.style.display = "none"; });
-
-            if (workerType === "local") {
-                hideServerless();
-                hostGroup.style.display = "none";
-                portGroup.style.display = "flex";
-                cudaGroup.style.display = "flex";
-                argsGroup.style.display = "flex";
-                runpodTextElem.style.display = "none";
-            } else if (workerType === "remote") {
-                hideServerless();
-                hostGroup.style.display = "flex";
-                portGroup.style.display = "flex";
-                cudaGroup.style.display = "none";
-                argsGroup.style.display = "none";
-                runpodTextElem.style.display = "none";
-                hostInput.placeholder = "e.g., 192.168.1.100";
-                if (hostInput.value === "localhost" || hostInput.value === "127.0.0.1") {
-                    hostInput.value = "";
-                }
-            } else if (workerType === "cloud") {
-                hideServerless();
-                hostGroup.style.display = "flex";
-                portGroup.style.display = "flex";
-                cudaGroup.style.display = "none";
-                argsGroup.style.display = "none";
-                runpodTextElem.style.display = "block";
-                hostInput.placeholder = "e.g., your-cloud-worker.trycloudflare.com";
-                portInput.value = "443";
-                if (hostInput.value === "localhost" || hostInput.value === "127.0.0.1") {
-                    hostInput.value = "";
-                }
-            } else if (workerType === "serverless") {
-                hostGroup.style.display = "none";
-                portGroup.style.display = "none";
-                cudaGroup.style.display = "none";
-                argsGroup.style.display = "none";
-                runpodTextElem.style.display = "none";
-                serverlessGroups.forEach((group) => { group.style.display = "flex"; });
+        } else if (workerType === "cloud") {
+            hideServerless();
+            hostGroup.group.style.display = "flex";
+            portGroup.group.style.display = "flex";
+            cudaGroup.group.style.display = "none";
+            argsGroup.group.style.display = "none";
+            runpodText.style.display = "block";
+            hostInput.placeholder = "e.g., your-cloud-worker.trycloudflare.com";
+            if (applyDefaults) portInput.value = "443";
+            if (applyDefaults && (hostInput.value === "localhost" || hostInput.value === "127.0.0.1")) {
+                hostInput.value = "";
             }
-        };
+        } else if (workerType === "serverless") {
+            hostGroup.group.style.display = "none";
+            portGroup.group.style.display = "none";
+            cudaGroup.group.style.display = "none";
+            argsGroup.group.style.display = "none";
+            runpodText.style.display = "none";
+            serverlessGroups.forEach((group) => { group.style.display = "flex"; });
+        }
     };
 
     typeGroup.appendChild(typeLabel);
@@ -217,7 +207,7 @@ export function createWorkerSettingsForm(ui, extension, worker) {
     const buttonGroup = ui.createButtonGroup([saveBtn, cancelBtn, deleteBtn], " margin-top: 8px;");
     form.appendChild(buttonGroup);
 
-    typeSelect.onchange = createOnChangeHandler();
+    typeSelect.onchange = (event) => updateWorkerType(event.target.value, true);
 
     if (worker.type === "serverless") {
         typeSelect.value = "serverless";
@@ -230,7 +220,7 @@ export function createWorkerSettingsForm(ui, extension, worker) {
         typeSelect.value = "local";
     }
 
-    typeSelect.dispatchEvent(new Event('change'));
+    updateWorkerType(typeSelect.value);
 
     return form;
 }
