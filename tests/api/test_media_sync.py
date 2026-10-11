@@ -243,5 +243,54 @@ class RewritePromptMediaInputsTests(unittest.TestCase):
         self.assertEqual(prompt["1"]["inputs"]["audio"], "song.wav")
 
 
+class AnnotatedMediaUploadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_output_temp_and_input_uploads_do_not_collide(self):
+        from unittest.mock import AsyncMock, patch
+
+        class Response:
+            status = 200
+            def __init__(self, data):
+                self.data = data
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_args):
+                return None
+            async def json(self):
+                return self.data
+            def raise_for_status(self):
+                pass
+
+        class Form:
+            def __init__(self):
+                self.fields = {}
+            def add_field(self, key, value, **kwargs):
+                self.fields[key] = value
+                if key == 'image':
+                    self.fields['name'] = kwargs['filename']
+
+        checked = []
+        def post(url, *, json=None, data=None, **kwargs):
+            if url.endswith('/check_file'):
+                checked.append(json['filename'])
+                return Response({'exists': False})
+            self.assertEqual(data.fields['type'], 'input')
+            self.assertEqual(data.fields['image'], b'real file bytes')
+            return Response({'name': data.fields['name'], 'subfolder': data.fields['subfolder']})
+
+        refs = ['shared/ref.png', 'shared/ref.png [output]', 'shared/ref.png [temp]']
+        prompt = {str(i): {'inputs': {'image': ref}} for i, ref in enumerate(refs)}
+        self.assertEqual(ms._find_media_references(prompt), refs)
+        with patch.object(ms, 'get_client_session', AsyncMock(return_value=types.SimpleNamespace(post=post))), \
+             patch.object(ms, 'aiohttp', types.SimpleNamespace(FormData=Form, ClientTimeout=lambda **kw: kw)):
+            paths = [await ms._upload_media_to_worker({}, ref, b'real file bytes', 'fixture-hash', 'image/png')
+                     for ref in refs]
+        expected = ['shared/ref.png', 'distributed-media/output/fixture-hash/ref.png',
+                    'distributed-media/temp/fixture-hash/ref.png']
+        self.assertEqual(checked, expected)
+        self.assertEqual(paths, [(True, path) for path in expected])
+        ms._rewrite_prompt_media_inputs(prompt, dict(zip(refs, expected)))
+        self.assertEqual([node['inputs']['image'] for node in prompt.values()], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
