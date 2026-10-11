@@ -1,19 +1,5 @@
-import { updateWorkerControls, toggleWorkerExpanded } from "../workerLifecycle.js";
+import { updateWorkerControls, toggleWorkerExpanded, formatServerlessStatus } from "../workerLifecycle.js";
 import { isRemoteWorker } from "../workerSettings.js";
-
-function formatServerlessStatus(status) {
-    if (!status) return "Runpod status pending";
-    const message = status.message || (status.ok ? "Ready to scale" : "Runpod status unavailable");
-    const queue = Number(status.queueRemaining);
-    const parts = [message];
-    if (Number.isFinite(queue)) parts.push(`${Math.max(0, queue)} queued`);
-    const jobs = (Array.isArray(status.jobs) ? status.jobs : [])
-        .slice(0, 2)
-        .map((job) => String(job?.status || "").trim())
-        .filter(Boolean);
-    if (jobs.length) parts.push(`Jobs: ${jobs.join(", ")}`);
-    return parts.join(" • ");
-}
 
 export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
     const config = cardConfigs[entityType] || {};
@@ -92,9 +78,10 @@ export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
         const statusMessage = document.createElement("small");
         statusMessage.id = `serverless-status-${data.id}`;
         statusMessage.className = "dist-worker-info__meta dist-serverless-status";
-        statusMessage.style.display = "block";
         statusMessage.setAttribute("aria-live", "polite");
-        statusMessage.textContent = formatServerlessStatus(extension.state.getWorker(data.id)?.serverlessStatus);
+        const status = extension.state.getWorker(data.id)?.serverlessStatus;
+        statusMessage.textContent = data.enabled ? formatServerlessStatus(status) : "Disabled";
+        statusMessage.title = status?.message || "";
         infoSpan.appendChild(statusMessage);
     }
 

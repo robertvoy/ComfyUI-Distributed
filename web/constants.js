@@ -131,7 +131,7 @@ export const PULSE_ANIMATION_CSS = `
 `;
 
 export const UI_STYLES = {
-    statusDot: "display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 10px;",
+    statusDot: "display: inline-block; flex: 0 0 10px; width: 10px; height: 10px; border-radius: 50%; margin-right: 10px;",
     controlsDiv: "padding: 0 12px 12px 12px; display: flex; gap: 6px;",
     formGroup: "display: flex; flex-direction: column; gap: 5px;",
     formLabel: "font-size: 12px; color: var(--dist-label-text, #ccc); font-weight: 500;",
@@ -147,12 +147,12 @@ export const UI_STYLES = {
     // Column styles
     columnBase: "display: flex; align-items: center; justify-content: center;",
     checkboxColumn: "flex: 0 0 44px; display: flex; align-items: center; justify-content: center; cursor: default;",
-    contentColumn: "flex: 1; display: flex; flex-direction: column; transition: background-color 0.2s ease;",
+    contentColumn: "flex: 1; min-width: 0; display: flex; flex-direction: column; transition: background-color 0.2s ease;",
     iconColumn: "width: 44px; flex-shrink: 0; font-size: 20px; color: var(--dist-placeholder-add-color, #666);",
     
     // Row and content styles
     infoRow: "display: flex; align-items: center; padding: 12px; cursor: pointer; min-height: 64px;",
-    workerContent: "display: flex; align-items: center; gap: 10px; flex: 1;",
+    workerContent: "display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0;",
     
     // Form and controls styles
     buttonGroup: "display: flex; gap: 4px; margin-top: 10px;",

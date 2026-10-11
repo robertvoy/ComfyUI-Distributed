@@ -5,7 +5,7 @@ vi.mock("../../scripts/api.js", () => ({ api: { clientId: "test-client" } }), { 
 import { createApiClient } from "../apiClient.js";
 import { createWorkerSettingsForm } from "../ui/settingsForm.js";
 import { DistributedUI } from "../ui.js";
-import { checkWorkerStatus, getWorkerUrl, launchWorker, stopWorker, viewWorkerLog } from "../workerLifecycle.js";
+import { checkWorkerStatus, formatServerlessStatus, getWorkerUrl, launchWorker, stopWorker, viewWorkerLog } from "../workerLifecycle.js";
 import { handleClearMemory, handleInterruptWorkers } from "../workerUtils.js";
 import { isRemoteWorker, saveWorkerSettings, testServerlessWorker } from "../workerSettings.js";
 import { performPreflightCheck } from "../executionUtils.js";
@@ -16,7 +16,9 @@ function createDocumentMock() {
         const element = {
             tagName,
             children: [],
+            dataset: {},
             style: {},
+            setAttribute(name, value) { this[name] = value; },
             classList: {
                 values: new Set(),
                 add(...names) { names.forEach((name) => this.values.add(name)); },
@@ -259,6 +261,50 @@ describe("Runpod serverless worker panel", () => {
         expect(worker).not.toHaveProperty("api_key");
     });
 
+    it.each([
+        [undefined, "Checking status…"],
+        [{ ok: true, queueRemaining: 0, jobs: [] }, "Ready"],
+        [{ ok: true, queueRemaining: 1, jobs: [{ status: "IN_QUEUE" }] }, "Queued"],
+        [{ ok: true, jobs: [{ status: "IN_PROGRESS" }] }, "Running"],
+        [{ ok: true, jobs: [{ status: "RUNNING" }, { status: "IN_QUEUE" }] }, "Running"],
+        [{ ok: true, jobs: [{ status: "RUNNING" }, { status: "IN_PROGRESS" }] }, "Running · 2 jobs"],
+        [{ ok: true, jobs: [{ status: "DOWNLOADING" }] }, "Downloading result"],
+        [{ ok: true, jobs: [{ status: "CANCEL_REQUESTED" }] }, "Cancelling"],
+        [{ ok: true, queueRemaining: 1 }, "Active · 1 job"],
+        [{ ok: true, queueRemaining: 3 }, "Active · 3 jobs"],
+        [{ ok: true, jobs: [{ status: "COMPLETED" }] }, "Ready"],
+        [{ ok: true, jobs: [{ status: "FAILED" }] }, "Last job failed"],
+        [{ ok: false, message: "Check the saved endpoint ID and API key" }, "Unavailable"],
+    ])("formats provider state as one plain-language summary: %j", (status, expected) => {
+        expect(formatServerlessStatus(status)).toBe(expected);
+    });
+
+    it("keeps the serverless card compact while retaining its expanded settings", () => {
+        const ui = new DistributedUI();
+        const worker = {
+            id: "compact", name: "Used Car Inventory", type: "serverless", enabled: true,
+            endpoint_id: "ep_private_id", jobs_per_run: 1, concurrency: 1,
+        };
+        const extension = {
+            config: { workers: [worker] },
+            state: {
+                isWorkerExpanded: () => false,
+                getWorker: () => ({ serverlessStatus: { ok: true, queueRemaining: 1, jobs: [{ status: "IN_QUEUE" }] } }),
+            },
+        };
+        const card = ui.renderEntityCard("worker", worker, extension);
+        const collect = (element) => [element, ...(element.children || []).flatMap(collect)];
+        const info = collect(card).find((element) => element.classList.values.has("dist-worker-info"));
+        expect(info.innerHTML).toContain("Runpod Serverless");
+        expect(info.innerHTML).not.toMatch(/ep_private_id|jobs\/run|slots/);
+        expect(elements.get("serverless-status-compact").textContent).toBe("Queued");
+        expect(elements.get("endpoint-id-compact").value).toBe("ep_private_id");
+        expect(Number(elements.get("jobs-per-run-compact").value)).toBe(1);
+        expect(Number(elements.get("concurrency-compact").value)).toBe(1);
+        expect(elements.has("controls-compact")).toBe(false);
+        expect(elements.get("status-compact").style.cssText).toContain("flex: 0 0 10px");
+    });
+
     it("uses provider status instead of a direct ComfyUI URL probe", async () => {
         const statusElement = { textContent: "" };
         elements.set("serverless-status-w4", statusElement);
@@ -288,8 +334,8 @@ describe("Runpod serverless worker panel", () => {
         expect(extension.state.setWorkerStatus).toHaveBeenCalledWith("w4", {
             online: true, processing: true, queueCount: 0,
         });
-        expect(statusElement.textContent).toContain("Ready to scale");
-        expect(statusElement.textContent).toContain("RUNNING");
+        expect(statusElement.textContent).toBe("Running");
+        expect(statusElement.title).toBe("Ready to scale");
     });
 
     it("considers a healthy zero-worker Runpod pool ready and never builds a worker URL", async () => {
@@ -312,8 +358,7 @@ describe("Runpod serverless worker panel", () => {
         const ui = new DistributedUI();
         const worker = { id: "w-controls", name: "Runpod", type: "serverless", enabled: true };
         const controls = ui.createControlsSection({ dynamic: true }, worker, {}, true);
-        const collect = (element) => [element, ...(element.children || []).flatMap(collect)];
-        const elementsInControls = collect(controls);
+
         const extension = {
             config: { workers: [worker] },
             api: {
@@ -321,7 +366,7 @@ describe("Runpod serverless worker panel", () => {
             },
         };
 
-        expect(elementsInControls.filter((element) => element.tagName === "button")).toHaveLength(0);
+        expect(controls).toBeNull();
         await launchWorker(extension, worker.id);
         await stopWorker(extension, worker.id);
         await viewWorkerLog(extension, worker.id, true);

@@ -41,26 +41,39 @@ function setButtonVisibility(button, visible) {
     button.style.display = visible ? "" : "none";
 }
 
+export function formatServerlessStatus(status) {
+    if (!status) return "Checking status…";
+    if (!status.ok) return "Unavailable";
+    const jobs = (Array.isArray(status.jobs) ? status.jobs : [])
+        .map((job) => String(job?.status || "").trim().toUpperCase());
+    // Prefer current work over old ledger entries, and avoid raw provider enums.
+    const phases = [
+        ["Downloading result", ["DOWNLOADING"]],
+        ["Cancelling", ["CANCEL_REQUESTED"]],
+        ["Running", ["RUNNING", "PROCESSING", "IN_PROGRESS"]],
+        ["Starting", ["STARTING"]],
+        ["Submitting", ["SUBMITTING"]],
+        ["Queued", ["WAITING", "IN_QUEUE", "QUEUED", "PENDING"]],
+    ];
+    for (const [label, states] of phases) {
+        const count = jobs.filter((state) => states.includes(state)).length;
+        if (count) return count > 1 ? `${label} · ${count} jobs` : label;
+    }
+    // Health counts queued AND running jobs, not just the waiting queue.
+    const remaining = Number(status.queueRemaining);
+    if (Number.isFinite(remaining) && remaining > 0) {
+        return `Active · ${remaining} ${remaining === 1 ? "job" : "jobs"}`;
+    }
+    if (jobs[0] === "FAILED") return "Last job failed";
+    if (jobs[0] === "TIMED_OUT") return "Last job timed out";
+    return "Ready";
+}
+
 function updateServerlessStatusMessage(workerId, status) {
     const messageElement = document.getElementById(`serverless-status-${workerId}`);
     if (!messageElement) return;
-
-    const message = typeof status?.message === "string" && status.message
-        ? status.message
-        : status?.ok ? "Ready to scale" : "Runpod status unavailable";
-    const queueRemaining = Number(status?.queueRemaining);
-    const parts = [message];
-    if (Number.isFinite(queueRemaining)) {
-        parts.push(`${Math.max(0, queueRemaining)} queued`);
-    }
-    const jobStatuses = (Array.isArray(status?.jobs) ? status.jobs : [])
-        .slice(0, 2)
-        .map((job) => String(job?.status || "").trim())
-        .filter(Boolean);
-    if (jobStatuses.length) {
-        parts.push(`Jobs: ${jobStatuses.join(", ")}`);
-    }
-    messageElement.textContent = parts.join(" • ");
+    messageElement.textContent = formatServerlessStatus(status);
+    messageElement.title = status?.message || "";
 }
 
 export async function checkAllWorkerStatuses(extension) {

@@ -235,6 +235,17 @@
     border-radius: 4px;
 }
 
+.dist-worker-info {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.dist-serverless-status {
+    display: block;
+    margin-top: 4px;
+    line-height: 1.4;
+}
+
 .dist-worker-info__title {
     color: var(--dist-card-title) !important;
     font-size: 1.03em;

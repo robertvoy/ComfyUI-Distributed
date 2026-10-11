@@ -69,10 +69,7 @@ const cardConfigs = {
             const isServerless = data.type === 'serverless';
 
             if (isServerless) {
-                const endpoint = data.endpoint_id || "Endpoint not configured";
-                const jobsPerRun = data.jobs_per_run ?? 1;
-                const concurrency = data.concurrency ?? 1;
-                return `<span class="dist-worker-info__title">${escapeWorkerInfo(data.name)}</span><br><span class="dist-worker-info__meta">Runpod Serverless • ${escapeWorkerInfo(endpoint)} • ${escapeWorkerInfo(jobsPerRun)} jobs/run • ${escapeWorkerInfo(concurrency)} slots</span>`;
+                return `<span class="dist-worker-info__title">${escapeWorkerInfo(data.name)}</span><br><span class="dist-worker-info__meta">Runpod Serverless</span>`;
             }
 
             if (isCloud) {
@@ -576,6 +573,8 @@ export class DistributedUI {
 
     createControlsSection(config, data, extension, isRemote) {
         if (!config) return null;
+        // Serverless has no direct-worker actions; its provider is already in the header.
+        if (config.dynamic && data?.type === "serverless") return null;
         
         const controlsDiv = document.createElement("div");
         controlsDiv.id = `controls-${data?.id || 'master'}`;
@@ -607,24 +606,18 @@ export class DistributedUI {
             controlsWrapper.appendChild(badge);
         } else if (config.dynamic && data) {
             if (isRemote) {
-                if (data.type === "serverless") {
-                    const workerTypeBadge = this.createInfoBox("Runpod Serverless worker");
-                    workerTypeBadge.title = "Provider-managed workers scale on demand";
-                    controlsWrapper.appendChild(workerTypeBadge);
-                } else {
-                    const isCloud = data.type === 'cloud';
-                    const workerTypeText = isCloud ? "Cloud worker" : "Remote worker";
-                    const workerTypeBadge = this.createInfoBox(workerTypeText);
-                    workerTypeBadge.title = "Worker is externally hosted";
-                    controlsWrapper.appendChild(workerTypeBadge);
+                const isCloud = data.type === 'cloud';
+                const workerTypeText = isCloud ? "Cloud worker" : "Remote worker";
+                const workerTypeBadge = this.createInfoBox(workerTypeText);
+                workerTypeBadge.title = "Worker is externally hosted";
+                controlsWrapper.appendChild(workerTypeBadge);
 
-                    const logBtn = this.createButton('View Log', () => viewWorkerLog(extension, data.id, true));
-                    logBtn.id = `log-${data.id}`;
-                    logBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl;
-                    logBtn.classList.add("btn--log");
-                    logBtn.title = "View remote worker log";
-                    controlsWrapper.appendChild(logBtn);
-                }
+                const logBtn = this.createButton('View Log', () => viewWorkerLog(extension, data.id, true));
+                logBtn.id = `log-${data.id}`;
+                logBtn.style.cssText = BUTTON_STYLES.base + BUTTON_STYLES.workerControl;
+                logBtn.classList.add("btn--log");
+                logBtn.title = "View remote worker log";
+                controlsWrapper.appendChild(logBtn);
             } else {
                 const controls = this.createWorkerControls(data.id, {
                     launch: () => launchWorker(extension, data.id),
