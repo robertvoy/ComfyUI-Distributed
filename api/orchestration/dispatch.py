@@ -77,27 +77,44 @@ async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
     ws_url = worker_url.replace("http://", "ws://").replace("https://", "wss://")
     ws_url = f"{ws_url}/distributed/worker_ws"
     session = await get_client_session()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    ws = None
 
-    async with session.ws_connect(ws_url, heartbeat=20, timeout=timeout) as ws:
-        await ws.send_json(ws_payload)
-        async for msg in ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(msg.data or "{}")
-                if data.get("type") == "dispatch_ack" and data.get("request_id") == request_id:
-                    if data.get("ok"):
-                        return data.get("prompt_id")
-                    error_text = data.get("error") or "Worker rejected websocket dispatch."
-                    validation_error = data.get("validation_error")
-                    node_errors = data.get("node_errors")
-                    if validation_error:
-                        error_text = f"{error_text} | validation_error={validation_error}"
-                    if node_errors:
-                        error_text = f"{error_text} | node_errors={node_errors}"
-                    raise RuntimeError(error_text)
-            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                raise RuntimeError(f"Worker websocket closed unexpectedly: {msg.type}")
-
-    raise RuntimeError("Worker websocket closed before dispatch_ack was received.")
+    try:
+        async with asyncio.timeout_at(deadline):
+            ws = await session.ws_connect(ws_url, heartbeat=20)
+            await ws.send_json(ws_payload)
+            while True:
+                msg = await ws.receive()
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data or "{}")
+                    if data.get("type") == "dispatch_ack" and data.get("request_id") == request_id:
+                        if data.get("ok"):
+                            return data.get("prompt_id")
+                        error_text = data.get("error") or "Worker rejected websocket dispatch."
+                        validation_error = data.get("validation_error")
+                        node_errors = data.get("node_errors")
+                        if validation_error:
+                            error_text = f"{error_text} | validation_error={validation_error}"
+                        if node_errors:
+                            error_text = f"{error_text} | node_errors={node_errors}"
+                        raise RuntimeError(error_text)
+                elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                    raise RuntimeError(f"Worker websocket closed before acknowledgement: {msg.type}; submission status is ambiguous")
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            "Worker websocket dispatch timed out before dispatch_ack; submission status is ambiguous."
+        ) from exc
+    finally:
+        if ws is not None:
+            # Closing must not discard an already acknowledged prompt ID or
+            # replace a definite rejection with an ambiguous timeout.
+            try:
+                async with asyncio.timeout_at(min(deadline, loop.time() + 1.0)):
+                    await ws.close()
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                pass
 
 
 async def dispatch_worker_prompt(
