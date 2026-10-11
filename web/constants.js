@@ -104,7 +104,8 @@ export const PULSE_ANIMATION_CSS = `
         transition: max-height 0.3s ease, opacity 0.3s ease, padding 0.3s ease, margin 0.3s ease;
     }
     .worker-settings.expanded {
-        max-height: 500px;
+        /* Let long forms and wrapped labels fit; the sidebar owns scrolling. */
+        max-height: none;
         opacity: 1;
         padding: 12px;
         margin-top: 8px;

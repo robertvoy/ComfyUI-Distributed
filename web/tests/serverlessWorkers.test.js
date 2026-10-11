@@ -130,7 +130,7 @@ describe("Runpod serverless worker panel", () => {
         for (const id of ["endpoint-id-group-w1", "api-key-group-w1", "clear-api-key-group-w1", "jobs-per-run-group-w1", "concurrency-group-w1", "timeout-seconds-group-w1", "serverless-test-group-w1"]) {
             expect(elements.get(id).style.display).toBe("flex");
         }
-        expect(elements.get("serverless-help-w1").textContent).toContain("image Collectors only");
+        expect(elements.has("serverless-help-w1")).toBe(false);
         expect(elements.get("api-key-w1").type).toBe("password");
         expect(elements.get("api-key-w1").value).toBe("");
         expect(elements.get("api-key-w1").placeholder).toMatch(/leave blank/i);

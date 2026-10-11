@@ -67,7 +67,6 @@ export function createWorkerSettingsForm(ui, extension, worker) {
                 `concurrency-group-${worker.id}`,
                 `timeout-seconds-group-${worker.id}`,
                 `serverless-test-group-${worker.id}`,
-                `serverless-help-${worker.id}`,
             ].map((id) => document.getElementById(id));
 
             if (!hostGroup || !portGroup || !cudaGroup || !argsGroup || !runpodTextElem || !hostInput || !portInput || serverlessGroups.some((group) => !group)) {
@@ -140,12 +139,6 @@ export function createWorkerSettingsForm(ui, extension, worker) {
     argsGroup.group.id = `args-group-${worker.id}`;
     argsGroup.group.style.display = (isRemoteWorker(extension, worker) || worker.type === "cloud") ? "none" : "flex";
     form.appendChild(argsGroup.group);
-
-    const serverlessHelp = document.createElement("small");
-    serverlessHelp.id = `serverless-help-${worker.id}`;
-    serverlessHelp.style.display = "none";
-    serverlessHelp.textContent = "Preview: image Collectors only. The endpoint must provide the generic workflow + images handler and required models/nodes. Enabling it permits paid Runpod jobs.";
-    form.appendChild(serverlessHelp);
 
     const endpointGroup = ui.createFormGroup("Endpoint ID:", worker.endpoint_id || "", `endpoint-id-${worker.id}`, "text", "Runpod endpoint ID");
     endpointGroup.group.id = `endpoint-id-group-${worker.id}`;
