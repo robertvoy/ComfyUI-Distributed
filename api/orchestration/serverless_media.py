@@ -20,7 +20,7 @@ from PIL import Image, UnidentifiedImageError
 
 
 MAX_INPUT_IMAGE_BYTES = 25 * 1024 * 1024
-MAX_INPUT_TOTAL_BYTES = 7 * 1024 * 1024
+MAX_INPUT_TOTAL_BYTES = 10_000_000
 MAX_OUTPUT_FILES = 1024
 MAX_OUTPUT_IMAGE_BYTES = 128 * 1024 * 1024
 MAX_OUTPUT_TOTAL_BYTES = 256 * 1024 * 1024
@@ -183,13 +183,23 @@ def _read_limited(path, expected_size):
             info = os.fstat(handle.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_INPUT_IMAGE_BYTES:
                 raise ServerlessMediaError("Image input exceeds the permitted size")
-            data = handle.read(MAX_INPUT_IMAGE_BYTES + 1)
+            if info.st_size > MAX_INPUT_TOTAL_BYTES:
+                raise ServerlessMediaError(
+                    f"Total raw serverless image input size exceeds {MAX_INPUT_TOTAL_BYTES:,} bytes; "
+                    "base64 encoding adds about 33%, and the complete request body is also limited to 10,000,000 bytes"
+                )
+            data = handle.read(MAX_INPUT_TOTAL_BYTES + 1)
     except ServerlessMediaError:
         raise
     except OSError:
         raise ServerlessMediaError("Image input file could not be read safely") from None
-    if len(data) > MAX_INPUT_IMAGE_BYTES or len(data) != expected_size:
-        raise ServerlessMediaError("Image input exceeds the permitted size or changed while being read")
+    if len(data) > MAX_INPUT_TOTAL_BYTES:
+        raise ServerlessMediaError(
+            f"Total raw serverless image input size exceeds {MAX_INPUT_TOTAL_BYTES:,} bytes; "
+            "base64 encoding adds about 33%, and the complete request body is also limited to 10,000,000 bytes"
+        )
+    if len(data) != expected_size:
+        raise ServerlessMediaError("Image input changed while being read")
     return data
 
 
@@ -229,7 +239,11 @@ async def prepare_images(workflow: dict) -> list[dict]:
                 raise ServerlessMediaError("Image input exceeds the permitted size")
             total_source_bytes += size
             if total_source_bytes > MAX_INPUT_TOTAL_BYTES:
-                raise ServerlessMediaError("Total serverless image inputs exceed the permitted size")
+                raise ServerlessMediaError(
+                    f"Total raw serverless image input size is {total_source_bytes:,} bytes; "
+                    f"the input read guard is {MAX_INPUT_TOTAL_BYTES:,} bytes. Base64 encoding "
+                    "adds about 33%, and the complete request body is also limited to 10,000,000 bytes"
+                )
             unique_paths[path] = {"size": size, "suffix": suffix}
         resolved_refs.append((inputs, key, path))
 

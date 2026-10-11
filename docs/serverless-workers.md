@@ -109,8 +109,11 @@ with completion; `CANCEL_REQUESTED` is not a provider-confirmed cancellation.
 - Downstream post-collector processing remains local; the remote graph contains
   only the upstream compute required for image saves.
 - Inputs must be supported images under ComfyUI's input/output/temp roots.
-- Image input bytes are bounded to 7 MiB total; the complete request is bounded
-  to 10 MiB. Large-media/object-storage upload support is not included.
+- Raw image input reads are guarded at 10,000,000 bytes total, and the complete
+  serialized `/run` JSON request body (workflow, base64 images, and policy) must
+  also fit within 10,000,000 bytes. Base64 adds about 33%, so the usable raw-image
+  budget is lower and depends on workflow size. Large-media/object-storage upload
+  support is not included.
 - No remote GPU discovery, endpoint provisioning, model synchronization, automatic
   scaling changes, or inbound master callback/tunnel is needed.
 

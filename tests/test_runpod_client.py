@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -13,6 +14,31 @@ def load_module():
     return module
 
 client = load_module()
+
+
+def workflow_for_request_size(target_size, timeout_seconds):
+    """Build an ASCII workflow whose compact UTF-8 request body has exact size."""
+    workflow = {"1": {"class_type": "Text", "inputs": {"value": ""}}}
+
+    def body_size(candidate):
+        payload = {
+            "input": {"workflow": candidate, "images": []},
+            "policy": {
+                "executionTimeout": timeout_seconds * 1000,
+                "ttl": timeout_seconds * 1000,
+            },
+        }
+        return len(json.dumps(
+            payload, allow_nan=False, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8"))
+
+    padding = target_size - body_size(workflow)
+    if padding < 0:
+        raise AssertionError("target is smaller than the request fixture")
+    workflow["1"]["inputs"]["value"] = "x" * padding
+    if body_size(workflow) != target_size:
+        raise AssertionError("request fixture did not reach the exact target size")
+    return workflow
 
 class Response:
     def __init__(self, status=200, payload=None):
@@ -42,8 +68,10 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "job-1")
         method, url, kwargs = session.calls[0]
         self.assertEqual((method, url), ("POST", "https://api.runpod.ai/v2/endpoint123/run"))
-        self.assertEqual(set(kwargs["json"]["input"]), {"workflow", "images"})
-        self.assertEqual(kwargs["json"]["policy"]["ttl"], 1800000)
+        self.assertIsInstance(kwargs["data"], bytes)
+        sent_payload = json.loads(kwargs["data"])
+        self.assertEqual(set(sent_payload["input"]), {"workflow", "images"})
+        self.assertEqual(sent_payload["policy"]["ttl"], 1800000)
         self.assertFalse(kwargs["allow_redirects"])
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer secret-value")
 
@@ -96,3 +124,44 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await api.submit({}, [{"image": "x" * client.MAX_REQUEST_BYTES}], 30)
         self.assertFalse(session.calls)
+
+    async def test_exact_10mb_serialized_request_is_sent_as_validated_bytes(self):
+        session = Session([Response(payload={"id": "boundary-job"})])
+        api = client.RunpodClient(session, "endpoint123", "key")
+        timeout_seconds = 37
+        workflow = workflow_for_request_size(10_000_000, timeout_seconds)
+
+        result = await api.submit(workflow, [], timeout_seconds)
+
+        self.assertEqual(result, "boundary-job")
+        sent = session.calls[0][2]["data"]
+        self.assertIsInstance(sent, bytes)
+        self.assertEqual(len(sent), 10_000_000)
+        self.assertEqual(json.loads(sent)["policy"]["executionTimeout"], 37_000)
+
+    async def test_one_byte_over_10mb_is_rejected_without_request_or_payload_leak(self):
+        session = Session([Response(payload={"id": "must-not-be-used"})])
+        api = client.RunpodClient(session, "endpoint123", "key")
+        workflow = workflow_for_request_size(10_000_001, 37)
+        workflow["1"]["inputs"]["value"] = "private graph value" + workflow["1"]["inputs"]["value"][19:]
+
+        with self.assertRaisesRegex(ValueError, "10,000,001") as ctx:
+            await api.submit(workflow, [], 37)
+
+        self.assertNotIn("private graph value", str(ctx.exception))
+        self.assertFalse(session.calls)
+
+    async def test_wire_size_counts_utf8_graph_bytes_and_policy_fields(self):
+        session = Session([Response(payload={"id": "unicode-job"})])
+        api = client.RunpodClient(session, "endpoint123", "key")
+        workflow = {"1": {"class_type": "Text", "inputs": {"value": "café雪"}}}
+
+        await api.submit(workflow, [], 41)
+
+        sent = session.calls[0][2]["data"]
+        expected = json.dumps({
+            "input": {"workflow": workflow, "images": []},
+            "policy": {"executionTimeout": 41_000, "ttl": 41_000},
+        }, allow_nan=False, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.assertEqual(sent, expected)
+        self.assertGreater(len(sent), len(sent.decode("utf-8")))

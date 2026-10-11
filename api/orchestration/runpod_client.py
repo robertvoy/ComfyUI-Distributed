@@ -6,7 +6,7 @@ import re
 import aiohttp
 
 API_BASE = "https://api.runpod.ai/v2"
-MAX_REQUEST_BYTES = 10 * 1024 * 1024
+MAX_REQUEST_BYTES = 10_000_000
 _ID = re.compile(r"[A-Za-z0-9_-]{1,200}\Z")
 
 
@@ -16,6 +16,31 @@ class RunpodError(RuntimeError):
 
 class AmbiguousSubmission(RunpodError):
     """Submission may have been accepted: never retry it automatically."""
+
+
+def serialize_request(workflow, images, timeout_seconds):
+    """Serialize and size-check the exact JSON body used by Runpod ``/run``."""
+    payload = {
+        "input": {"workflow": workflow, "images": images},
+        "policy": {
+            "executionTimeout": timeout_seconds * 1000,
+            "ttl": timeout_seconds * 1000,
+        },
+    }
+    body = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    size = len(body)
+    if size > MAX_REQUEST_BYTES:
+        raise ValueError(
+            f"Serialized serverless request body is {size:,} bytes; Runpod allows at most "
+            f"{MAX_REQUEST_BYTES:,} bytes. Base64-encoded images add about 33% over raw "
+            "image bytes; reduce image or workflow size."
+        )
+    return body
 
 
 def checked_id(value):
@@ -32,19 +57,25 @@ class RunpodClient:
             raise ValueError("A valid Runpod API key is required")
         self._api_key = api_key
 
-    async def _request(self, method, path, payload=None):
+    async def _request(self, method, path, payload=None, request_body=None):
         # Base origin is code-owned, never a user-supplied URL. Do not follow redirects
         # with credentials, or include response bodies/transport errors in exceptions.
         url = f"{API_BASE}/{self.endpoint_id}/{path}"
         attempts = 3 if method == "GET" else 1
         for attempt in range(attempts):
             try:
+                request_kwargs = {
+                    "headers": {"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+                    "timeout": aiohttp.ClientTimeout(total=30),
+                    "allow_redirects": False,
+                }
+                if request_body is None:
+                    request_kwargs["json"] = payload
+                else:
+                    request_kwargs["data"] = request_body
                 async with self.session.request(
                     method, url,
-                    headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=30),
-                    allow_redirects=False,
+                    **request_kwargs,
                 ) as response:
                     status = response.status
                     if status != 200:
@@ -78,13 +109,8 @@ class RunpodClient:
         return await self._request("GET", "health")
 
     async def submit(self, workflow, images, timeout_seconds):
-        payload = {
-            "input": {"workflow": workflow, "images": images},
-            "policy": {"executionTimeout": timeout_seconds * 1000, "ttl": timeout_seconds * 1000},
-        }
-        if len(json.dumps(payload, allow_nan=False).encode("utf-8")) > MAX_REQUEST_BYTES:
-            raise ValueError("Serverless request exceeds the 10 MiB safety limit; reduce input media size")
-        result = await self._request("POST", "run", payload)
+        body = serialize_request(workflow, images, timeout_seconds)
+        result = await self._request("POST", "run", request_body=body)
         try:
             return checked_id(result.get("id"))
         except ValueError:

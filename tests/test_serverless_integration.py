@@ -164,3 +164,20 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "invalid local graph"):
             await self.q.orchestrate_distributed_execution(self.prompt, None, "client")
         self.manager.start.assert_not_awaited()
+
+    async def test_oversized_serverless_request_fails_before_dispatch_or_master_queue(self):
+        media_module = sys.modules[PKG + ".api.orchestration.serverless_media"]
+        media_module.prepare_images.return_value = [{
+            "name": "private-image-name.png",
+            "image": "x" * 10_000_001,
+        }]
+
+        with self.assertRaisesRegex(ValueError, "10,000,") as ctx:
+            await self.q.orchestrate_distributed_execution(self.prompt, None, "client")
+
+        self.assertNotIn("private-image-name.png", str(ctx.exception))
+        self.assertNotIn("x" * 100, str(ctx.exception))
+        self.q.dispatch_worker_prompt.assert_not_awaited()
+        self.q.queue_prompt_payload.assert_not_awaited()
+        self.manager.start.assert_not_awaited()
+        self.assertEqual(self.ps.distributed_pending_jobs, {})

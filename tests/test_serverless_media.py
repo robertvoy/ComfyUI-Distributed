@@ -26,6 +26,20 @@ def load_module():
 media = load_module()
 
 
+def load_runpod_module():
+    spec = importlib.util.spec_from_file_location(
+        "dist_serverless_media_runpod_test", ROOT / "api" / "orchestration" / "runpod_client.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+runpod = load_runpod_module()
+
+
 def png_bytes(mode="RGB", size=(2, 1), color=None):
     if color is None:
         color = (10, 20, 30, 40) if mode == "RGBA" else (10, 20, 30)
@@ -199,6 +213,20 @@ class ServerlessMediaInputTests(unittest.IsolatedAsyncioTestCase):
         }
         with self.assertRaisesRegex(media.ServerlessMediaError, "size"):
             await media.prepare_images(workflow)
+
+
+    async def test_accepts_raw_image_over_old_7mib_when_complete_request_fits_10mb(self):
+        raw_size = 7 * 1024 * 1024 + 1
+        source = self.paths.input / "large-input.png"
+        source.write_bytes(b"x" * raw_size)
+        workflow = {"1": {"class_type": "LoadImage", "inputs": {"image": "large-input.png"}}}
+
+        packed = await media.prepare_images(workflow)
+        request_body = runpod.serialize_request(workflow, packed, 30)
+
+        self.assertGreater(raw_size, 7 * 1024 * 1024)
+        self.assertEqual(len(base64.b64decode(packed[0]["image"])), raw_size)
+        self.assertLessEqual(len(request_body), 10_000_000)
 
 
 class ServerlessMediaOutputTests(unittest.IsolatedAsyncioTestCase):

@@ -165,12 +165,16 @@ async def _prepare_worker_payload(
         if worker.get("type") == "serverless":
             from .orchestration.serverless_prompt import compile_serverless_prompt
             from .orchestration.serverless_media import prepare_images
+            from .orchestration.runpod_client import serialize_request
             worker_prompt = apply_participant_overrides(
                 prune_prompt_for_worker(worker_prompt), worker["id"], enabled_ids,
                 job_id_map, "", delegate_master, prompt_index,
             )
             workflow, manifest = compile_serverless_prompt(worker_prompt)
             images = await prepare_images(workflow)
+            # Fail during preparation, before regular workers or the master are
+            # dispatched. submit() uses this same serializer for the sent bytes.
+            serialize_request(workflow, images, worker["timeout_seconds"])
             return worker, {"worker": worker, "workflow": workflow, "manifest": manifest, "images": images}
 
         worker_master_url = build_master_callback_url(
