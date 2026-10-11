@@ -172,7 +172,11 @@ class SchedulingBoundaryTests(unittest.IsolatedAsyncioTestCase):
         })
         for node_id in ['3', '6', '9']:
             prompt[node_id]['inputs']['model'] = ['11', 0]
-        regions = runtime.validate_image_list_regions(prompt)
+        # Shared dependencies are verified against the registered output schema.
+        loader = type('GenericModelLoader', (), {'RETURN_TYPES': ('MODEL',)})
+        registry = types.SimpleNamespace(NODE_CLASS_MAPPINGS={'GenericModelLoader': loader})
+        with patch.dict(sys.modules, {'nodes': registry}):
+            regions = runtime.validate_image_list_regions(prompt)
         self.assertEqual(len(regions), 3)
         for region in regions:
             self.assertIn('11', region['node_ids'])

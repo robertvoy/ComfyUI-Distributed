@@ -395,6 +395,41 @@ def _downstream_until(prompt: dict[str, Any], start_id: str, end_id: str) -> set
     return visited
 
 
+def _start_ancestors(prompt: dict[str, Any], start_id: str) -> set[str]:
+    """All dependencies materialized on the master, without crossing Start again."""
+    ancestors = set()
+    pending = [source for _, source, _ in _prompt_links(prompt[start_id], prompt)]
+    while pending:
+        node_id = pending.pop()
+        if node_id == start_id or node_id in ancestors:
+            continue
+        ancestors.add(node_id)
+        pending.extend(source for _, source, _ in _prompt_links(prompt[node_id], prompt))
+    return ancestors
+
+
+def _safe_shared_dependency(node: dict[str, Any], prompt: dict[str, Any], registry) -> bool:
+    """Only typed model dependencies or scalar constants may straddle Start.
+
+    A leaf alone is not sufficient: LoadImage/EmptyImage are leaves too. Unknown
+    classes and list-producing nodes fail closed. All shared ancestors are checked,
+    so a model-producing node cannot hide a shared image/latent dependency.
+    """
+    node_class = registry.get(node.get("class_type"))
+    if node_class is None:
+        return False
+    info = node_class.GET_NODE_INFO_V1() if hasattr(node_class, "GET_NODE_INFO_V1") else {}
+    outputs = info.get("output", getattr(node_class, "RETURN_TYPES", ()))
+    if not outputs or any(info.get("output_is_list", getattr(node_class, "OUTPUT_IS_LIST", ()))):
+        return False
+    types = {str(output) for output in outputs}
+    model_types = {"MODEL", "CLIP", "VAE", "CLIP_VISION", "CONTROL_NET"}
+    scalar_types = {"INT", "FLOAT", "STRING", "BOOLEAN"}
+    if types <= model_types:
+        return True
+    return types <= scalar_types and not any(_prompt_links(node, prompt))
+
+
 def validate_image_list_regions(prompt: dict[str, Any]) -> list[dict[str, Any]]:
     """Validate pairing, non-nesting, and closed per-image graph boundaries."""
     if not isinstance(prompt, dict):
@@ -431,6 +466,18 @@ def validate_image_list_regions(prompt: dict[str, Any]) -> list[dict[str, Any]]:
         # evaluate the processing branch on the master as well as the worker.
         import sys
         registry = getattr(sys.modules.get("nodes"), "NODE_CLASS_MAPPINGS", {})
+        shared = region_nodes & _start_ancestors(prompt, start_id)
+        unsafe = {node_id for node_id in shared
+                  if not _safe_shared_dependency(prompt[node_id], prompt, registry)}
+        if unsafe:
+            links = [f"{node_id}.{name} <- {source}:{slot}"
+                     for node_id in sorted(region_nodes - {start_id})
+                     for name, source, slot in _prompt_links(prompt[node_id], prompt)
+                     if source in unsafe]
+            raise ValueError(
+                f"Image-list region {start_id}->{end_id} bypasses Start through upstream nodes "
+                f"{sorted(unsafe)} ({'; '.join(links)}); route per-item data through Start"
+            )
         for node_id in region_nodes - {start_id, end_id}:
             node_class = registry.get(prompt[node_id].get("class_type"))
             if node_class is None:

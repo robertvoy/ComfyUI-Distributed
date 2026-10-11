@@ -151,6 +151,49 @@ class ImageListGraphBoundaryTests(unittest.TestCase):
         self.assertEqual(worker["4"]["inputs"]["model"], ["1", 0])
         self.assertNotIn("6", worker)
 
+    def test_rejects_upstream_processing_and_leaf_image_bypasses(self):
+        # Both a leaf source and a generated batch must cross Start exactly once.
+        for generated in (False, True):
+            with self.subTest(generated=generated):
+                prompt = graph_one_region()
+                if generated:
+                    prompt["2"] = {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0]}}
+                    prompt["7"] = {"class_type": "KSampler", "inputs": {"model": ["1", 0]}}
+                prompt["4"]["inputs"]["reference"] = ["2", 0]
+                with self.assertRaisesRegex(ValueError, "bypasses Start.*2"):
+                    validate_image_list_regions(prompt)
+
+    def test_shared_typed_loader_and_leaf_constant_remain_valid(self):
+        import sys
+        import types
+        from unittest.mock import patch
+        prompt = graph_one_region()
+        prompt["7"] = {"class_type": "SeedConstant", "inputs": {"value": 9}}
+        prompt["2"]["inputs"].update({"model": ["1", 0], "seed": ["7", 0]})
+        prompt["4"]["inputs"]["shared_seed"] = ["7", 0]
+        registry = {
+            "CheckpointLoaderSimple": type("Loader", (), {"RETURN_TYPES": ("MODEL", "CLIP", "VAE")}),
+            "SeedConstant": type("Constant", (), {"RETURN_TYPES": ("INT",)}),
+        }
+        with patch.dict(sys.modules, {"nodes": types.SimpleNamespace(NODE_CLASS_MAPPINGS=registry)}):
+            region = validate_image_list_regions(prompt)[0]
+        worker = build_worker_prompt(prompt, region, "token", "ctx", 0, "http://master")
+        self.assertNotIn("2", worker)
+        self.assertTrue({"1", "7"}.issubset(worker))
+
+    def test_unknown_or_list_producing_shared_dependency_is_not_exempt(self):
+        import sys
+        import types
+        from unittest.mock import patch
+        for node_class in (None, type("ListLoader", (), {
+                "RETURN_TYPES": ("MODEL",), "OUTPUT_IS_LIST": (True,)})):
+            prompt = graph_one_region()
+            prompt["2"]["inputs"]["model"] = ["1", 0]
+            registry = {} if node_class is None else {"CheckpointLoaderSimple": node_class}
+            with patch.dict(sys.modules, {"nodes": types.SimpleNamespace(NODE_CLASS_MAPPINGS=registry)}):
+                with self.assertRaisesRegex(ValueError, "bypasses Start.*1"):
+                    validate_image_list_regions(prompt)
+
     def test_two_sequential_regions_are_valid_and_isolated(self):
         regions = validate_image_list_regions(graph_two_sequential_regions())
         self.assertEqual([(r["start_id"], r["end_id"]) for r in regions], [("2", "4"), ("5", "7")])
