@@ -34,3 +34,4 @@ def test_image_list_network_runtime():
     assert result.returncode == 0, result.stdout + '\n' + result.stderr
     assert 'IMAGE_LIST_NETWORK_OK' in result.stdout
     assert 'IMAGE_LIST_CANCEL_OK' in result.stdout
+    assert 'IMAGE_LIST_MASTER_OK' in result.stdout

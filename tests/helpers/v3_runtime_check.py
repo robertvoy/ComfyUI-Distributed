@@ -215,7 +215,7 @@ async def check_image_list_lazy_executor(mapping, module, prompt_server, asset_m
     original_contexts = set(runtime._MASTER_JOBS)
     image_list_nodes = sys.modules[module.__name__ + '.nodes.image_list']
     workflow_meta = {'nodes': [{'id': 2, 'type': 'DistributedImageListStart'}], 'extra': {'acceptance': True}}
-    async def fake_worker_results(_context_id):
+    async def fake_worker_results(_context_id, *, model_callback=None):
         state = runtime.get_master_job(_context_id)
         assert state.prompt_id == 'image-list-lazy', state.prompt_id
         assert state.workflow_meta == workflow_meta, state.workflow_meta

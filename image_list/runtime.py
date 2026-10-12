@@ -59,6 +59,9 @@ class ImageListJob:
     failed: str | None = None
     prompt_id: str | None = None
     active: bool = False
+    master_participates: bool = False
+    event_loop: asyncio.AbstractEventLoop | None = None
+    local_model_callback: Any = None
 
 
 def _torch():
@@ -329,15 +332,17 @@ def delete_worker_item(token: str) -> bool:
 def create_master_job(start_id: str, end_id: str, prompt: dict[str, Any], items: list[dict[str, Any]],
                       worker_ids: list[str], master_callback_url: str,
                       workflow_meta: dict[str, Any] | None = None,
-                      prompt_id: str | None = None) -> str:
+                      prompt_id: str | None = None, *, master_participates: bool = False) -> str:
     if not isinstance(prompt, dict):
         raise ValueError("Image List Start requires the original ComfyUI prompt for region extraction")
-    if not worker_ids:
+    if not isinstance(master_participates, bool):
+        raise ValueError("master_participates must be a boolean")
+    if not worker_ids and not master_participates:
         raise RuntimeError("Distributed Image List requires at least one preflighted direct worker; master fallback is disabled")
     context_id = secrets.token_urlsafe(36)
     state = ImageListJob(context_id, str(start_id), str(end_id), prompt, items,
                          [str(worker_id) for worker_id in worker_ids], master_callback_url,
-                         workflow_meta, prompt_id=prompt_id)
+                         workflow_meta, prompt_id=prompt_id, master_participates=master_participates)
     with _LOCK:
         _MASTER_JOBS[context_id] = state
     return context_id
@@ -542,7 +547,7 @@ def create_worker_task_token() -> str:
     return secrets.token_urlsafe(36)
 
 
-async def dynamic_schedule(item_count: int, workers: list[str], dispatch, wait_next,
+async def dynamic_schedule(item_count: int, workers: list[Any], dispatch, wait_next,
                            cleanup, interrupted=None):
     """One in-flight job per worker; completed workers immediately take next item."""
     if item_count <= 0:
@@ -550,7 +555,7 @@ async def dynamic_schedule(item_count: int, workers: list[str], dispatch, wait_n
     if not workers:
         raise RuntimeError("No free, reachable, feature-compatible direct workers are available")
     pending_index = 0
-    inflight: dict[str, Any] = {}
+    inflight: dict[Any, Any] = {}
     results: dict[int, Any] = {}
 
     def check_interrupted():
@@ -645,7 +650,10 @@ def set_master_result(context_id: str, item_index: int, token: str, result: dict
         state.results[item_index] = result
         event = state.event
     if event is not None:
-        event.set()
+        if state.event_loop is not None:
+            state.event_loop.call_soon_threadsafe(event.set)
+        else:
+            event.set()
 
 
 def register_assignment(context_id: str, item_index: int, worker_id: str, token: str) -> None:
@@ -718,13 +726,14 @@ def _collect_output_lists(results: list[dict[str, Any]]) -> tuple[list[Any], lis
     return images, masks, texts
 
 
-async def run_image_list_job(context_id: str) -> tuple[list[Any], list[Any], list[Any]]:
-    """Resolve compatible idle direct workers and schedule one image at a time."""
+async def run_image_list_job(context_id: str, *, model_callback=None) -> tuple[list[Any], list[Any], list[Any]]:
+    """Schedule a shared queue across the optional master and direct workers."""
     state = get_master_job(context_id)
     if state is None:
         raise RuntimeError("Distributed Image List context is missing or expired")
     with _LOCK:
         state.active = True
+        state.local_model_callback = model_callback
     try:
         from ..utils.config import get_image_list_job_timeout_seconds
         deadline = get_image_list_job_timeout_seconds()
@@ -736,6 +745,10 @@ async def run_image_list_job(context_id: str) -> tuple[list[Any], list[Any], lis
             if timer.expired():
                 raise TimeoutError(f"Image-list total deadline exceeded ({deadline:g}s); cleanup attempted") from None
             raise
+    except asyncio.CancelledError as exc:
+        # The synchronous End bridge catches Exception, not BaseException.
+        # Cleanup (including the local thread join) has finished at this point.
+        raise ImageListCancelledError("Image-list job cancelled") from exc
     finally:
         remove_master_job(context_id)
 
@@ -743,6 +756,7 @@ async def run_image_list_job(context_id: str) -> tuple[list[Any], list[Any], lis
 async def _run_image_list_job(state: ImageListJob):
     context_id = state.context_id
     state.event = asyncio.Event()
+    state.event_loop = asyncio.get_running_loop()
     from ..api.orchestration.dispatch import (
         preflight_image_list_workers, dispatch_worker_prompt,
     )
@@ -754,14 +768,14 @@ async def _run_image_list_job(state: ImageListJob):
 
     config = load_config()
     workers = _resolve_direct_workers_for_image_list(config, state.worker_ids)
-    if not workers:
+    if not workers and not state.master_participates:
         raise RuntimeError("Distributed Image List requires enabled direct workers; serverless pools are unsupported")
     # Recheck worker capability and idle state immediately before the first item.
-    worker_statuses = await preflight_image_list_workers(workers, require_idle=True)
+    worker_statuses = await preflight_image_list_workers(workers, require_idle=not state.master_participates) if workers else {}
     workers = [worker for worker in workers if worker["id"] in worker_statuses]
-    if not workers:
+    if not workers and not state.master_participates:
         raise RuntimeError("No free, reachable, feature-compatible direct workers are available; master execution is disabled")
-    session = await get_client_session()
+    session = await get_client_session() if workers else None
     regions = validate_image_list_regions(state.original_prompt)
     region = next((entry for entry in regions if entry["start_id"] == state.start_id and entry["end_id"] == state.end_id), None)
     if region is None:
@@ -770,11 +784,35 @@ async def _run_image_list_job(state: ImageListJob):
     use_websocket = bool((config.get("settings", {}) or {}).get("websocket_orchestration", False))
     prepared_worker_prompts: dict[str, dict[str, Any]] = {}
     owned_uploads: dict[str, dict[str, Any]] = {}
+    # An opaque key cannot collide with any configured direct worker ID, even
+    # a worker named "master" or a separate local worker process.
+    master_slot = object()
+    local_executor = None
+    local_tokens: set[str] = set()
+    if state.master_participates:
+        from .local_executor import LocalExecutionSlot
+        local_executor = LocalExecutionSlot(model_callback=state.local_model_callback)
 
-    async def dispatch(worker_id: str, index: int) -> dict[str, Any]:
+    async def dispatch(worker_id: Any, index: int) -> dict[str, Any]:
+        if worker_id is master_slot:
+            assert local_executor is not None
+            token = create_worker_task_token()
+            register_assignment(context_id, index, "in-process-master", token)
+            local_tokens.add(token)
+            # Already normalized tensors stay in memory; no HTTP, serialization,
+            # /prompt queue, or repeated execution of the original source.
+            with _LOCK:
+                _WORKER_ITEMS[token] = (time.monotonic() + _WORKER_ITEM_TTL_SECONDS, state.items[index])
+            prompt = build_worker_prompt(state.original_prompt, region, token, context_id, index, "")
+            prompt[state.start_id]["inputs"]["image_list_local_execution"] = True
+            prompt[state.end_id]["inputs"]["image_list_local_execution"] = True
+            future = local_executor.submit(prompt, f"{context_id}:{index}", state.end_id, state.workflow_meta)
+            future.add_done_callback(lambda _: state.event_loop.call_soon_threadsafe(state.event.set))
+            return {"index": index, "token": token, "future": future}
         worker = next((entry for entry in workers if entry["id"] == worker_id), None)
         if worker is None:
             raise RuntimeError(f"Worker {worker_id} was removed before dispatch")
+        assert session is not None
         token = create_worker_task_token()
         register_assignment(context_id, index, worker_id, token)
         item_payload = {"context_id": context_id, "item": encode_item(state.items[index])}
@@ -814,12 +852,26 @@ async def _run_image_list_job(state: ImageListJob):
         handle.update(prompt_id=prompt_id, last_seen=time.monotonic(), submission_pending=False)
         return handle
 
-    async def wait_next(inflight: dict[str, Any]):
+    async def wait_next(inflight: dict[Any, Any]):
         while True:
+            state.event.clear()
             if state.failed:
                 raise RuntimeError(state.failed)
+            local = inflight.get(master_slot)
+            if local is not None and local["future"].done():
+                # A posted result does not release this slot until execution has
+                # actually finished, including restoration of parent state.
+                local["future"].result()
+                with _LOCK:
+                    result = state.results.pop(local["index"], None)
+                if result is None:
+                    raise RuntimeError(f"Master completed item {local['index']} without posting a result")
+                delete_worker_item(local["token"])
+                local_tokens.discard(local["token"])
+                return master_slot, local["index"], result
             # Treat worker-side execution errors as failures even when End never posts a result.
             async def history_status(worker_id, handle):
+                assert session is not None
                 url = build_worker_url(handle["worker"], f"/history/{handle['prompt_id']}")
                 try:
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=3)) as response:
@@ -853,7 +905,8 @@ async def _run_image_list_job(state: ImageListJob):
                 except (asyncio.TimeoutError, aiohttp.ClientError):
                     return None
                 return None
-            errors = await asyncio.gather(*(history_status(wid, handle) for wid, handle in inflight.items()))
+            errors = await asyncio.gather(*(history_status(wid, handle) for wid, handle in inflight.items()
+                                            if wid is not master_slot))
             failure = next((error for error in errors if isinstance(error, str)), None)
             if failure:
                 raise RuntimeError(failure)
@@ -867,12 +920,22 @@ async def _run_image_list_job(state: ImageListJob):
                 return completed
             now = time.monotonic()
             expired = [f"{wid}/item {handle['index']}" for wid, handle in inflight.items()
-                       if now - handle["last_seen"] > timeout_seconds]
+                       if wid is not master_slot and now - handle["last_seen"] > timeout_seconds]
             if expired:
                 raise TimeoutError(f"Image-list owned-prompt liveness timeout after {timeout_seconds:.1f}s: {', '.join(expired)}")
-            await asyncio.sleep(0.25)
+            try:
+                await asyncio.wait_for(state.event.wait(), timeout=0.25)
+            except TimeoutError:
+                pass
 
-    async def cleanup(worker_id: str, handle: dict[str, Any]) -> None:
+    async def cleanup(worker_id: Any, handle: dict[str, Any]) -> None:
+        if worker_id is master_slot:
+            # The outer finally owns the non-abandonable stop/join. The generic
+            # scheduler's bounded remote cleanup must never detach local work.
+            assert local_executor is not None
+            local_executor.request_stop()
+            return
+        assert session is not None
         worker = handle["worker"]
         prompt_id = handle.get("prompt_id")
         if prompt_id:
@@ -906,10 +969,26 @@ async def _run_image_list_job(state: ImageListJob):
             return False
 
     try:
-        results = await dynamic_schedule(len(state.items), [worker["id"] for worker in workers],
+        slots = ([master_slot] if local_executor is not None else []) + [worker["id"] for worker in workers]
+        results = await dynamic_schedule(len(state.items), slots,
                                          dispatch, wait_next, cleanup, interrupted)
         return _collect_output_lists(results)
     finally:
+        if local_executor is not None:
+            # No timeout here: Python cannot safely kill a synchronous node.
+            # Stop at a node/progress boundary and join BEFORE releasing End.
+            # Shield against repeated cancellation as well as the job deadline.
+            closing = asyncio.create_task(local_executor.close())
+            try:
+                while not closing.done():
+                    try:
+                        await asyncio.shield(closing)
+                    except asyncio.CancelledError:
+                        continue
+                closing.result()
+            finally:
+                for token in local_tokens:
+                    delete_worker_item(token)
         # Upload ownership exists before dynamic_schedule has an acknowledged
         # handle. Cover rejection/lost upload responses as well as cancellation.
         pending = list(owned_uploads.values())

@@ -37,12 +37,12 @@ export async function executeParallelDistributed(extension, promptWrapper) {
         // Pre-flight health check on all enabled workers
         const activeWorkers = await performPreflightCheck(extension, enabledWorkers);
         
-        if (hasImageList && activeWorkers.length === 0) {
-            throw new Error("Distributed Image List requires an active direct worker; master fallback is disabled.");
+        if (hasImageList && activeWorkers.length === 0 && extension.config?.settings?.master_delegate_only) {
+            throw new Error("Distributed Image List in orchestrator-only mode requires an active direct worker.");
         }
 
         // Case: Enabled workers but all offline
-        if (activeWorkers.length === 0 && enabledWorkers.length > 0) {
+        if (!hasImageList && activeWorkers.length === 0 && enabledWorkers.length > 0) {
             extension.log("No active workers found. All enabled workers are offline.");
             if (extension.ui?.showToast) {
                 extension.ui.showToast(extension.app, "error", "All Workers Offline", 

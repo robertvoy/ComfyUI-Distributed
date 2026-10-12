@@ -63,12 +63,17 @@ class DistributedImageListStart(io.ComfyNode):
                 strength=None, strength_mode="shared", seed=None, seed_mode="shared",
                 worker_item_token="", worker_context_id="", image_list_enabled_worker_ids="[]",
                 image_list_master_callback="", image_list_execution_id="",
-                image_list_workflow_meta=None):
+                image_list_workflow_meta=None, image_list_master_participates=None,
+                image_list_local_execution=False):
         worker_item_token = unwrap_single(worker_item_token)
         worker_context_id = unwrap_single(worker_context_id)
         image_list_workflow_meta = unwrap_single(image_list_workflow_meta)
         if worker_item_token:
-            item = run_async_in_server_loop(_consume_worker_item(worker_item_token), timeout=10)
+            if unwrap_single(image_list_local_execution):
+                from ..image_list.runtime import consume_worker_item
+                item = consume_worker_item(worker_item_token)
+            else:
+                item = run_async_in_server_loop(_consume_worker_item(worker_item_token), timeout=10)
             context_id = worker_context_id
             if not isinstance(context_id, str) or not context_id:
                 raise RuntimeError("Worker image-list prompt is missing its paired context")
@@ -99,11 +104,18 @@ class DistributedImageListStart(io.ComfyNode):
             raise RuntimeError(f"No safe paired Image List End was found for Start node {start_id}")
         from comfy_execution.utils import get_executing_context
         executing = get_executing_context()
+        master_participates = unwrap_single(image_list_master_participates)
+        if master_participates is None:
+            from ..utils.config import load_config
+            master_participates = not bool((load_config().get("settings", {}) or {}).get("master_delegate_only", False))
+        if not isinstance(master_participates, bool):
+            raise ValueError("image_list_master_participates must be a boolean")
         context_id = create_master_job(
             start_id, region["end_id"], prompt, items, worker_ids,
             str(unwrap_single(image_list_master_callback or "")),
             image_list_workflow_meta if isinstance(image_list_workflow_meta, dict) else None,
             prompt_id=executing.prompt_id if executing is not None else None,
+            master_participates=master_participates,
         )
         return io.NodeOutput(
             [item["image"] for item in items],
@@ -148,7 +160,7 @@ class DistributedImageListEnd(io.ComfyNode):
             is_output_node=True,
             accept_all_inputs=True,
             not_idempotent=True,
-            hidden=[io.Hidden.prompt, io.Hidden.unique_id],
+            hidden=[io.Hidden.prompt, io.Hidden.unique_id, io.Hidden.execution_list],
         )
 
     @classmethod
@@ -177,7 +189,8 @@ class DistributedImageListEnd(io.ComfyNode):
 
     @classmethod
     def execute(cls, images=None, masks=None, texts=None, context=None,
-                worker_result_token="", worker_item_index=-1, master_callback_url=""):
+                worker_result_token="", worker_item_index=-1, master_callback_url="",
+                image_list_local_execution=False):
         worker_result_token = unwrap_single(worker_result_token)
         master_callback_url = unwrap_single(master_callback_url)
         if worker_result_token:
@@ -186,11 +199,16 @@ class DistributedImageListEnd(io.ComfyNode):
             if not context_values or len(set(context_values)) != 1:
                 raise RuntimeError("Worker Image List End is missing its paired context")
             result = normalize_worker_result(images, masks, texts)
-            payload = encode_result(result)
-            run_async_in_server_loop(
-                submit_worker_result(str(master_callback_url), str(worker_result_token),
-                                     context_values[0], int(unwrap_single(worker_item_index)), payload), timeout=60,
-            )
+            if unwrap_single(image_list_local_execution):
+                from ..image_list.runtime import set_master_result
+                set_master_result(context_values[0], int(unwrap_single(worker_item_index)),
+                                  str(worker_result_token), result)
+            else:
+                payload = encode_result(result)
+                run_async_in_server_loop(
+                    submit_worker_result(str(master_callback_url), str(worker_result_token),
+                                         context_values[0], int(unwrap_single(worker_item_index)), payload), timeout=60,
+                )
             return io.NodeOutput([result["image"]], [result.get("mask")], [result.get("text")])
 
         context_values = [item for item in (context if isinstance(context, (list, tuple)) else [context])
@@ -201,7 +219,12 @@ class DistributedImageListEnd(io.ComfyNode):
         from ..image_list.runtime import ImageListCancelledError
         try:
             # The runtime owns the configurable deadline and bounded remote cleanup.
-            result_lists = run_async_in_server_loop(run_image_list_job(context_id))
+            execution_list = getattr(cls.hidden, "execution_list", None)
+            # Local model outputs belong to this still-running outer prompt.
+            # Add them to its existing tracker; never start/end another tracker
+            # that could unpin a model still needed by the parent.
+            model_callback = getattr(execution_list, "output_link_callback", None)
+            result_lists = run_async_in_server_loop(run_image_list_job(context_id, model_callback=model_callback))
         except ImageListCancelledError:
             import comfy.model_management
             raise comfy.model_management.InterruptProcessingException()

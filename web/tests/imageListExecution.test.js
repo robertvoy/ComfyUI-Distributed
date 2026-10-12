@@ -31,9 +31,10 @@ describe('image-list queue interception', () => {
         expect(ext.api.queueDistributed).toHaveBeenCalledWith(expect.objectContaining({ enabled_worker_ids: ['one'] }));
         expect(ext.originalQueuePrompt).not.toHaveBeenCalled();
     });
-    it('never falls back to master when all image-list workers are offline', async () => {
+    it('does not fall back when orchestrator-only workers are offline', async () => {
         vi.useFakeTimers();
         const ext = extension([{ id: 'one', type: 'local' }], false);
+        ext.config.settings.master_delegate_only = true;
         setupInterceptor(ext);
         expect(await api.queuePrompt(0, prompt)).toBeNull();
         expect(ext.originalQueuePrompt).not.toHaveBeenCalled();
@@ -43,8 +44,34 @@ describe('image-list queue interception', () => {
         vi.useFakeTimers();
         const ext = extension([{ id: 'pool', type: 'serverless' }]);
         setupInterceptor(ext);
-        expect(await api.queuePrompt(0, prompt)).toBeNull();
+        expect(await api.queuePrompt(0, prompt)).toEqual({ prompt_id: 'distributed' });
+        expect(ext.api.queueDistributed).toHaveBeenCalledWith(expect.objectContaining({ enabled_worker_ids: [], delegate_master: false }));
         expect(ext.api.getServerlessStatus).not.toHaveBeenCalled();
+        expect(ext.originalQueuePrompt).not.toHaveBeenCalled();
+    });
+    it.each([{ workers: [] }, { workers: [{ id: 'one', type: 'local' }] }])('queues master-only through orchestration when no workers are online: $workers', async ({ workers }) => {
+        vi.useFakeTimers();
+        const ext = extension(workers, false);
+        setupInterceptor(ext);
+        expect(await api.queuePrompt(0, prompt)).toEqual({ prompt_id: 'distributed' });
+        expect(ext.api.queueDistributed).toHaveBeenCalledWith(expect.objectContaining({ enabled_worker_ids: [], delegate_master: false }));
+        expect(ext.originalQueuePrompt).not.toHaveBeenCalled();
+    });
+    it('passes orchestrator-only mode to backend when workers are online', async () => {
+        vi.useFakeTimers();
+        const ext = extension([{ id: 'one', type: 'local' }]);
+        ext.config.settings.master_delegate_only = true;
+        setupInterceptor(ext);
+        await api.queuePrompt(0, prompt);
+        expect(ext.api.queueDistributed).toHaveBeenCalledWith(expect.objectContaining({ delegate_master: true }));
+    });
+    it('does not bypass backend errors with local execution', async () => {
+        vi.useFakeTimers();
+        const ext = extension([]);
+        ext.api.queueDistributed.mockRejectedValue(new Error('invalid region'));
+        setupInterceptor(ext);
+        expect(await api.queuePrompt(0, prompt)).toBeNull();
+        expect(ext.api.queueDistributed).toHaveBeenCalled();
         expect(ext.originalQueuePrompt).not.toHaveBeenCalled();
     });
     it('preserves ordinary prompt handling', async () => {

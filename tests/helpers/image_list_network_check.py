@@ -35,7 +35,8 @@ from aiohttp import web
 import aiohttp
 
 torch.set_num_threads(1)
-SOURCE_CALLS, BRANCH_CALLS, CAPTURED = [], [], []
+SOURCE_CALLS, BRANCH_CALLS, CAPTURED, MODEL_CALLS = [], [], [], []
+ALLOW_MASTER = False
 COUNT = 7
 
 
@@ -62,17 +63,29 @@ class TestImageSource:
                      ('image', 'reference_image', 'mask', 'text', 'strength', 'seed'))
 
 
+class TestCachedModel:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {'required': {}}
+    RETURN_TYPES = ('MODEL',)
+    FUNCTION = 'run'
+    def run(self):
+        MODEL_CALLS.append(True)
+        return (object(),)
+
+
 class TestImageOperation:
     @classmethod
     def INPUT_TYPES(cls):
         return {'required': {'image': ('IMAGE',), 'reference_image': ('IMAGE',), 'mask': ('MASK',),
                              'text': ('STRING', {'forceInput': True}),
                              'strength': ('FLOAT', {'forceInput': True}),
-                             'seed': ('INT', {'forceInput': True}), 'index': ('INT', {'forceInput': True})}}
+                             'seed': ('INT', {'forceInput': True}), 'index': ('INT', {'forceInput': True}),
+                             'model': ('MODEL',)}}
     RETURN_TYPES = ('IMAGE', 'MASK', 'STRING')
     FUNCTION = 'run'
-    def run(self, image, reference_image, mask, text, strength, seed, index):
-        assert WORKER, 'per-image branch executed on master'
+    def run(self, image, reference_image, mask, text, strength, seed, index, model):
+        assert WORKER or ALLOW_MASTER, 'per-image branch executed in orchestrator-only mode'
         BRANCH_CALLS.append(index)
         # Sleep in short chunks so the real Comfy interrupt signal can be tested.
         until = time.monotonic() + DELAY
@@ -105,7 +118,8 @@ async def setup():
     assert await nodes.load_custom_node(str(ROOT))
     module = sys.modules[str(ROOT).replace('.', '_x_')]
     nodes.NODE_CLASS_MAPPINGS.update(TestImageSource=TestImageSource,
-                                   TestImageOperation=TestImageOperation, TestCapture=TestCapture)
+                                   TestImageOperation=TestImageOperation, TestCapture=TestCapture,
+                                   TestCachedModel=TestCachedModel)
     # Match the CORS-enabled direct-worker launch contract for canvas probes.
     app = web.Application(middlewares=[server.create_cors_middleware('*')])
     # Register the actual feature routes, not test replacements.
@@ -200,14 +214,16 @@ def graph(callback, worker_ids):
             'image_list_enabled_worker_ids': json.dumps(worker_ids), 'image_list_master_callback': callback}},
         '3': {'class_type': 'TestImageOperation', 'inputs': {
             key: ['2', index] for key, index in [('image', 0), ('reference_image', 1), ('mask', 2),
-                ('text', 3), ('strength', 4), ('seed', 5), ('index', 6)]}},
+                ('text', 3), ('strength', 4), ('seed', 5), ('index', 6)]} | {'model': ['6', 0]}},
         '4': {'class_type': 'DistributedImageListEnd', 'inputs': {
             'images': ['3', 0], 'masks': ['3', 1], 'texts': ['3', 2], 'context': ['2', 7]}},
         '5': {'class_type': 'TestCapture', 'inputs': {'images': ['4', 0], 'masks': ['4', 1], 'texts': ['4', 2]}},
+        '6': {'class_type': 'TestCachedModel', 'inputs': {}},
     }
 
 
 async def coordinator():
+    global ALLOW_MASTER
     ps, assets, module, app = await setup()
     runtime = importlib.import_module(module.__name__ + '.image_list.runtime')
     config_mod = importlib.import_module(module.__name__ + '.utils.config')
@@ -258,7 +274,7 @@ async def coordinator():
                 worker_port = await asyncio.wait_for(ready(), 60)
                 workers.append({'id': name, 'type': 'local', 'host': '127.0.0.1',
                                 'port': worker_port, 'enabled': True})
-            config = {'workers': workers, 'settings': {'websocket_orchestration': False},
+            config = {'workers': workers, 'settings': {'websocket_orchestration': False, 'master_delegate_only': True},
                       'master': {'host': f'http://127.0.0.1:{port}'}}
             prompt = graph(f'http://127.0.0.1:{port}', [w['id'] for w in workers])
             valid = await execution.validate_prompt('network-acceptance', prompt, None)
@@ -328,6 +344,54 @@ async def coordinator():
             assert CAPTURED[1][1:] == ([None, None], [None, None])
             assert not runtime._MASTER_JOBS
             print('IMAGE_LIST_SEQUENTIAL_OK three regions; one worker; optional outputs omitted')
+            # Same public queue path, now with master participation enabled. The
+            # parent queue stays occupied while its local slot processes items.
+            ALLOW_MASTER = True
+            config['settings']['master_delegate_only'] = False
+            participation_counts = {}
+            for mode, selected in [('mixed', [w['id'] for w in workers]), ('master-only', [])]:
+                executor = execution.PromptExecutor(ps, cache_args={'ram': 0, 'ram_inactive': 0}, asset_manager=assets)
+                before_sources, before_local, before_models = len(SOURCE_CALLS), len(BRANCH_CALLS), len(MODEL_CALLS)
+                async with aiohttp.ClientSession() as session:
+                    before_worker_calls = []
+                    for worker in workers:
+                        async with session.get(f"http://127.0.0.1:{worker['port']}/test-stats") as response:
+                            before_worker_calls.append(len((await response.json())['calls']))
+                with patch.object(config_mod, 'load_config', return_value=config), \
+                     patch.object(orchestration, 'load_config', return_value=config), \
+                     patch.object(orchestration, 'queue_prompt_payload', enqueue), \
+                     patch.object(config_mod, 'get_worker_timeout_seconds', return_value=15):
+                    queued = await asyncio.wait_for(orchestration.orchestrate_distributed_execution(
+                        prompt, None, 'test', selected), 45)
+                assert executor.success, (mode, executor.status_messages)
+                assert queued[2] == len(selected)
+                assert len(SOURCE_CALLS) == before_sources + 1, 'source was reevaluated per local item'
+                local_calls = BRANCH_CALLS[before_local:]
+                assert local_calls, f'{mode}: master did not process any items'
+                assert len(MODEL_CALLS) == before_models + 1, 'local model dependency did not stay cached'
+                remote_calls = []
+                async with aiohttp.ClientSession() as session:
+                    for worker, offset in zip(workers, before_worker_calls):
+                        async with session.get(f"http://127.0.0.1:{worker['port']}/test-stats") as response:
+                            current = await response.json()
+                        remote_calls.extend(current['calls'][offset:])
+                        assert not current['running'] and not current['pending'], current
+                if mode == 'mixed':
+                    assert remote_calls, 'mixed execution failed to use direct workers'
+                else:
+                    assert not remote_calls and len(local_calls) == COUNT
+                assert Counter(local_calls + remote_calls) == Counter(range(COUNT)), (local_calls, remote_calls)
+                images, masks, texts = CAPTURED[-1]
+                assert len(images) == len(masks) == len(texts) == COUNT
+                for i, row in enumerate(source_rows()):
+                    assert torch.equal(images[i], row['image'] + row['strength']), (mode, i)
+                    assert torch.equal(masks[i], row['mask'] * 0.5), (mode, i)
+                    assert texts[i] == f'item-{i}:seed-{100 + i}', (mode, texts)
+                assert not runtime._MASTER_JOBS and not runtime._WORKER_ITEMS
+                participation_counts[mode] = {'master': len(local_calls), 'workers': len(remote_calls)}
+            print('IMAGE_LIST_MASTER_OK ' + json.dumps(participation_counts))
+            ALLOW_MASTER = False
+            config['settings']['master_delegate_only'] = True
             # Real Comfy user-interrupt flag while a real worker executor is active.
             slow = workers[1]
             async with aiohttp.ClientSession() as session:

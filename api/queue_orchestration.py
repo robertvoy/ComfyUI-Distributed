@@ -239,6 +239,8 @@ async def orchestrate_distributed_execution(
     execution_trace_id = trace_execution_id or _generate_execution_trace_id()
 
     config = load_config()
+    if delegate_master is None:
+        delegate_master = bool(config.get("settings", {}).get("master_delegate_only", False))
     use_websocket = bool(config.get("settings", {}).get("websocket_orchestration", False))
     master_url = build_master_url(config=config, prompt_server_instance=prompt_server)
     (
@@ -277,10 +279,10 @@ async def orchestrate_distributed_execution(
                 + ", ".join(configured_serverless),
             )
         workers = _resolve_direct_workers_for_image_list(config, requested_ids)
-        if not workers:
+        if not workers and delegate_master:
             raise RuntimeError(
-                "Distributed Image List v1 requires an enabled selected direct local/remote worker; "
-                "serverless pools and master-only execution are unsupported"
+                "Distributed Image List in orchestrator-only mode requires a selected direct worker; "
+                "serverless pools are unsupported"
             )
     else:
         workers = _resolve_enabled_workers(config, requested_ids)
@@ -299,39 +301,35 @@ async def orchestrate_distributed_execution(
         ),
     )
 
-    # Respect master delegate-only configuration
-    if delegate_master is None:
-        delegate_master = bool(config.get("settings", {}).get("master_delegate_only", False))
-    if image_list_mode:
-        # The master must execute each upstream dependency once to obtain the
-        # full typed lists; only the enclosed branch is delegated.
-        delegate_master = False
-
-    if not workers and delegate_master:
+    # Keep the legacy Collector fallback, but never override image-list
+    # orchestrator-only mode merely because its direct workers are unavailable.
+    if not image_list_mode and not workers and delegate_master:
         trace_debug(
             execution_trace_id,
             "Delegate-only requested but no workers are enabled. Falling back to master execution.",
         )
         delegate_master = False
 
-    active_workers, delegate_master = await select_active_workers(
+    active_workers, selected_delegate_master = await select_active_workers(
         workers,
         use_websocket,
-        delegate_master,
+        False if image_list_mode else delegate_master,
         trace_execution_id=execution_trace_id,
         probe_concurrency=worker_probe_concurrency,
     )
     if image_list_mode:
         from .orchestration.dispatch import preflight_image_list_workers
-        if not active_workers:
+        if not active_workers and delegate_master:
             raise RuntimeError(
-                "No selected direct worker is reachable for Distributed Image List; "
-                "the master will not duplicate per-image processing"
+                "No selected direct worker is reachable for Distributed Image List in orchestrator-only mode"
             )
-        idle_ids = await preflight_image_list_workers(active_workers, require_idle=True)
+        idle_ids = (await preflight_image_list_workers(active_workers, require_idle=delegate_master)
+                    if active_workers else {})
         active_workers = [worker for worker in active_workers if worker["id"] in idle_ids]
-        if not active_workers:
-            raise RuntimeError("No feature-compatible direct worker is idle; no master job was queued")
+        if not active_workers and delegate_master:
+            raise RuntimeError("No feature-compatible direct worker is idle in orchestrator-only mode")
+    else:
+        delegate_master = selected_delegate_master
 
     if load_balance_requested and not image_list_mode:
         candidate_workers = list(active_workers)
@@ -416,7 +414,7 @@ async def orchestrate_distributed_execution(
         workflow_meta=workflow_meta,
     )
 
-    if delegate_master:
+    if delegate_master and not image_list_mode:
         collector_ids = find_nodes_by_class(master_prompt, "DistributedCollector")
         upscale_nodes = find_nodes_by_class(master_prompt, "UltimateSDUpscaleDistributed")
         if upscale_nodes:

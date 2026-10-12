@@ -585,7 +585,7 @@ def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, 
 
 
 def _override_image_list_nodes(prompt_copy, prompt_index, participant_id, worker_ids,
-                               job_id_map, master_url, workflow_meta=None):
+                               job_id_map, master_url, delegate_master, workflow_meta=None):
     """Attach protocol context to Start without changing its visible V3 sockets."""
     for node_id in prompt_index.nodes_for_class("DistributedImageListStart"):
         node = prompt_copy.get(node_id)
@@ -593,6 +593,7 @@ def _override_image_list_nodes(prompt_copy, prompt_index, participant_id, worker
             continue
         inputs = node.setdefault("inputs", {})
         inputs["image_list_enabled_worker_ids"] = json.dumps(list(worker_ids))
+        inputs["image_list_master_participates"] = participant_id == "master" and not delegate_master
         inputs["image_list_master_callback"] = str(master_url or "")
         inputs["image_list_execution_id"] = job_id_map.get(node_id, node_id)
         if workflow_meta is not None:
@@ -642,6 +643,7 @@ def apply_participant_overrides(
         enabled_worker_ids,
         job_id_map,
         master_url,
+        delegate_master,
         workflow_meta=workflow_meta,
     )
 
