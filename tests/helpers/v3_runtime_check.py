@@ -228,15 +228,13 @@ async def check_image_list_lazy_executor(mapping, module, prompt_server, asset_m
     graph = {
         '1': {'class_type': 'EmptyImage', 'inputs': {'height': 8, 'width': 8, 'batch_size': 3, 'color': 0}},
         '2': {'class_type': 'DistributedImageListStart', 'inputs': {
-            'images': ['1', 0], 'reference_image_mode': 'per_item', 'mask_mode': 'per_item',
-            'text_mode': 'shared', 'strength': 1.0, 'strength_mode': 'shared',
-            'seed': 17, 'seed_mode': 'shared', 'image_list_enabled_worker_ids': '["test-worker"]',
+            'images': ['1', 0], 'image_list_enabled_worker_ids': '["test-worker"]',
             'image_list_master_callback': 'http://127.0.0.1:1',
             'image_list_workflow_meta': workflow_meta,
         }},
         '3': {'class_type': 'ImageListTestProbe', 'inputs': {'image': ['2', 0]}},
         '4': {'class_type': 'DistributedImageListEnd', 'inputs': {
-            'images': ['3', 0], 'context': ['2', 7],
+            'images': ['3', 0], 'context': ['2', 3],
         }},
         '5': {'class_type': 'PreviewImage', 'inputs': {'images': ['4', 0]}},
     }
@@ -247,7 +245,7 @@ async def check_image_list_lazy_executor(mapping, module, prompt_server, asset_m
     assert len(validator(graph)) == 1
     connected_text_graph = json.loads(json.dumps(graph))
     connected_text_graph['6'] = {
-        'class_type': 'ImageListTextProbe', 'inputs': {'text': ['2', 3]},
+        'class_type': 'ImageListTextProbe', 'inputs': {'text': ['2', 4]},
     }
     connected_text_graph['4']['inputs']['texts'] = ['6', 0]
     assert len(validator(connected_text_graph)) == 1
@@ -359,9 +357,44 @@ async def main():
     assert texts_schema.get('forceInput') is True, texts_schema
     assert 'default' not in texts_schema, texts_schema
     assert [out.io_type for out in start_schema.outputs] == [
-        'IMAGE', 'IMAGE', 'MASK', 'STRING', 'FLOAT', 'INT', 'INT', 'DISTRIBUTED_IMAGE_LIST_CONTEXT']
+        'IMAGE', 'MASK', 'INT', 'DISTRIBUTED_IMAGE_LIST_CONTEXT'] + ['*'] * 10
+    assert [out.display_name for out in start_schema.outputs][4:] == [f'value_{i}' for i in range(1, 11)]
     assert all(out.is_output_list for out in start_schema.outputs)
     assert start_schema.is_input_list and start_schema.accept_all_inputs
+    start_info = json.loads(json.dumps(mapping['DistributedImageListStart'].GET_NODE_INFO_V1()))
+    assert list(start_info['input']['optional']) == ['images', 'mask', 'values'], start_info['input']
+    values_spec = start_info['input']['optional']['values']
+    assert values_spec[0] == 'COMFY_AUTOGROW_V3', values_spec
+    template = values_spec[1]['template']
+    assert template['names'] == [f'value_{i}' for i in range(1, 11)] and template['min'] == 0, template
+    assert template['input']['required']['value'][0] == 'IMAGE,MASK,STRING,INT,FLOAT,BOOLEAN', template
+    # Autogrow + INPUT_IS_LIST through the real parser/list mapper, values
+    # still split 1-or-N, unconnected slots ignored.
+    # get_input_data must accept Autogrow names; constants are wrapped once.
+    parsed, missing, hidden = execution.get_input_data(
+        {'values.value_1': 'shared', 'values.value_3': 4},
+        mapping['DistributedImageListStart'], unique_id='autogrow-probe', extra_data={})
+    assert not missing and parsed['values.value_1'] == ['shared'], parsed
+    # Linked inputs arrive as the upstream output list (one element per value).
+    prepared = {'images': [torch.zeros((3, 2, 2, 3))], 'values.value_1': ['shared'],
+                'values.value_3': [4, 5, 6]}
+    seen = {}
+    runtime_mod = sys.modules[module.__name__ + '.image_list.runtime']
+    def capture(_images, _mask, values):
+        seen['values'] = values
+        raise RuntimeError('captured')
+    nodes_mod = sys.modules[module.__name__ + '.nodes.image_list']
+    with patch.object(nodes_mod, 'normalize_image_list_inputs', capture):
+        try:
+            await asyncio.to_thread(lambda: asyncio.run(execution._async_map_node_over_list(
+                'autogrow-probe', 'autogrow-probe', mapping['DistributedImageListStart'], prepared,
+                'execute', v3_data=hidden)))
+        except RuntimeError as exc:
+            assert 'captured' in str(exc), exc
+    assert seen['values'] == {'value_1': ['shared'], 'value_3': [4, 5, 6]}, seen
+    rows = runtime_mod.normalize_image_list_inputs(prepared['images'], None, seen['values'])
+    assert [row['values'] for row in rows] == [{'value_1': 'shared', 'value_3': n} for n in (4, 5, 6)]
+    print('IMAGE_LIST_AUTOGROW_OK real parser; value_N slots shared/per-item')
     assert [out.io_type for out in end_schema.outputs] == ['IMAGE', 'MASK', 'STRING']
     assert all(out.is_output_list for out in end_schema.outputs)
     assert end_schema.is_input_list and end_schema.is_output_node

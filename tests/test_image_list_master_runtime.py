@@ -21,7 +21,7 @@ def graph():
         'start': {'class_type': 'DistributedImageListStart', 'inputs': {'images': ['source', 0]}},
         'op': {'class_type': 'Operation', 'inputs': {'image': ['start', 0]}},
         'end': {'class_type': 'DistributedImageListEnd', 'inputs': {
-            'images': ['op', 0], 'context': ['start', 7]}},
+            'images': ['op', 0], 'context': ['start', 3]}},
     }
 
 
@@ -90,7 +90,8 @@ class MasterRuntimeTests(unittest.IsolatedAsyncioTestCase):
                             raise fixture.local_error
                         item = fixture.rt.consume_worker_item(token)
                         fixture.rt.set_master_result(fixture.context, index, token, {
-                            'image': item['image'], 'mask': item.get('mask'), 'text': item.get('text')})
+                            'image': item['image'], 'mask': item.get('mask'),
+                            'text': item['values'].get('value_1')})
                     finally:
                         fixture.local_finished.set()
                 task = asyncio.create_task(execute())
@@ -134,7 +135,8 @@ class MasterRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     def create(self, participates=True, count=5):
         self.items = [{'image': torch.full((1, i + 1, 2, 3), float(i)),
-                       'mask': torch.full((1, i + 1, 2), float(i)), 'text': str(i), 'index': i}
+                       'mask': torch.full((1, i + 1, 2), float(i)), 'values': {'value_1': str(i)},
+                       'index': i}
                       for i in range(count)]
         self.context = self.rt.create_master_job('start', 'end', graph(), self.items,
             [w['id'] for w in self.workers], '', master_participates=participates)
@@ -162,7 +164,7 @@ class MasterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         # A remote callback is ready immediately; the local slot is slower.
         item = self.rt.consume_worker_item(token)
         self.rt.set_master_result(self.context, index, token, {
-            'image': item['image'], 'mask': item['mask'], 'text': item['text']})
+            'image': item['image'], 'mask': item['mask'], 'text': item['values']['value_1']})
         return f'remote-{index}'
 
     async def test_local_only_preserves_order_and_uses_no_http(self):
@@ -328,10 +330,12 @@ def real_framework_probe(comfy_root):
     nodes.NODE_CLASS_MAPPINGS.update(Loader=Loader, Operation=Operation, Expanded=Expanded)
     prompt = graph()
     prompt['loader'] = {'class_type': 'Loader', 'inputs': {}}
-    prompt['op']['inputs'].update(model=['loader', 0], mask=['start', 2], text=['start', 3])
+    prompt['op']['inputs'].update(model=['loader', 0], mask=['start', rt.MASK_OUT],
+                                  text=['start', rt.VALUE_OUT_BASE])
     prompt['end']['inputs'].update(masks=['op', 1], texts=['op', 2])
     items = [{'image': torch.full((1, i + 1, 2, 3), float(i)),
-              'mask': torch.full((1, i + 1, 2), float(i)), 'text': str(i), 'index': i} for i in range(3)]
+              'mask': torch.full((1, i + 1, 2), float(i)), 'values': {'value_1': str(i)}, 'index': i}
+             for i in range(3)]
     region = rt.validate_image_list_regions(prompt)[0]
     parent_progress = progress.ProgressRegistry('outer', execution.DynamicPrompt({}))
     parent_progress.nodes['outer'] = {'state': progress.NodeState.Running, 'value': 3, 'max': 7}
@@ -364,7 +368,7 @@ def real_framework_probe(comfy_root):
             data['images'] = [torch.zeros((3, 2, 2, 3))]
             result = await execution._async_map_node_over_list('outer', 'start', cls, data, cls.FUNCTION, v3_data=v3)
             result = await execution.resolve_map_node_over_list_results(result)
-            context = result[0].result[7][0]
+            context = result[0].result[rt.CONTEXT_OUT][0]
             assert rt.get_master_job(context).master_participates is expected
             rt.remove_master_job(context)
 

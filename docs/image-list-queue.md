@@ -23,7 +23,7 @@ Distributed Image List Start -------- context ---------+
                      Preview / Save / next stage
 ```
 
-1. Install the same feature-capable version of Distributed on the master and every selected worker. Restart those instances and refresh the frontend after installation.
+1. Install the same feature-capable version of Distributed on the master and every selected worker. Workers on an older image-list protocol fail preflight before any work is sent. Restart those instances and refresh the frontend after installation.
 2. Enable Distributed and select the **direct** workers to use. The master also participates unless **Orchestrator Only** is enabled. With the master participating, an empty worker selection runs locally through the same image-list scheduler; orchestrator-only mode requires at least one reachable, idle direct worker. The master must be reachable from remote workers at its configured callback address.
 3. Feed your image list or tensor batch into **Distributed Image List Start → images**.
 4. Connect its `image` output through the per-image processing nodes to **Distributed Image List End → images**.
@@ -36,13 +36,21 @@ ComfyUI represents these as ordinary `IMAGE` sockets with list semantics, not a 
 
 Start accepts:
 
-- `images`: one image, an IMAGE batch, or a ComfyUI image list. A batch is split into individual frames.
-- Optional `reference_image`, `mask`, `text`, `strength`, and `seed`.
-- A `per_item` / `shared` mode for each optional input. `per_item` requires exactly one value per image; `shared` requires exactly one value, reused for all images. Inputs are never silently padded by repeating the last element.
+- `images`: one image, an IMAGE batch, or a ComfyUI image list. A batch is split into individual frames; each frame becomes one job.
+- Optional `mask`.
+- Optional `value_1`, `value_2`, … inputs. Only `value_1` is shown at first; connecting it adds `value_2`, and so on, up to `value_10`. Each accepts an IMAGE, MASK, STRING, INT, FLOAT or BOOLEAN.
 
-Reference images and masks default to `per_item`. Text, strength and seed default to `shared`; strength defaults to `1.0`, seed to `0`.
+`mask` and every value follow one rule:
 
-Start outputs, in order: `image`, `reference_image`, `mask`, `text`, `strength`, `seed`, `item_index` (zero-based), `context`. Connect only optional values that your processing region actually provides and uses. Seeds are tied to input values, not worker assignments; use a per-item seed list for deterministic variation.
+- **1 value** is shared by every image.
+- **One value per image** pairs them in order.
+- **Any other count** is an error. Values are never padded or repeated silently.
+
+Only `images` is split into frames. A batch connected to a value input stays a single value, so a 2-image batch can travel with each item (for example, two reference images per job). To pass a different batch to each image, connect a list with one batch per image.
+
+Start outputs, in order: `image`, `mask`, `item_index` (zero-based), `context`, then one `value_N` output per connected `value_N` input, with the same type. Unused value outputs are hidden. Seeds and strengths are ordinary values: connect a single number to share it, a list for one per image, or derive it from `item_index`.
+
+Values that cannot be transported exactly (models, latents, conditioning and other objects) are rejected. Load models inside the region from a loader connected directly to the processing nodes, as described below.
 
 End accepts `images`, optional `masks` / `texts`, and `context`. It returns `image_list`, `masks`, and `texts` in original item order. Each job must produce exactly one image, at most one mask, and at most one text value. Unconnected optional outputs contain `None` entries.
 
@@ -63,7 +71,7 @@ File-based dependencies keep ComfyUI's `[output]` / `[temp]` root annotations wh
 - Local items execute while the enclosing master prompt waits; they are not queued behind that prompt on the master's `/prompt` queue. The enclosed branch is not also evaluated as a full list by the outer prompt.
 - Start/End regions may be chained sequentially and share model-loader dependencies. Nested/overlapping per-image regions and data escaping a region without End are rejected. Collector and distributed-upscaler nodes cannot be mixed into the same prompt in this first version.
 - Output nodes inside a region are rejected because ComfyUI would execute them independently on the master. Avoid other side-effecting processing nodes as well; save after End.
-- The entire input list is materialized before scheduling; this is not streaming input. The limit is 4,096 frames. Remote transport preserves floating-point tensor dtype and values rather than encoding to lossy images. Each transported tensor is limited to 50 MiB, and the complete JSON/base64 HTTP request to 101 MiB; image/reference/mask combinations can hit the aggregate request limit first. In-process master items use tensors directly and do not incur those HTTP limits.
+- The entire input list is materialized before scheduling; this is not streaming input. The limit is 4,096 frames. Remote transport preserves floating-point tensor dtype and values rather than encoding to lossy images. Each transported tensor is limited to 50 MiB, and the complete JSON/base64 HTTP request to 101 MiB; image/mask/value combinations can hit the aggregate request limit first. In-process master items use tensors directly and do not incur those HTTP limits.
 - Results are accepted once per item using assignment tokens. Missing, duplicate, malformed and wrong-index results fail rather than silently returning a partial list. No failed or ambiguous submission is retried automatically.
 - Worker errors fail the region. The worker timeout measures loss of evidence for the **owned prompt ID**, not maximum render duration. Pending/running evidence refreshes liveness; unrelated busy jobs and failed polls do not. Healthy cold loads and long renders can continue.
 - User interruption is checked during submission and result waiting. Cleanup targets only this region's acknowledged prompt IDs and staged input tokens. Submission may wait briefly for an acknowledgement before cancellation; remote transport and cleanup have finite time limits. Local cleanup stops at node/progress boundaries and waits for its execution thread to finish before the parent prompt can resume. A synchronous node that does not cooperate with cancellation can delay this beyond the configured deadline. Lost acknowledgements are **ambiguous**, never retried automatically. Unreachable cleanup is logged as unconfirmed and may require checking the worker manually; cancellation does not guarantee remote termination through a broken network.
@@ -75,7 +83,7 @@ File-based dependencies keep ComfyUI's `[output]` / `[temp]` root annotations wh
 
 Uploads, media preparation and submission acknowledgements are independently bounded. WebSocket acknowledgement waiting includes connect/send/receive and is not extended by heartbeats or unrelated messages. A user interrupt allows up to one second for a late acknowledgement; cleanup requests use five-second bounds each.
 
-**4K float32 RGB outputs cannot be returned by direct workers under these transport limits.** A 3840×2160 RGB float32 tensor exceeds 50 MiB before base64 encoding. Mixed master/worker 1080p-to-4K upscaling therefore cannot use this configuration; master-only execution does not use the HTTP transport. Dtypes/values are never silently reduced to fit. Complete encoded input requests are checked before upload, including image/reference/mask combinations; output limits are checked when the worker has computed the result. Reverse proxies may impose lower HTTP limits.
+**4K float32 RGB outputs cannot be returned by direct workers under these transport limits.** A 3840×2160 RGB float32 tensor exceeds 50 MiB before base64 encoding. Mixed master/worker 1080p-to-4K upscaling therefore cannot use this configuration; master-only execution does not use the HTTP transport. Dtypes/values are never silently reduced to fit. Complete encoded input requests are checked before upload, including image/mask/value combinations; output limits are checked when the worker has computed the result. Reverse proxies may impose lower HTTP limits.
 
 Use trusted workers and trusted workflows, as with the existing ComfyUI API. Capability tokens protect assignment/result matching; they are not a replacement for network access control.
 

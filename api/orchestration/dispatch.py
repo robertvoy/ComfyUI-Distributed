@@ -6,6 +6,9 @@ import aiohttp
 
 from ...utils.logging import debug_log, log
 from ...utils.network import build_worker_url, get_client_session, probe_worker
+# Must match image_list.runtime.PROTOCOL_VERSION (kept local so this module
+# stays importable without the image-list runtime; a test pins them equal).
+IMAGE_LIST_PROTOCOL_VERSION = 2
 try:
     from ...utils.trace_logger import trace_debug, trace_info
 except ImportError:
@@ -215,11 +218,12 @@ async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0):
                     raise RuntimeError(f"Image-list worker {worker_id} returned malformed capability data")
                 if (
                     supported is not True
-                    or protocol_version != 1
+                    or protocol_version != IMAGE_LIST_PROTOCOL_VERSION
                     or not required_nodes.issubset(nodes)
                 ):
                     raise RuntimeError(
-                        f"Image-list worker {worker_id} is incompatible: requires protocol v1 and nodes "
+                        f"Image-list worker {worker_id} is incompatible: requires protocol "
+                        f"v{IMAGE_LIST_PROTOCOL_VERSION} and nodes "
                         f"{sorted(required_nodes)}; no work was submitted"
                     )
 

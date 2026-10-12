@@ -168,7 +168,7 @@ class _FakeSession:
 def _valid_capability():
     return {
         "supported": True,
-        "protocol_version": 1,
+        "protocol_version": 2,
         "node_ids": ["DistributedImageListStart", "DistributedImageListEnd"],
     }
 
@@ -418,7 +418,7 @@ class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
                 await dispatch.preflight_image_list_workers(workers, require_idle=True)
 
     async def test_image_list_preflight_fails_closed_for_malformed_capabilities(self):
-        malformed = {"supported": True, "protocol_version": 1, "node_ids": None}
+        malformed = {"supported": True, "protocol_version": 2, "node_ids": None}
         session = _FakeSession({("worker", "capabilities"): (200, malformed)})
 
         async def fake_session():
@@ -432,7 +432,7 @@ class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_image_list_preflight_fails_closed_for_incompatible_protocol(self):
         incompatible = _valid_capability()
-        incompatible["protocol_version"] = 2
+        incompatible["protocol_version"] = 1
         session = _FakeSession({("worker", "capabilities"): (200, incompatible)})
 
         async def fake_session():

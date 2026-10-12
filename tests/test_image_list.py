@@ -9,6 +9,7 @@ from image_list.runtime import (
     IMAGE_OUT,
     CONTEXT_OUT,
     START_CLASS,
+    VALUE_OUT_BASE,
     ImageListCancelledError,
     build_worker_prompt,
     create_master_job,
@@ -26,11 +27,7 @@ from image_list.runtime import (
 
 
 def start_node(image_link):
-    return {"class_type": START_CLASS, "inputs": {
-        "images": image_link,
-        "reference_image_mode": "per_item", "mask_mode": "per_item",
-        "text_mode": "shared", "strength_mode": "shared", "seed_mode": "shared",
-    }}
+    return {"class_type": START_CLASS, "inputs": {"images": image_link}}
 
 
 def graph_one_region():
@@ -39,7 +36,7 @@ def graph_one_region():
         "2": {"class_type": "EmptyImage", "inputs": {"height": 8, "width": 8, "batch_size": 2}},
         "3": start_node(["2", 0]),
         "4": {"class_type": "GenericFrameOperation", "inputs": {
-            "image": ["3", IMAGE_OUT], "model": ["1", 0], "seed": ["3", 5],
+            "image": ["3", IMAGE_OUT], "model": ["1", 0], "seed": ["3", VALUE_OUT_BASE],
         }},
         "5": {"class_type": END_CLASS, "inputs": {
             "images": ["4", 0], "context": ["3", CONTEXT_OUT],
@@ -70,53 +67,85 @@ class ImageListNormalizationTests(unittest.TestCase):
         refs = torch.ones((2, 5, 7, 3), dtype=torch.float16) * 0.333
         masks = [torch.full((1, 2, 3), 0.125, dtype=torch.float64),
                  torch.full((1, 8, 9), 0.875, dtype=torch.float32)]
-        rows = normalize_image_list_inputs(
-            images, refs, masks, ["first", "second"], [0.2], [37],
-            "per_item", "per_item", "per_item", "shared", "shared",
-        )
+        rows = normalize_image_list_inputs(images, masks, {
+            "value_1": [refs[:1], refs[1:]], "value_2": ["first", "second"],
+            "value_3": [0.2], "value_4": [37],
+        })
         self.assertEqual(len(rows), 2)
         self.assertEqual([tuple(row["image"].shape) for row in rows], [(1, 1, 1, 3), (1, 2, 3, 4)])
         self.assertEqual([row["image"].dtype for row in rows], [torch.float64, torch.float32])
-        self.assertTrue(torch.equal(rows[0]["reference_image"], refs[:1]))
+        self.assertTrue(torch.equal(rows[0]["values"]["value_1"], refs[:1]))
         self.assertEqual(rows[1]["mask"].dtype, torch.float32)
         self.assertEqual([row["index"] for row in rows], [0, 1])
-        self.assertEqual([row["seed"] for row in rows], [37, 37])
-        self.assertEqual([row["strength"] for row in rows], [0.2, 0.2])
+        self.assertEqual([row["values"]["value_2"] for row in rows], ["first", "second"])
+        self.assertEqual([row["values"]["value_3"] for row in rows], [0.2, 0.2])
+        self.assertEqual([row["values"]["value_4"] for row in rows], [37, 37])
 
-    def test_explicit_per_item_and_shared_scalar_contracts(self):
+    def test_one_value_is_shared_and_n_values_pair_in_order(self):
         image = torch.zeros((3, 2, 4, 3), dtype=torch.float32)
-        rows = normalize_image_list_inputs(image, text="same", strength=0.4, seed=9,
-                                           text_mode="shared", strength_mode="shared", seed_mode="shared")
-        self.assertEqual([row["text"] for row in rows], ["same"] * 3)
-        self.assertEqual([row["strength"] for row in rows], [0.4] * 3)
-        self.assertEqual([row["seed"] for row in rows], [9] * 3)
-        with self.assertRaisesRegex(ValueError, "expected exactly 3"):
-            normalize_image_list_inputs(image, text=["one", "two"], text_mode="per_item")
-        with self.assertRaisesRegex(ValueError, "shared inputs require exactly one"):
-            normalize_image_list_inputs(image, seed=[1, 2], seed_mode="shared")
-        with self.assertRaisesRegex(ValueError, "expected exactly 3"):
-            normalize_image_list_inputs(image, mask=torch.zeros((2, 2, 4)), mask_mode="per_item")
+        rows = normalize_image_list_inputs(image, values={
+            "value_1": ["same"], "value_2": [0.4], "value_3": [9], "value_4": [True]})
+        self.assertEqual([row["values"]["value_1"] for row in rows], ["same"] * 3)
+        self.assertEqual([row["values"]["value_2"] for row in rows], [0.4] * 3)
+        self.assertEqual([row["values"]["value_3"] for row in rows], [9] * 3)
+        self.assertEqual([row["values"]["value_4"] for row in rows], [True] * 3)
+        rows = normalize_image_list_inputs(image, values={"value_2": [1, 2, 3]})
+        self.assertEqual([row["values"] for row in rows], [{"value_2": 1}, {"value_2": 2}, {"value_2": 3}])
+        with self.assertRaisesRegex(ValueError, "value_1 has 2 values; connect exactly 1.*or 3"):
+            normalize_image_list_inputs(image, values={"value_1": ["one", "two"]})
+        with self.assertRaisesRegex(ValueError, "mask has 2 values"):
+            normalize_image_list_inputs(image, mask=torch.zeros((2, 2, 4)))
+        shared_mask = normalize_image_list_inputs(image, mask=torch.ones((1, 2, 4)))
+        self.assertTrue(all(torch.equal(row["mask"], torch.ones((1, 2, 4))) for row in shared_mask))
 
-    def test_no_implicit_tail_repetition_and_no_empty_primary_batch(self):
+    def test_value_batches_stay_whole_and_only_images_split(self):
         images = torch.zeros((2, 2, 2, 3), dtype=torch.float32)
-        with self.assertRaisesRegex(ValueError, "expected exactly 2"):
-            normalize_image_list_inputs(images, reference_image=torch.zeros((1, 2, 2, 3)),
-                                        reference_image_mode="per_item")
+        pair = torch.rand((2, 4, 4, 3))  # e.g. two references for one item
+        rows = normalize_image_list_inputs(images, values={"value_1": [pair]})
+        self.assertTrue(all(torch.equal(row["values"]["value_1"], pair) for row in rows))
+        per_item = [torch.rand((2, 4, 4, 3)), torch.rand((2, 4, 4, 3))]
+        rows = normalize_image_list_inputs(images, values={"value_1": per_item})
+        self.assertTrue(torch.equal(rows[1]["values"]["value_1"], per_item[1]))
+
+    def test_rejects_unsupported_values_and_counts(self):
+        images = torch.zeros((2, 2, 2, 3), dtype=torch.float32)
+        with self.assertRaisesRegex(ValueError, "value_1 has 3 values"):
+            normalize_image_list_inputs(images, values={"value_1": [1, 2, 3]})
+        with self.assertRaisesRegex(TypeError, "unsupported type dict"):
+            normalize_image_list_inputs(images, values={"value_1": [{"samples": 1}]})
+        with self.assertRaisesRegex(TypeError, "floating-point"):
+            normalize_image_list_inputs(images, values={"value_1": [torch.zeros(2, dtype=torch.int64)]})
+        with self.assertRaisesRegex(TypeError, "finite"):
+            normalize_image_list_inputs(images, values={"value_1": [float("nan")]})
+        with self.assertRaisesRegex(ValueError, "Unknown Start value slot"):
+            normalize_image_list_inputs(images, values={"value_11": [1]})
         with self.assertRaisesRegex(ValueError, "at least one image"):
             normalize_image_list_inputs(None)
+        # Unconnected Autogrow slots arrive as None and are ignored.
+        rows = normalize_image_list_inputs(images, values={"value_1": [None], "value_2": None})
+        self.assertEqual([row["values"] for row in rows], [{}, {}])
 
     def test_typed_transport_round_trips_float_images_masks_and_scalar_values(self):
         item = {"image": torch.arange(24, dtype=torch.float64).reshape(1, 2, 4, 3) / 7,
-                "reference_image": torch.ones((1, 1, 3, 4), dtype=torch.float16),
                 "mask": torch.full((1, 5, 6), 0.375, dtype=torch.float32),
-                "text": "safe text", "strength": 0.625, "seed": 42, "index": 3}
+                "values": {"value_1": torch.ones((2, 1, 3, 4), dtype=torch.float16),
+                           "value_2": "safe text", "value_3": 0.625, "value_4": 42,
+                           "value_5": False},
+                "index": 3}
         restored = decode_item(encode_item(item))
         self.assertTrue(torch.equal(restored["image"], item["image"]))
         self.assertEqual(restored["image"].dtype, torch.float64)
-        self.assertTrue(torch.equal(restored["reference_image"], item["reference_image"]))
+        self.assertTrue(torch.equal(restored["values"]["value_1"], item["values"]["value_1"]))
+        self.assertEqual(restored["values"]["value_1"].dtype, torch.float16)
         self.assertTrue(torch.equal(restored["mask"], item["mask"]))
-        self.assertEqual(restored["text"], "safe text")
-        self.assertEqual(restored["seed"], 42)
+        self.assertEqual(restored["values"]["value_2"], "safe text")
+        self.assertEqual(restored["values"]["value_3"], 0.625)
+        self.assertIs(restored["values"]["value_4"], 42)
+        self.assertIs(restored["values"]["value_5"], False)
+        with self.assertRaisesRegex(ValueError, "unknown slot"):
+            decode_item({**encode_item(item), "values": {"strength": {"type": "FLOAT", "value": 1.0}}})
+        with self.assertRaisesRegex(ValueError, "unsupported type"):
+            decode_item({**encode_item(item), "values": {"value_1": {"type": "PATH", "value": "/x"}}})
         with self.assertRaisesRegex(TypeError, "floating-point tensor"):
             encode_item({**item, "image": torch.ones((1, 2, 4, 3), dtype=torch.int32)})
         with self.assertRaisesRegex(ValueError, "Unsupported image-list transport type"):
@@ -148,6 +177,19 @@ class ImageListGraphBoundaryTests(unittest.TestCase):
         self.assertEqual(set(worker), {"1", "3", "4", "5"})
         self.assertEqual(worker["3"]["inputs"]["worker_item_token"], "token_12345678901234567890123456789012")
         self.assertNotIn("images", worker["3"]["inputs"])
+
+    def test_worker_prompt_drops_per_item_value_links(self):
+        prompt = graph_one_region()
+        prompt["8"] = {"class_type": "StringList", "inputs": {}}
+        prompt["3"]["inputs"].update({"values.value_1": ["8", 0], "values.value_2": ["8", 0]})
+        import sys, types
+        from unittest.mock import patch
+        registry = {"CheckpointLoaderSimple": type("Loader", (), {"RETURN_TYPES": ("MODEL",)})}
+        with patch.dict(sys.modules, {"nodes": types.SimpleNamespace(NODE_CLASS_MAPPINGS=registry)}):
+            region = validate_image_list_regions(prompt)[0]
+        worker = build_worker_prompt(prompt, region, "token_12345678901234567890123456789012", "ctx", 0, "http://m")
+        self.assertFalse([name for name in worker["3"]["inputs"] if name.startswith("values.")])
+        self.assertNotIn("8", worker)
         self.assertEqual(worker["4"]["inputs"]["model"], ["1", 0])
         self.assertNotIn("6", worker)
 

@@ -7,6 +7,9 @@ from comfy_api.v0_0_2 import io
 
 from ..utils.async_helpers import run_async_in_server_loop
 from ..image_list.runtime import (
+    MAX_VALUE_SLOTS,
+    VALUE_NAMES,
+    VALUES_INPUT,
     create_master_job,
     normalize_image_list_inputs,
     normalize_worker_result,
@@ -15,6 +18,12 @@ from ..image_list.runtime import (
     encode_request_payload,
     unwrap_single,
 )
+
+
+# Types the transport can carry exactly. Anything else (models, latents, ...)
+# must be loaded inside the region or shared as a model dependency instead.
+_VALUE_TYPES = [io.Image, io.Mask, io.String, io.Int, io.Float, io.Boolean]
+assert len(VALUE_NAMES) == MAX_VALUE_SLOTS
 
 
 class DistributedImageListStart(io.ComfyNode):
@@ -26,30 +35,28 @@ class DistributedImageListStart(io.ComfyNode):
             node_id="DistributedImageListStart",
             display_name="Distributed Image List Start",
             category="image/distributed",
-            description=("Starts one per-image processing region. Optional inputs explicitly choose shared "
-                         "(exactly one value) or per-item (exactly one value per image) alignment."),
+            description=("Starts one per-image processing region. Each image becomes one job. "
+                         "mask and value_N inputs take 1 value (shared by every image) or exactly "
+                         "one value per image, paired in order."),
             inputs=[
-                io.Image.Input("images", optional=True, tooltip="Image list or image batch; each frame becomes one worker job."),
-                io.Image.Input("reference_image", optional=True),
-                io.Combo.Input("reference_image_mode", options=["per_item", "shared"], default="per_item"),
-                io.Mask.Input("mask", optional=True),
-                io.Combo.Input("mask_mode", options=["per_item", "shared"], default="per_item"),
-                io.String.Input("text", optional=True),
-                io.Combo.Input("text_mode", options=["per_item", "shared"], default="shared"),
-                io.Float.Input("strength", optional=True, default=1.0),
-                io.Combo.Input("strength_mode", options=["per_item", "shared"], default="shared"),
-                io.Int.Input("seed", optional=True, default=0, min=0, max=0xffffffffffffffff),
-                io.Combo.Input("seed_mode", options=["per_item", "shared"], default="shared"),
+                io.Image.Input("images", optional=True, tooltip="Image list or image batch; each frame becomes one job."),
+                io.Mask.Input("mask", optional=True,
+                              tooltip="1 mask shared by every image, or one mask per image."),
+                io.Autogrow.Input(VALUES_INPUT, optional=True, template=io.Autogrow.TemplateNames(
+                    io.MultiType.Input("value", types=_VALUE_TYPES,
+                                       tooltip=("Any image, mask, text, number or boolean. 1 value is shared by "
+                                                "every image; one value per image pairs them in order. "
+                                                "A batch stays one value.")),
+                    names=list(VALUE_NAMES), min=0)),
             ],
             outputs=[
                 io.Image.Output(display_name="image", is_output_list=True),
-                io.Image.Output(display_name="reference_image", is_output_list=True),
                 io.Mask.Output(display_name="mask", is_output_list=True),
-                io.String.Output(display_name="text", is_output_list=True),
-                io.Float.Output(display_name="strength", is_output_list=True),
-                io.Int.Output(display_name="seed", is_output_list=True),
                 io.Int.Output(display_name="item_index", is_output_list=True),
                 io.Custom("DISTRIBUTED_IMAGE_LIST_CONTEXT").Output(display_name="context", is_output_list=True),
+                # value_N outputs mirror value_N inputs. The web extension hides
+                # unused ones and shows the connected input's type.
+                *[io.AnyType.Output(id=name, display_name=name, is_output_list=True) for name in VALUE_NAMES],
             ],
             is_input_list=True,
             accept_all_inputs=True,
@@ -58,9 +65,7 @@ class DistributedImageListStart(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, images=None, reference_image=None, reference_image_mode="per_item",
-                mask=None, mask_mode="per_item", text=None, text_mode="shared",
-                strength=None, strength_mode="shared", seed=None, seed_mode="shared",
+    def execute(cls, images=None, mask=None, values=None,
                 worker_item_token="", worker_context_id="", image_list_enabled_worker_ids="[]",
                 image_list_master_callback="", image_list_execution_id="",
                 image_list_workflow_meta=None, image_list_master_participates=None,
@@ -77,16 +82,13 @@ class DistributedImageListStart(io.ComfyNode):
             context_id = worker_context_id
             if not isinstance(context_id, str) or not context_id:
                 raise RuntimeError("Worker image-list prompt is missing its paired context")
+            item_values = item.get("values") or {}
             return io.NodeOutput(
-                [item["image"]], [item.get("reference_image")], [item.get("mask")],
-                [item.get("text")], [item.get("strength")], [item.get("seed")],
-                [item["index"]], [context_id],
+                [item["image"]], [item.get("mask")], [item["index"]], [context_id],
+                *[[item_values.get(name)] for name in VALUE_NAMES],
             )
 
-        items = normalize_image_list_inputs(
-            images, reference_image, mask, text, strength, seed,
-            reference_image_mode, mask_mode, text_mode, strength_mode, seed_mode,
-        )
+        items = normalize_image_list_inputs(images, mask, values)
         prompt = getattr(cls.hidden, "prompt", None)
         start_id = str(getattr(cls.hidden, "unique_id", ""))
         if not prompt or not start_id:
@@ -119,13 +121,10 @@ class DistributedImageListStart(io.ComfyNode):
         )
         return io.NodeOutput(
             [item["image"] for item in items],
-            [item.get("reference_image") for item in items],
             [item.get("mask") for item in items],
-            [item.get("text") for item in items],
-            [item.get("strength") for item in items],
-            [item.get("seed") for item in items],
             [item["index"] for item in items],
             [context_id for _ in items],
+            *[[item["values"].get(name) for item in items] for name in VALUE_NAMES],
         )
 
 

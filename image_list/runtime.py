@@ -15,13 +15,20 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-PROTOCOL_VERSION = 1
+# v2: Start carries generic value_N slots instead of fixed reference/text/strength/seed fields.
+PROTOCOL_VERSION = 2
 START_CLASS = "DistributedImageListStart"
 END_CLASS = "DistributedImageListEnd"
 START_NODE_ID = "DistributedImageListStart"
 END_NODE_ID = "DistributedImageListEnd"
-# Start output indexes are a stable internal prompt protocol.
-IMAGE_OUT, REFERENCE_OUT, MASK_OUT, TEXT_OUT, STRENGTH_OUT, SEED_OUT, INDEX_OUT, CONTEXT_OUT = range(8)
+# Start output indexes are a stable internal prompt protocol. Fixed outputs come
+# first; value_1..value_N follow so the frontend can hide unused trailing slots
+# without renumbering any connected output.
+IMAGE_OUT, MASK_OUT, INDEX_OUT, CONTEXT_OUT = range(4)
+VALUE_OUT_BASE = 4
+MAX_VALUE_SLOTS = 10
+VALUE_NAMES = tuple(f"value_{i}" for i in range(1, MAX_VALUE_SLOTS + 1))
+VALUES_INPUT = "values"
 MAX_PAYLOAD_BYTES = 50 * 1024 * 1024
 MAX_REQUEST_BYTES = MAX_PAYLOAD_BYTES * 2 + 1024 * 1024
 MAX_ITEMS = 4096
@@ -29,6 +36,7 @@ SUBMISSION_TIMEOUT_SECONDS = 190.0
 SUBMISSION_CANCEL_GRACE_SECONDS = 1.0
 CLEANUP_TIMEOUT_SECONDS = 16.0
 _ALLOWED_FLOAT_DTYPES = {"float16", "bfloat16", "float32", "float64"}
+_VALUE_KINDS = {"TENSOR", "STRING", "INT", "FLOAT", "BOOLEAN"}
 
 _LOCK = threading.RLock()
 _MASTER_JOBS: dict[str, "ImageListJob"] = {}
@@ -116,53 +124,75 @@ def _scalar_items(value: Any, name: str) -> list[Any]:
     return [value]
 
 
-def _normalize_aligned(value: Any, mode: str, count: int, name: str, kind: str) -> list[Any]:
+def _align(items: list[Any], count: int, name: str) -> list[Any]:
+    """One value is shared by every image; exactly one value per image pairs in order."""
+    if len(items) == 1:
+        return [items[0] for _ in range(count)]
+    if len(items) == count:
+        return items
+    raise ValueError(f"{name} has {len(items)} values; connect exactly 1 (shared by every image) "
+                     f"or {count} (one per image, in order)")
+
+
+def value_kind(value: Any, name: str) -> str:
+    """Return the transport kind for one generic value, or raise for unsupported types."""
+    torch = _torch()
+    if isinstance(value, torch.Tensor):
+        if not value.is_floating_point():
+            raise TypeError(f"{name} tensor must have a floating-point dtype")
+        if value.ndim < 1 or value.ndim > 4 or min(value.shape) < 1:
+            raise ValueError(f"{name} tensor must have 1 to 4 positive dimensions")
+        return "TENSOR"
+    if isinstance(value, bool):
+        return "BOOLEAN"
+    if isinstance(value, int):
+        return "INT"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise TypeError(f"{name} numbers must be finite")
+        return "FLOAT"
+    if isinstance(value, str):
+        return "STRING"
     if value is None:
-        return [None] * count
-    if mode not in ("per_item", "shared"):
-        raise ValueError(f"{name}_mode must be 'per_item' or 'shared'")
-    if kind == "image":
-        items = _image_frames(value, name)
-    elif kind == "mask":
-        items = _image_frames(value, name, mask=True)
-    else:
-        items = _scalar_items(value, name)
-    if mode == "shared":
-        if len(items) != 1:
-            raise ValueError(f"{name} is shared but has {len(items)} values; shared inputs require exactly one value")
-        items = [items[0] for _ in range(count)]
-    if len(items) != count:
-        raise ValueError(f"{name} has {len(items)} per-item values; expected exactly {count}")
-    if kind == "text" and any(item is not None and not isinstance(item, str) for item in items):
-        raise TypeError(f"{name} per-item values must be strings")
-    if kind == "int" and any(item is not None and (isinstance(item, bool) or not isinstance(item, int)) for item in items):
-        raise TypeError(f"{name} per-item values must be integers")
-    if kind == "float" and any(item is not None and (isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item))) for item in items):
-        raise TypeError(f"{name} per-item values must be finite numbers")
-    return items
+        raise ValueError(f"{name} contains an empty value")
+    raise TypeError(f"{name} has unsupported type {type(value).__name__}; "
+                    "use IMAGE, MASK, STRING, INT, FLOAT or BOOLEAN")
 
 
-def normalize_image_list_inputs(images: Any, reference_image: Any = None, mask: Any = None,
-                                text: Any = None, strength: Any = None, seed: Any = None,
-                                reference_image_mode: Any = "per_item", mask_mode: Any = "per_item",
-                                text_mode: Any = "per_item", strength_mode: Any = "per_item",
-                                seed_mode: Any = "per_item") -> list[dict[str, Any]]:
-    """Normalize batches and explicitly shared/per-item optional inputs."""
+def _normalize_values(values: Any, count: int) -> dict[str, list[Any]]:
+    if values is None:
+        return {}
+    if not isinstance(values, dict):
+        raise TypeError("Start values must be a mapping of value_N slots")
+    aligned = {}
+    for name, raw in values.items():
+        if name not in VALUE_NAMES:
+            raise ValueError(f"Unknown Start value slot {name!r}; expected value_1..value_{MAX_VALUE_SLOTS}")
+        if raw is None or (isinstance(raw, (list, tuple)) and all(item is None for item in raw)):
+            continue  # Unconnected Autogrow slot.
+        # Each list element is one value. A batch tensor stays one value; only
+        # `images` is split into frames.
+        items = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+        for item in items:
+            value_kind(item, name)
+        aligned[name] = _align(items, count, name)
+    return aligned
+
+
+def normalize_image_list_inputs(images: Any, mask: Any = None, values: Any = None) -> list[dict[str, Any]]:
+    """Split images into items and pair masks/generic values by the 1-or-N rule."""
     frames = _image_frames(images, "images")
     if not frames:
         raise ValueError("Distributed Image List Start requires at least one image")
     if len(frames) > MAX_ITEMS:
         raise ValueError(f"Image list contains {len(frames)} items; maximum is {MAX_ITEMS}")
     count = len(frames)
-    refs = _normalize_aligned(reference_image, str(unwrap_single(reference_image_mode)), count,
-                              "reference_image", "image")
-    masks = _normalize_aligned(mask, str(unwrap_single(mask_mode)), count, "mask", "mask")
-    texts = _normalize_aligned(text, str(unwrap_single(text_mode)), count, "text", "text")
-    strengths = _normalize_aligned(strength, str(unwrap_single(strength_mode)), count, "strength", "float")
-    seeds = _normalize_aligned(seed, str(unwrap_single(seed_mode)), count, "seed", "int")
+    mask_frames = _image_frames(mask, "mask", mask=True)
+    masks = _align(mask_frames, count, "mask") if mask_frames else [None] * count
+    aligned = _normalize_values(values, count)
     return [
-        {"image": frames[i], "reference_image": refs[i], "mask": masks[i],
-         "text": texts[i], "strength": strengths[i], "seed": seeds[i], "index": i}
+        {"image": frames[i], "mask": masks[i],
+         "values": {name: column[i] for name, column in aligned.items()}, "index": i}
         for i in range(count)
     ]
 
@@ -175,14 +205,17 @@ def _tensor_dtype_name(tensor: Any) -> str:
 
 
 def encode_value(value: Any, kind: str) -> dict[str, Any] | None:
-    """Encode only the explicit IMAGE/MASK/STRING/FLOAT/INT protocol types."""
+    """Encode only the explicit IMAGE/MASK/TENSOR/STRING/FLOAT/INT/BOOLEAN protocol types."""
     if value is None:
         return None
-    if kind in ("IMAGE", "MASK"):
+    if kind in ("IMAGE", "MASK", "TENSOR"):
         torch = _torch()
         if not isinstance(value, torch.Tensor) or not value.is_floating_point():
             raise TypeError(f"{kind} result must be a floating-point tensor")
-        if kind == "IMAGE":
+        if kind == "TENSOR":
+            if value.ndim < 1 or value.ndim > 4 or min(value.shape) < 1:
+                raise ValueError("TENSOR value must have 1 to 4 positive dimensions")
+        elif kind == "IMAGE":
             if value.ndim != 4 or value.shape[0] != 1 or value.shape[-1] not in (3, 4):
                 raise ValueError("IMAGE item must have shape [1,H,W,3|4]")
         else:
@@ -208,6 +241,10 @@ def encode_value(value: Any, kind: str) -> dict[str, Any] | None:
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError("INT transport value must be an integer")
         return {"type": kind, "value": value}
+    if kind == "BOOLEAN":
+        if not isinstance(value, bool):
+            raise TypeError("BOOLEAN transport value must be a boolean")
+        return {"type": kind, "value": value}
     if kind == "FLOAT":
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             raise TypeError("FLOAT transport value must be finite")
@@ -220,7 +257,7 @@ def decode_value(data: Any, expected_kind: str) -> Any:
         return None
     if not isinstance(data, dict) or data.get("type") != expected_kind:
         raise ValueError(f"Expected {expected_kind} transport value")
-    if expected_kind in ("IMAGE", "MASK"):
+    if expected_kind in ("IMAGE", "MASK", "TENSOR"):
         torch = _torch()
         dtype_name = data.get("dtype")
         if dtype_name not in _ALLOWED_FLOAT_DTYPES:
@@ -256,18 +293,21 @@ def encode_request_payload(payload: dict[str, Any]) -> bytes:
     if len(body) > MAX_REQUEST_BYTES:
         raise ValueError(
             f"Image-list complete JSON/base64 request is {len(body)} bytes; "
-            f"limit is {MAX_REQUEST_BYTES} bytes (image/reference/mask combined)"
+            f"limit is {MAX_REQUEST_BYTES} bytes (image/mask/values combined)"
         )
     return body
 
 
 def encode_item(item: dict[str, Any]) -> dict[str, Any]:
+    values = item.get("values") or {}
+    encoded_values = {}
+    for name, value in values.items():
+        if name not in VALUE_NAMES:
+            raise ValueError(f"Unknown Start value slot {name!r}")
+        encoded_values[name] = encode_value(value, value_kind(value, name))
     return {"image": encode_value(item["image"], "IMAGE"),
-            "reference_image": encode_value(item.get("reference_image"), "IMAGE"),
             "mask": encode_value(item.get("mask"), "MASK"),
-            "text": encode_value(item.get("text"), "STRING"),
-            "strength": encode_value(item.get("strength"), "FLOAT"),
-            "seed": encode_value(item.get("seed"), "INT"),
+            "values": encoded_values,
             "index": int(item["index"])}
 
 
@@ -280,18 +320,22 @@ def decode_item(data: Any) -> dict[str, Any]:
     image = decode_value(data.get("image"), "IMAGE")
     if image is None or image.ndim != 4 or image.shape[0] != 1 or image.shape[-1] not in (3, 4):
         raise ValueError("item.image must contain exactly one RGB/RGBA image frame")
-    reference = decode_value(data.get("reference_image"), "IMAGE")
-    if reference is not None and (reference.ndim != 4 or reference.shape[0] != 1 or reference.shape[-1] not in (3, 4)):
-        raise ValueError("item.reference_image must contain exactly one RGB/RGBA image frame")
     mask = decode_value(data.get("mask"), "MASK")
     if mask is not None and (mask.ndim != 3 or mask.shape[0] != 1):
         raise ValueError("item.mask must contain exactly one MASK frame")
-    return {"image": image,
-            "reference_image": reference,
-            "mask": mask,
-            "text": decode_value(data.get("text"), "STRING"),
-            "strength": decode_value(data.get("strength"), "FLOAT"),
-            "seed": decode_value(data.get("seed"), "INT"), "index": index}
+    raw_values = data.get("values", {})
+    if not isinstance(raw_values, dict):
+        raise ValueError("item.values must be an object")
+    values = {}
+    for name, encoded in raw_values.items():
+        if name not in VALUE_NAMES:
+            raise ValueError(f"item.values has unknown slot {name!r}")
+        if not isinstance(encoded, dict) or encoded.get("type") not in _VALUE_KINDS:
+            raise ValueError(f"item.values.{name} has an unsupported type")
+        values[name] = decode_value(encoded, encoded["type"])
+        if values[name] is None:
+            raise ValueError(f"item.values.{name} is empty")
+    return {"image": image, "mask": mask, "values": values, "index": index}
 
 
 def _sweep_worker_items() -> None:
@@ -533,8 +577,10 @@ def build_worker_prompt(prompt: dict[str, Any], region: dict[str, Any], item_tok
     _direct_link(prompt[end_id].get("inputs", {}).get("context"), prompt, end_id, "context")
     kept = {node_id: json.loads(json.dumps(prompt[node_id])) for node_id in region["node_ids"]}
     start_inputs = kept[start_id].setdefault("inputs", {})
-    for name in ("images", "reference_image", "mask", "text", "strength", "seed"):
-        start_inputs.pop(name, None)
+    # Per-item data reaches workers only through the staged item token.
+    for name in list(start_inputs):
+        if name in ("images", "mask") or name.startswith(VALUES_INPUT + "."):
+            start_inputs.pop(name)
     start_inputs.update({"worker_item_token": item_token, "worker_context_id": context_id})
     end_inputs = kept[end_id].setdefault("inputs", {})
     end_inputs.update({"worker_result_token": item_token,

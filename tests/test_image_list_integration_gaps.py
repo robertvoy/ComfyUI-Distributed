@@ -154,11 +154,9 @@ class SchedulingBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 runtime.validate_image_list_regions(prompt)
 
     def test_shared_scalars_are_validated_before_dispatch(self):
-        for kwargs in ({'text': 4, 'text_mode': 'shared'},
-                       {'strength': float('nan'), 'strength_mode': 'shared'},
-                       {'seed': True, 'seed_mode': 'shared'}):
+        for value in (float('nan'), object(), torch.zeros(2, dtype=torch.int32)):
             with self.assertRaises(TypeError):
-                runtime.normalize_image_list_inputs(torch.zeros((1, 2, 2, 3)), **kwargs)
+                runtime.normalize_image_list_inputs(torch.zeros((1, 2, 2, 3)), values={'value_1': [value]})
 
     def test_three_sequential_regions_can_share_worker_loader(self):
         prompt = graph_two_sequential_regions()

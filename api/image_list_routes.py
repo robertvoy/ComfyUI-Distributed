@@ -6,6 +6,7 @@ import server
 
 from ..image_list.runtime import (
     MAX_REQUEST_BYTES,
+    PROTOCOL_VERSION,
     decode_result,
     delete_worker_item,
     set_master_result,
@@ -34,7 +35,7 @@ async def _json_body(request):
 async def image_list_capabilities_endpoint(_request):
     return web.json_response({
         "supported": True,
-        "protocol_version": 1,
+        "protocol_version": PROTOCOL_VERSION,
         "node_ids": ["DistributedImageListStart", "DistributedImageListEnd"],
         "transport": "typed-float-tensor-json-v1",
     })

@@ -63,6 +63,17 @@ class TestImageSource:
                      ('image', 'reference_image', 'mask', 'text', 'strength', 'seed'))
 
 
+class TestSharedFlag:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {'required': {}}
+    RETURN_TYPES = ('BOOLEAN',)
+    FUNCTION = 'run'
+    def run(self):
+        assert not WORKER, 'shared value source leaked into worker prompt'
+        return (True,)
+
+
 class TestCachedModel:
     @classmethod
     def INPUT_TYPES(cls):
@@ -81,10 +92,10 @@ class TestImageOperation:
                              'text': ('STRING', {'forceInput': True}),
                              'strength': ('FLOAT', {'forceInput': True}),
                              'seed': ('INT', {'forceInput': True}), 'index': ('INT', {'forceInput': True}),
-                             'model': ('MODEL',)}}
+                             'flag': ('BOOLEAN', {'forceInput': True}), 'model': ('MODEL',)}}
     RETURN_TYPES = ('IMAGE', 'MASK', 'STRING')
     FUNCTION = 'run'
-    def run(self, image, reference_image, mask, text, strength, seed, index, model):
+    def run(self, image, reference_image, mask, text, strength, seed, index, flag, model):
         assert WORKER or ALLOW_MASTER, 'per-image branch executed in orchestrator-only mode'
         BRANCH_CALLS.append(index)
         # Sleep in short chunks so the real Comfy interrupt signal can be tested.
@@ -93,6 +104,7 @@ class TestImageOperation:
             comfy.model_management.throw_exception_if_processing_interrupted()
             time.sleep(0.01)
         assert seed == 100 + index
+        assert flag is True
         assert text == f'item-{index}'
         assert strength == (index + 1) / 16
         assert torch.all(reference_image == strength)
@@ -119,7 +131,7 @@ async def setup():
     module = sys.modules[str(ROOT).replace('.', '_x_')]
     nodes.NODE_CLASS_MAPPINGS.update(TestImageSource=TestImageSource,
                                    TestImageOperation=TestImageOperation, TestCapture=TestCapture,
-                                   TestCachedModel=TestCachedModel)
+                                   TestCachedModel=TestCachedModel, TestSharedFlag=TestSharedFlag)
     # Match the CORS-enabled direct-worker launch contract for canvas probes.
     app = web.Application(middlewares=[server.create_cors_middleware('*')])
     # Register the actual feature routes, not test replacements.
@@ -206,19 +218,22 @@ async def worker_main():
 def graph(callback, worker_ids):
     return {
         '1': {'class_type': 'TestImageSource', 'inputs': {}},
+        # Generic Autogrow value slots carry per-item reference images, text,
+        # strength and seed (one value per image), plus a shared boolean.
         '2': {'class_type': 'DistributedImageListStart', 'inputs': {
-            'images': ['1', 0], 'reference_image': ['1', 1], 'mask': ['1', 2], 'text': ['1', 3],
-            'strength': ['1', 4], 'seed': ['1', 5],
-            'reference_image_mode': 'per_item', 'mask_mode': 'per_item', 'text_mode': 'per_item',
-            'strength_mode': 'per_item', 'seed_mode': 'per_item',
+            'images': ['1', 0], 'mask': ['1', 2],
+            'values.value_1': ['1', 1], 'values.value_2': ['1', 3],
+            'values.value_3': ['1', 4], 'values.value_4': ['1', 5], 'values.value_5': ['7', 0],
             'image_list_enabled_worker_ids': json.dumps(worker_ids), 'image_list_master_callback': callback}},
         '3': {'class_type': 'TestImageOperation', 'inputs': {
-            key: ['2', index] for key, index in [('image', 0), ('reference_image', 1), ('mask', 2),
-                ('text', 3), ('strength', 4), ('seed', 5), ('index', 6)]} | {'model': ['6', 0]}},
+            key: ['2', index] for key, index in [('image', 0), ('mask', 1), ('index', 2),
+                ('reference_image', 4), ('text', 5), ('strength', 6), ('seed', 7), ('flag', 8)]}
+              | {'model': ['6', 0]}},
         '4': {'class_type': 'DistributedImageListEnd', 'inputs': {
-            'images': ['3', 0], 'masks': ['3', 1], 'texts': ['3', 2], 'context': ['2', 7]}},
+            'images': ['3', 0], 'masks': ['3', 1], 'texts': ['3', 2], 'context': ['2', 3]}},
         '5': {'class_type': 'TestCapture', 'inputs': {'images': ['4', 0], 'masks': ['4', 1], 'texts': ['4', 2]}},
         '6': {'class_type': 'TestCachedModel', 'inputs': {}},
+        '7': {'class_type': 'TestSharedFlag', 'inputs': {}},
     }
 
 
@@ -325,10 +340,9 @@ async def coordinator():
             previous = '1'
             for start, end in [('2', '3'), ('4', '5'), ('6', '7')]:
                 chained[start] = {'class_type': 'DistributedImageListStart', 'inputs': {
-                    'images': [previous, 0], 'reference_image_mode': 'per_item', 'mask_mode': 'per_item',
-                    'text_mode': 'shared', 'strength_mode': 'shared', 'seed_mode': 'shared'}}
+                    'images': [previous, 0]}}
                 chained[end] = {'class_type': 'DistributedImageListEnd', 'inputs': {
-                    'images': [start, 0], 'context': [start, 7]}}
+                    'images': [start, 0], 'context': [start, 3]}}
                 previous = end
             chained['8'] = {'class_type': 'TestCapture', 'inputs': {
                 'images': ['7', 0], 'masks': ['7', 1], 'texts': ['7', 2]}}

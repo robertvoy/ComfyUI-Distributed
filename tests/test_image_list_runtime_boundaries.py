@@ -237,7 +237,7 @@ class RuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(single)['item']['image']['dtype'], 'float32')
         self.rt.MAX_REQUEST_BYTES = len(single)
         self.assertEqual(self.rt.encode_request_payload(payload), single)
-        item['reference_image'] = item['image']
+        item['values'] = {'value_1': item['image']}
         item['mask'] = torch.zeros((1, 4, 4))
         payload['item'] = self.rt.encode_item(item)
         with self.assertRaisesRegex(ValueError, 'complete.*request'):

@@ -25,7 +25,7 @@ class MasterSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.prompt = {
             "1": {"class_type": "EmptyImage", "inputs": {}},
             "2": {"class_type": "DistributedImageListStart", "inputs": {"images": ["1", 0]}},
-            "3": {"class_type": "DistributedImageListEnd", "inputs": {"images": ["2", 0], "context": ["2", 7]}},
+            "3": {"class_type": "DistributedImageListEnd", "inputs": {"images": ["2", 0], "context": ["2", 3]}},
         }
 
     async def queue(self, **kwargs):
