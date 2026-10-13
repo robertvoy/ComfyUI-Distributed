@@ -332,6 +332,10 @@ async def orchestrate_distributed_execution(
                           for node in prompt_obj.values())
     target_kwargs = {}
     if image_list_mode:
+        if any(isinstance(node, dict) and node.get("class_type") in {
+                "DistributedCollector", "DistributedMediaCollector", "UltimateSDUpscaleDistributed"
+        } for node in prompt_obj.values()):
+            raise ValueError("Distributed Image List cannot be mixed with other distributed collectors")
         prompt_obj, outer_targets = prepare_image_list_execution(prompt_obj)
         target_kwargs["partial_execution_targets"] = outer_targets
     prompt_index = PromptIndex(prompt_obj)
