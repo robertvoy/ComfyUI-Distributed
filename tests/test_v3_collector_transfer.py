@@ -70,6 +70,7 @@ def v3(monkeypatch):
     module(f"{PKG}.nodes.distributed_upscale", UltimateSDUpscaleDistributed=object)
     module(f"{PKG}.nodes.collector", DistributedCollectorNode=CollectorRuntime)
     module(f"{PKG}.nodes.image_list", DistributedImageListStart=object, DistributedImageListEnd=object)
+    module(f"{PKG}.nodes.media_collector", DistributedMediaCollector=object)
     module("comfy", __path__=[])
     module("comfy.samplers", KSampler=types.SimpleNamespace(SAMPLERS=["euler"], SCHEDULERS=["normal"]))
     module("comfy_api", __path__=[])

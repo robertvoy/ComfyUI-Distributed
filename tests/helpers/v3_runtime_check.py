@@ -45,7 +45,7 @@ ADDED_OPTIONAL_INPUTS = {
 
 # Nodes added after the V1 baseline; not part of saved-workflow contracts.
 # DistributedWorkerSink is internal (dev-only) and only inserted by the master.
-ADDED_NODES = {'DistributedWorkerSink', 'DistributedImageListStart', 'DistributedImageListEnd'}
+ADDED_NODES = {'DistributedWorkerSink', 'DistributedImageListStart', 'DistributedImageListEnd', 'DistributedMediaCollector'}
 
 
 def normalized_input(value):
@@ -366,10 +366,14 @@ async def main():
     extension = await module.comfy_entrypoint()
     classes = await extension.get_node_list()
     mapping = {cls.GET_SCHEMA().node_id: cls for cls in classes}
-    assert len(classes) == len(mapping) == len(BASELINE) + len(ADDED_NODES) == 11
+    assert len(classes) == len(mapping) == len(BASELINE) + len(ADDED_NODES)
     assert set(mapping) == set(BASELINE) | ADDED_NODES
     for node_id in ADDED_NODES:
         assert nodes.NODE_CLASS_MAPPINGS[node_id] is mapping[node_id]
+    media_info = mapping['DistributedMediaCollector'].GET_NODE_INFO_V1()
+    assert media_info['output'] == ['IMAGE', 'AUDIO', 'MASK', 'STRING', 'VIDEO'], media_info
+    assert all(media_info['output_is_list']), media_info
+    assert media_info['input']['optional']['texts'][1]['forceInput'] is True
     sink_info = mapping['DistributedWorkerSink'].GET_NODE_INFO_V1()
     assert sink_info['output_node'] and sink_info['dev_only'], sink_info
     for node_id, cls in mapping.items():

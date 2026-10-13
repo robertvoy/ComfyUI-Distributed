@@ -84,6 +84,14 @@ def validate_serverless_worker(worker: dict) -> dict:
     if "enabled" in result and type(result["enabled"]) is not bool:
         raise ServerlessConfigError("enabled must be a boolean")
 
+    # Omission preserves old saved records and means legacy-image-v1. Selecting
+    # comfy-media-v1 declares an installed endpoint bridge, not health detection;
+    # its schema/representations/limits are fixed by serverless_bridge/contract.py.
+    if "media_profile" in result:
+        profile = result["media_profile"]
+        if not isinstance(profile, str) or profile not in ("legacy-image-v1", "comfy-media-v1"):
+            raise ServerlessConfigError("media_profile must be legacy-image-v1 or comfy-media-v1")
+
     for field, (minimum, maximum, default) in _NUMERIC_FIELDS.items():
         value = result.get(field, default)
         if type(value) is not int or not minimum <= value <= maximum:

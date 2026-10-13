@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import time
 import uuid
 
@@ -85,6 +86,10 @@ def _resolve_enabled_workers(config, requested_ids=None):
         if worker.get("type") == "serverless":
             from ..utils.serverless_config import validate_serverless_worker
             pool = validate_serverless_worker(worker)
+            if pool.get("media_profile") == "comfy-media-v1":
+                from ..serverless_bridge.contract import identifier
+                # Do not repair malformed media identities by stripping them.
+                identifier(pool["id"])
             for slot in range(pool["jobs_per_run"]):
                 workers.append(dict(pool, pool_id=worker_id, id=f"serverless:{worker_id}:{slot + 1}",
                                     name=f"{pool.get('name', worker_id)} / job {slot + 1}"))
@@ -147,11 +152,45 @@ def _is_load_balance_enabled(value):
 
 
 def _prompt_requests_load_balance(prompt_index):
-    for node_id in prompt_index.nodes_for_class("DistributedCollector"):
+    collector_ids = (prompt_index.nodes_for_class("DistributedCollector")
+                     + prompt_index.nodes_for_class("DistributedMediaCollector"))
+    for node_id in collector_ids:
         inputs = prompt_index.inputs_by_node.get(node_id, {})
         if _is_load_balance_enabled(inputs.get("load_balance", False)):
             return True
     return False
+
+
+def _validate_media_workers(prompt_index, workers):
+    """Reject incompatible selections before probing, pruning or dispatching.
+
+    Typed collectors currently have only a master/serverless transport. Check
+    all selected workers, not just reachable or load-balanced participants, so
+    a bad selection cannot silently turn into a different execution mode.
+    """
+    typed = bool(prompt_index.nodes_for_class("DistributedMediaCollector"))
+    if typed and (prompt_index.nodes_for_class("DistributedCollector")
+                  or prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")):
+        raise ValueError(
+            "DistributedMediaCollector cannot be mixed with DistributedCollector or "
+            "UltimateSDUpscaleDistributed in one prompt"
+        )
+    for worker in workers:
+        if worker.get("type") != "serverless":
+            if typed:
+                raise ValueError(
+                    "DistributedMediaCollector does not support selected direct workers; "
+                    "use master execution or comfy-media-v1 serverless pools"
+                )
+            continue
+        profile = worker.get("media_profile", "legacy-image-v1")
+        if profile not in ("legacy-image-v1", "comfy-media-v1"):
+            raise ValueError("Unsupported serverless media_profile")
+        if typed != (profile == "comfy-media-v1"):
+            raise ValueError(
+                "DistributedMediaCollector requires comfy-media-v1 serverless pools; "
+                "legacy collectors require legacy-image-v1"
+            )
 
 
 async def _prepare_worker_payload(
@@ -169,11 +208,34 @@ async def _prepare_worker_payload(
 ):
     """Prepare one worker prompt payload with bounded concurrency and media-sync timeout."""
     async with worker_prep_semaphore:
+        _validate_media_workers(prompt_index, [worker])
         worker_prompt = prompt_index.copy_prompt()
         if worker.get("type") == "serverless":
+            from .orchestration.runpod_client import serialize_request
+            if worker.get("media_profile", "legacy-image-v1") == "comfy-media-v1":
+                from ..serverless_bridge.contract import PROFILE, VERSION
+                from .orchestration.serverless_media_prompt import compile_media_prompt
+                from .orchestration.serverless_typed_inputs import prepare_media_inputs
+                # The legacy pruner only recognizes Collector/Upscale roots.
+                # The typed compiler validates the complete private graph and
+                # prunes it itself, retaining every connected typed branch.
+                worker_prompt = apply_participant_overrides(
+                    worker_prompt, worker["id"], enabled_ids, job_id_map,
+                    "", delegate_master, prompt_index,
+                )
+                request_id = str(uuid.uuid4())
+                workflow, manifest = compile_media_prompt(worker_prompt, request_id)
+                images, artifacts, refs = await prepare_media_inputs(workflow)
+                media = {
+                    "version": VERSION, "profile": PROFILE, "request_id": request_id,
+                    "artifacts": artifacts, "inputs": refs, "outputs": copy.deepcopy(manifest),
+                }
+                serialize_request(workflow, images, worker["timeout_seconds"], media=media)
+                return worker, {"worker": worker, "workflow": workflow, "manifest": manifest,
+                                "images": images, "media": media}
+
             from .orchestration.serverless_prompt import compile_serverless_prompt
             from .orchestration.serverless_media import prepare_images
-            from .orchestration.runpod_client import serialize_request
             worker_prompt = apply_participant_overrides(
                 prune_prompt_for_worker(worker_prompt), worker["id"], enabled_ids,
                 job_id_map, "", delegate_master, prompt_index,
@@ -266,21 +328,28 @@ async def orchestrate_distributed_execution(
     ) = _resolve_orchestration_limits(config)
     requested_ids = enabled_worker_ids if enabled_worker_ids is not None else None
     prompt_index = PromptIndex(prompt_obj)
+    typed_media_mode = bool(prompt_index.nodes_for_class("DistributedMediaCollector"))
+    if typed_media_mode:
+        from ..serverless_bridge.contract import identifier
+        # PromptIndex's JSON copy would otherwise turn integer keys into strings.
+        for node_id in prompt_obj:
+            identifier(node_id)
     image_list_start_ids = prompt_index.nodes_for_class("DistributedImageListStart")
     image_list_mode = bool(image_list_start_ids)
     if image_list_mode:
         # Validate before probing or queueing anything so malformed boundaries and
         # old worker releases fail before any upstream image is materialized.
-        validate_image_list_regions(prompt_obj)
         other_distributed = (
             prompt_index.nodes_for_class("DistributedCollector")
+            + prompt_index.nodes_for_class("DistributedMediaCollector")
             + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
         )
         if other_distributed:
             raise ValueError(
-                "Distributed Image List v1 cannot be mixed with Distributed Collector or "
-                "Ultimate SD Upscale nodes in one prompt"
+                "Distributed Image List v1 cannot be mixed with Distributed Collector, "
+                "DistributedMediaCollector or Ultimate SD Upscale nodes in one prompt"
             )
+        validate_image_list_regions(prompt_obj)
         configured_serverless = [
             str(worker.get("id")) for worker in config.get("workers", [])
             if worker.get("enabled", False)
@@ -300,7 +369,14 @@ async def orchestrate_distributed_execution(
                 "serverless pools are unsupported"
             )
     else:
+        if typed_media_mode and requested_ids is not None:
+            configured_ids = {worker.get("id") for worker in config.get("workers", [])}
+            if any(worker_id not in configured_ids for worker_id in requested_ids):
+                raise ValueError("Unknown explicitly selected media worker ID")
         workers = _resolve_enabled_workers(config, requested_ids)
+        _validate_media_workers(prompt_index, workers)
+        if typed_media_mode and delegate_master and not workers:
+            raise RuntimeError("Delegate-only DistributedMediaCollector requires a selected comfy-media-v1 pool")
     load_balance_requested = _prompt_requests_load_balance(prompt_index)
     trace_debug(
         execution_trace_id,
@@ -316,8 +392,8 @@ async def orchestrate_distributed_execution(
         ),
     )
 
-    # Keep the legacy Collector fallback, but never override image-list
-    # orchestrator-only mode merely because its direct workers are unavailable.
+    # Keep the legacy Collector fallback. Image-list and typed-media delegate
+    # modes must not silently enable master participation.
     if not image_list_mode and not workers and delegate_master:
         trace_debug(
             execution_trace_id,
@@ -332,6 +408,8 @@ async def orchestrate_distributed_execution(
         trace_execution_id=execution_trace_id,
         probe_concurrency=worker_probe_concurrency,
     )
+    if typed_media_mode and delegate_master and not active_workers:
+        raise RuntimeError("No selected comfy-media-v1 worker is reachable for delegate-only DistributedMediaCollector")
     if image_list_mode:
         from .orchestration.dispatch import preflight_image_list_workers
         if not active_workers and delegate_master:
@@ -430,7 +508,8 @@ async def orchestrate_distributed_execution(
     )
 
     if delegate_master and not image_list_mode:
-        collector_ids = find_nodes_by_class(master_prompt, "DistributedCollector")
+        collector_ids = (find_nodes_by_class(master_prompt, "DistributedCollector")
+                         + find_nodes_by_class(master_prompt, "DistributedMediaCollector"))
         upscale_nodes = find_nodes_by_class(master_prompt, "UltimateSDUpscaleDistributed")
         if upscale_nodes:
             debug_log(
@@ -477,6 +556,15 @@ async def orchestrate_distributed_execution(
     manager = None
     if serverless_jobs:
         from .orchestration.serverless_runtime import get_manager
+        # Repeat the manager's whole-batch identity/profile preflight *before*
+        # any direct dispatch, master queueing or collector queue allocation.
+        # Pure legacy jobs are a no-op in that validator; keep their path free
+        # of typed imports (and compatible with existing legacy media adapters).
+        for prepared in serverless_jobs:
+            if (prepared["worker"].get("media_profile", "legacy-image-v1") != "legacy-image-v1"
+                    or prepared.get("media") is not None):
+                from .orchestration.serverless_typed_results import validate_prepared_job
+                validate_prepared_job(prepared)
         manager = get_manager()
         manager.ensure_capacity(len(serverless_jobs))
 
@@ -522,8 +610,10 @@ async def orchestrate_distributed_execution(
             await manager.cancel(execution_id=execution_trace_id)
             async with prompt_server.distributed_jobs_lock:
                 for prepared in serverless_jobs:
-                    for binding in prepared["manifest"]:
-                        q = prompt_server.distributed_pending_jobs.get(binding["job_id"])
+                    # Typed manifests have several sockets per collector, but
+                    # each participant gets only one terminal collector event.
+                    for job_id in {binding["job_id"] for binding in prepared["manifest"]}:
+                        q = prompt_server.distributed_pending_jobs.get(job_id)
                         if q is not None:
                             q.put_nowait({"worker_id": prepared["worker"]["id"], "is_last": True,
                                           "serverless_error": "Serverless job setup failed; no automatic retry was attempted"})

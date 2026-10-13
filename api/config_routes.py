@@ -97,10 +97,11 @@ _SECRET_FIELDS = {"api_key", "clear_api_key"}
 _SERVERLESS_LOCAL_FIELDS = {"host", "port", "listen_port", "cuda_device", "extra_args"}
 _SERVERLESS_ONLY_FIELDS = {
     "provider", "endpoint_id", "jobs_per_run", "concurrency", "timeout_seconds", "api_key_configured",
+    "media_profile",
 }
 _SERVERLESS_CONFIG_FIELDS = {
     "worker_id", "type", "provider", "endpoint_id", "jobs_per_run", "concurrency",
-    "timeout_seconds", "enabled", "name", "api_key", "clear_api_key",
+    "timeout_seconds", "enabled", "name", "api_key", "clear_api_key", "media_profile",
 }
 
 
@@ -199,7 +200,13 @@ def _clean_bulk_type_conversions(old_workers, new_workers):
         if not isinstance(worker, dict) or worker.get("id") is None:
             continue
         old = old_by_id.get(str(worker["id"]))
-        if old is None or old.get("type") != "serverless" or worker.get("type") == "serverless":
+        if old is None or old.get("type") != "serverless":
+            continue
+        if worker.get("type") == "serverless":
+            # Older clients do not know this field. Only an explicit selection
+            # may change the endpoint contract, including on bulk saves.
+            if "media_profile" not in worker and "media_profile" in old:
+                worker["media_profile"] = old["media_profile"]
             continue
         converted = dict(worker)
         for field in _SERVERLESS_ONLY_FIELDS:
@@ -218,7 +225,10 @@ def _bulk_serverless_changes(old_workers, new_workers):
             if new is None or new.get("type") != "serverless":
                 _ensure_pool_idle(worker_id)
                 secret_ids.add(worker_id)
-            elif old.get("endpoint_id") != new.get("endpoint_id"):
+            elif (
+                old.get("endpoint_id") != new.get("endpoint_id")
+                or old.get("media_profile", "legacy-image-v1") != new.get("media_profile", "legacy-image-v1")
+            ):
                 _ensure_pool_idle(worker_id)
         elif new is not None and new.get("type") == "serverless":
             secret_ids.add(worker_id)
@@ -401,7 +411,7 @@ async def _update_worker_endpoint(request, secret_changes):
                 candidate.setdefault("provider", "runpod")
                 candidate.setdefault("enabled", False)
                 # Legacy "concurrency" is accepted (see _SERVERLESS_CONFIG_FIELDS) but ignored.
-                for field in ("provider", "endpoint_id", "jobs_per_run", "timeout_seconds", "enabled", "name"):
+                for field in ("provider", "endpoint_id", "jobs_per_run", "timeout_seconds", "enabled", "name", "media_profile"):
                     if field in data:
                         candidate[field] = data[field]
                 candidate = _clean_serverless_worker(candidate)
@@ -424,8 +434,12 @@ async def _update_worker_endpoint(request, secret_changes):
                     current_type == "serverless"
                     and existing.get("endpoint_id") != validated.get("endpoint_id")
                 )
+                media_profile_changed = (
+                    current_type == "serverless"
+                    and existing.get("media_profile", "legacy-image-v1") != validated.get("media_profile", "legacy-image-v1")
+                )
                 if current_type == "serverless" and (
-                    endpoint_changed or next_secret != prior_secret
+                    endpoint_changed or media_profile_changed or next_secret != prior_secret
                 ):
                     _ensure_pool_idle(worker_id)
 
