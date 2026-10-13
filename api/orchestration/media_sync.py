@@ -143,6 +143,30 @@ async def fetch_worker_path_separator(worker, trace_execution_id=None):
         return None
 
 
+async def fetch_worker_has_node(worker, node_class, trace_execution_id=None):
+    """Best-effort check that a worker has ``node_class`` registered.
+
+    Uses ComfyUI's ``GET /object_info/{node_class}``, which returns ``{}`` for
+    unknown classes. Any failure counts as "not available" so callers fall
+    back to nodes every ComfyUI install has.
+    """
+    url = build_worker_url(worker, f"/object_info/{node_class}")
+    session = await get_client_session()
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return False
+            payload = await resp.json()
+            return isinstance(payload, dict) and node_class in payload
+    except Exception as exc:
+        message = f"Failed to probe node '{node_class}' on worker {worker.get('id')}: {exc}"
+        if trace_execution_id:
+            trace_debug(trace_execution_id, message)
+        else:
+            debug_log(f"[Distributed] {message}")
+        return False
+
+
 async def _upload_media_to_worker(worker, filename, file_bytes, file_hash, mime_type, trace_execution_id=None):
     """Upload one media file to worker iff missing or hash-mismatched."""
     session = await get_client_session()
