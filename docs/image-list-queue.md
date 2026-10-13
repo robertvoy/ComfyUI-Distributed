@@ -1,10 +1,10 @@
 # Dynamic image-list queue
 
-Process a list of images across **the master and direct local or remote ComfyUI workers** without assigning fixed chunks to each participant.
+Process a list of images across the master and direct local or remote ComfyUI workers without assigning fixed chunks to each participant.
 
 The master evaluates the input list once. By default, the master and each selected idle worker receive one image job at a time; when a participant finishes, it gets the next unassigned image. Faster participants can therefore process more images. The master restores input order before running downstream nodes.
 
-The existing **Orchestrator Only** setting (`settings.master_delegate_only`) excludes the master from per-image processing. It still creates the input list and runs downstream nodes. API callers can override the setting for a run with `delegate_master`. There is no second image-list-specific toggle.
+The existing **Orchestrator Only** setting (`settings.master_delegate_only`) excludes the master from per-image processing. The master still creates the input list and runs downstream nodes. API callers can override the setting for a run with `delegate_master`. There is no second image-list-specific toggle.
 
 ## Wiring
 
@@ -54,13 +54,13 @@ Values that cannot be transported exactly (models, latents, conditioning and oth
 
 End accepts `images`, optional `masks` / `texts`, and `context`. It returns `image_list`, `masks`, and `texts` in original item order. Each job must produce exactly one image, at most one mask, and at most one text value. Unconnected optional outputs contain `None` entries.
 
-Models are **loaded and cached on each processing participant**, not serialized between machines. Connect loader outputs directly to the processing nodes. The master needs the region's model files when participating, as does each selected worker. **The master still validates the prompt:** it needs the relevant node definitions and any model-name/file availability required by their validation (including combo lists). This is not a model-free-master guarantee.
+Models are loaded and cached on each processing participant, not serialized between machines. Connect loader outputs directly to the processing nodes. The master needs the region's model files when participating, as does each selected worker. The master still validates the prompt: it needs the relevant node definitions and any model-name/file availability required by their validation (including combo lists). This is not a model-free-master guarantee.
 
 Per-image data must pass through Start; do not bypass it with upstream images, latents or generated batches connected directly into the processing region. Shared dependencies across Start are restricted to registered model outputs or scalar constants, not arbitrary image-producing leaf nodes.
 
-End's optional `texts` is a connection-only socket. For workflows saved before this fix, recreate End and reconnect its wires if an old text widget or literal `texts: ""` remains in the compiled prompt. Arbitrary text literals are not accepted at End.
+End's optional `texts` is a connection-only socket. For workflows saved before this socket became connection-only, recreate End and reconnect its wires if an old text widget or literal `texts: ""` remains in the compiled prompt. Arbitrary text literals are not accepted at End.
 
-File-based dependencies keep ComfyUI's `[output]` / `[temp]` root annotations while being read on the master. Their worker copies use separate content-addressed paths under `input/distributed-media/`; each worker's rewritten prompt is reused across items without reusing item tokens.
+File-based dependencies keep ComfyUI's `[output]` / `[temp]` root annotations and are read on the master. Their worker copies use separate content-addressed paths under `input/distributed-media/`; each worker's rewritten prompt is reused across items without reusing item tokens.
 
 ## Scope and failure behavior
 
@@ -71,10 +71,10 @@ File-based dependencies keep ComfyUI's `[output]` / `[temp]` root annotations wh
 - Local items execute while the enclosing master prompt waits; they are not queued behind that prompt on the master's `/prompt` queue. The enclosed branch is not also evaluated as a full list by the outer prompt.
 - Start/End regions may be chained sequentially and share model-loader dependencies. Nested/overlapping per-image regions and data escaping a region without End are rejected. Collector and distributed-upscaler nodes cannot be mixed into the same prompt in this first version.
 - Output nodes inside a region are rejected because ComfyUI would execute them independently on the master. Avoid other side-effecting processing nodes as well; save after End.
-- The entire input list is materialized before scheduling; this is not streaming input. The limit is 4,096 frames. Remote transport preserves floating-point tensor dtype and values rather than encoding to lossy images. Each transported tensor is limited to 50 MiB, and the complete JSON/base64 HTTP request to 101 MiB; image/mask/value combinations can hit the aggregate request limit first. In-process master items use tensors directly and do not incur those HTTP limits.
+- The entire input list is materialized before scheduling; this is not streaming input. The limit is 4,096 frames. Remote transport preserves floating-point tensor dtype and values rather than encoding to lossy images. Each transported tensor is limited to 50 MiB, and the complete JSON/base64 HTTP request to 101 MiB; image/mask/value combinations can hit the aggregate request limit first. In-process master items use tensors directly and are not subject to those HTTP limits.
 - Results are accepted once per item using assignment tokens. Missing, duplicate, malformed and wrong-index results fail rather than silently returning a partial list. No failed or ambiguous submission is retried automatically.
-- Worker errors fail the region. The worker timeout measures loss of evidence for the **owned prompt ID**, not maximum render duration. Pending/running evidence refreshes liveness; unrelated busy jobs and failed polls do not. Healthy cold loads and long renders can continue.
-- User interruption is checked during submission and result waiting. Cleanup targets only this region's acknowledged prompt IDs and staged input tokens. Submission may wait briefly for an acknowledgement before cancellation; remote transport and cleanup have finite time limits. Local cleanup stops at node/progress boundaries and waits for its execution thread to finish before the parent prompt can resume. A synchronous node that does not cooperate with cancellation can delay this beyond the configured deadline. Lost acknowledgements are **ambiguous**, never retried automatically. Unreachable cleanup is logged as unconfirmed and may require checking the worker manually; cancellation does not guarantee remote termination through a broken network.
+- Worker errors fail the region. The worker timeout measures loss of evidence for the owned prompt ID, not maximum render duration. Pending/running evidence refreshes liveness; unrelated busy jobs and failed polls do not. Healthy cold loads and long renders can continue.
+- User interruption is checked during submission and result waiting. Cleanup targets only this region's acknowledged prompt IDs and staged input tokens. Submission may wait briefly for an acknowledgement before cancellation; remote transport and cleanup have finite time limits. Local cleanup stops at node/progress boundaries and waits for its execution thread to finish before the parent prompt can resume. A synchronous node that does not cooperate with cancellation can delay this beyond the configured deadline. Lost acknowledgements are ambiguous, never retried automatically. Unreachable cleanup is logged as unconfirmed and may require checking the worker manually; cancellation does not guarantee remote termination through a broken network.
 - State is in memory. Restarting the master does not resume an interrupted region. Abandoned master contexts and expired worker staging are actively swept on the server loop; active/queued master work is protected from age-only expiry. End also removes its context on success, failure or interruption. This releases feature-owned references, not ComfyUI's separate execution cache.
 
 ### Time and size limits

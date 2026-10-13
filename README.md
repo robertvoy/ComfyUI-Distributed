@@ -28,7 +28,7 @@
 - Handles single images and videos
 
 #### Dynamic Image-List Processing
-- Schedule one image at a time to the next available direct worker; collect results in input order
+- Process a whole image list in parallel: the master and every worker take the next image when they free up, and results come back in input order
 - Use **Distributed Image List Start / End** around a per-image processing region
 - [Wiring, supported inputs, and first-version limits](/docs/image-list-queue.md)
 
@@ -48,7 +48,7 @@ ComfyUI Distributed supports four types of workers:
 - **Local Workers** - Additional GPUs on the same machine (auto-configured on first launch)
 - **Remote Workers** - GPUs on other computers in your network
 - **Cloud Workers** - GPUs hosted on a cloud service like Runpod, accessible via secure tunnels
-- **Serverless (Runpod)** - Queue-based Runpod endpoints for image Collector jobs; no Distributed install or inbound tunnel on workers. [Setup, endpoint contract, and preview limitations](/docs/serverless-workers.md).
+- **Serverless (Runpod)** - Queue-based endpoints for image Collector jobs; no Distributed install or inbound tunnel on the endpoint. [Setup, endpoint contract, and preview limitations](/docs/serverless-workers.md).
 
 > For detailed setup instructions, see the [setup guide](/docs/worker-setup-guides.md)
 

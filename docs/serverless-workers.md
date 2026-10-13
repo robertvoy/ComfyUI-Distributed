@@ -3,7 +3,7 @@
 A **Serverless (Runpod)** worker is a queue-based endpoint, not a permanent
 ComfyUI machine. Runpod chooses the actual GPU workers. Distributed submits one
 normal ComfyUI API workflow per requested image and collects the returned images.
-The endpoint workers **do not need ComfyUI-Distributed installed**.
+The endpoint workers do not need ComfyUI-Distributed installed.
 
 ## Setup
 
@@ -93,7 +93,7 @@ incomplete serverless batch.
 - A zero-worker endpoint can be healthy: Runpod scales from zero on submission.
 - Interrupting a collector or using the panel cancellation action requests
   cancellation only for jobs submitted by this master. It never purges the endpoint.
-- A network failure during submission is **not retried automatically**: the job
+- A network failure during submission is not retried automatically: the job
   may already be billable. Check the Runpod job list before queuing again.
 
 ## Persistence and recovery
@@ -107,7 +107,7 @@ available on Windows.
 
 `distributed/serverless/jobs.json` records provider job IDs and sanitized states,
 not image data, workflow payloads, or API keys. A restarted master cannot resume
-an interrupted collector. It does **not** automatically resubmit jobs. Retained
+an interrupted collector. It does not automatically resubmit jobs. Retained
 IDs are available through `/distributed/serverless/status/<worker_id>`; the worker's
 cancel action can request cancellation of known pre-restart jobs. If no job ID
 was received, check Runpod manually. Cancellation is best-effort and may race
@@ -127,7 +127,7 @@ Recovery uses the same trusted-master API as the panel; it never resubmits a job
    every unresolved record with its local `record_id`, provider `job_id` (if
    received), and state. These records remain visible if endpoint health fails.
 2. Request cancellation from the panel, or send
-   `POST /distributed/serverless/reconcile` with the body below to **read** the
+   `POST /distributed/serverless/reconcile` with the body below to read the
    retained provider IDs. Only a confirmed terminal state releases protection.
    Network errors, expired IDs, or ambiguous responses do not.
 
@@ -143,7 +143,7 @@ Recovery uses the same trusted-master API as the panel; it never resubmits a job
    {"worker_id": "YOUR_WORKER_ID", "record_id": "LOCAL_RECORD_ID", "provider_checked": true}
    ```
 
-   This records `RESOLVED`: an explicit operator acknowledgment, **not** a
+   This records `RESOLVED`: an explicit operator acknowledgment, not a
    provider-confirmed cancellation. It cannot resolve a live local task and does
    not stop remote compute. It releases the record's reservation and may let
    already-waiting jobs proceed. Never automate this acknowledgment as a retry
