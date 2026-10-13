@@ -38,6 +38,7 @@ from .orchestration.prompt_transform import (
     _resolve_direct_workers_for_image_list,
 )
 from ..image_list.runtime import validate_image_list_regions
+from ..image_list.execution_plan import prepare_image_list_execution
 
 
 prompt_server = server.PromptServer.instance
@@ -265,13 +266,17 @@ async def orchestrate_distributed_execution(
         media_sync_timeout_seconds,
     ) = _resolve_orchestration_limits(config)
     requested_ids = enabled_worker_ids if enabled_worker_ids is not None else None
+    image_list_mode = any(isinstance(node, dict) and node.get("class_type") == "DistributedImageListStart"
+                          for node in prompt_obj.values())
+    target_kwargs = {}
+    if image_list_mode:
+        prompt_obj, outer_targets = prepare_image_list_execution(prompt_obj)
+        target_kwargs["partial_execution_targets"] = outer_targets
     prompt_index = PromptIndex(prompt_obj)
-    image_list_start_ids = prompt_index.nodes_for_class("DistributedImageListStart")
-    image_list_mode = bool(image_list_start_ids)
     if image_list_mode:
         # Validate before probing or queueing anything so malformed boundaries and
         # old worker releases fail before any upstream image is materialized.
-        validate_image_list_regions(prompt_obj)
+        validate_image_list_regions(prompt_obj, explicit_targets=True)
         other_distributed = (
             prompt_index.nodes_for_class("DistributedCollector")
             + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
@@ -409,6 +414,7 @@ async def orchestrate_distributed_execution(
             workflow_meta,
             client_id,
             include_queue_metadata=True,
+            **target_kwargs,
         )
         return (
             queue_result["prompt_id"],
@@ -506,6 +512,7 @@ async def orchestrate_distributed_execution(
             workflow_meta,
             client_id,
             include_queue_metadata=True,
+            **target_kwargs,
         )
     except Exception:
         if serverless_jobs:
