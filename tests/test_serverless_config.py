@@ -54,7 +54,6 @@ class ValidateServerlessWorkerTests(unittest.TestCase):
                 "type": "serverless",
                 "provider": "runpod",
                 "jobs_per_run": 1,
-                "concurrency": 1,
                 "timeout_seconds": 1800,
             },
         )
@@ -62,20 +61,34 @@ class ValidateServerlessWorkerTests(unittest.TestCase):
         self.assertEqual(worker, {"id": "worker-1", "endpoint_id": "ep_123-abc", "name": "GPU"})
 
     def test_accepts_inclusive_numeric_bounds(self):
-        for jobs, concurrency, timeout in ((1, 1, 30), (16, 16, 86400)):
-            with self.subTest(jobs=jobs, concurrency=concurrency, timeout=timeout):
+        for jobs, timeout in ((1, 30), (16, 86400)):
+            with self.subTest(jobs=jobs, timeout=timeout):
                 result = serverless_config.validate_serverless_worker(
                     {
                         "id": "worker-1",
                         "endpoint_id": "ep-123",
                         "jobs_per_run": jobs,
-                        "concurrency": concurrency,
                         "timeout_seconds": timeout,
                     }
                 )
                 self.assertEqual(result["jobs_per_run"], jobs)
-                self.assertEqual(result["concurrency"], concurrency)
                 self.assertEqual(result["timeout_seconds"], timeout)
+
+    def test_legacy_concurrency_is_accepted_and_dropped(self):
+        # Configs saved before Images per run replaced the separate setting.
+        for legacy in (1, 2, 16, 17, True, "3"):
+            with self.subTest(legacy=legacy):
+                result = serverless_config.validate_serverless_worker(
+                    {"id": "worker-1", "endpoint_id": "ep-123", "jobs_per_run": 2, "concurrency": legacy}
+                )
+                self.assertNotIn("concurrency", result)
+                self.assertEqual(result["jobs_per_run"], 2)
+
+    def test_endpoint_url_is_rejected_with_a_plain_message(self):
+        with self.assertRaisesRegex(ValueError, "not a URL"):
+            serverless_config.validate_serverless_worker(
+                {"id": "worker-1", "endpoint_id": "https://api.runpod.ai/v2/abc123/run"}
+            )
 
     def test_rejects_missing_or_empty_id_and_endpoint(self):
         base: dict[str, object] = {"id": "worker-1", "endpoint_id": "ep-123"}
@@ -138,7 +151,6 @@ class ValidateServerlessWorkerTests(unittest.TestCase):
         base = {"id": "worker-1", "endpoint_id": "ep-123"}
         invalid_values = {
             "jobs_per_run": (True, 1.0, 0, 17),
-            "concurrency": (False, 2.5, 0, 17),
             "timeout_seconds": (True, 30.0, 29, 86401),
         }
         for field, values in invalid_values.items():

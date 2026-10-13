@@ -37,6 +37,19 @@ export function isCloudWorker(extension, worker) {
     return worker.type === "cloud";
 }
 
+// Mirrors the backend rule in utils/serverless_config.py.
+const RUNPOD_ENDPOINT_ID_RE = /^[A-Za-z0-9_-]{1,200}$/;
+
+/**
+ * Accept a pasted Runpod API URL (https://api.runpod.ai/v2/<id>/...) and keep
+ * only the endpoint ID; anything else is returned trimmed for validation.
+ */
+export function normalizeRunpodEndpointId(value) {
+    const text = String(value || "").trim();
+    const match = text.match(/^(?:https?:\/\/)?api\.runpod\.ai\/v2\/([A-Za-z0-9_-]{1,200})(?:[/?#].*)?$/i);
+    return match ? match[1] : text;
+}
+
 function showServerlessValidationError(extension, detail) {
     extension.app.extensionManager.toast.add({
         severity: "error",
@@ -47,11 +60,10 @@ function showServerlessValidationError(extension, detail) {
 }
 
 async function saveServerlessWorkerSettings(extension, worker, workerId, name) {
-    const endpointId = String(document.getElementById(`endpoint-id-${workerId}`).value || "").trim();
+    const endpointId = normalizeRunpodEndpointId(document.getElementById(`endpoint-id-${workerId}`).value);
     const apiKey = document.getElementById(`api-key-${workerId}`).value || "";
     const clearApiKey = Boolean(document.getElementById(`clear-api-key-${workerId}`).checked);
     const jobsPerRun = Number(document.getElementById(`jobs-per-run-${workerId}`).value);
-    const concurrency = Number(document.getElementById(`concurrency-${workerId}`).value);
     const timeoutSeconds = Number(document.getElementById(`timeout-seconds-${workerId}`).value);
 
     if (!name.trim()) {
@@ -62,12 +74,15 @@ async function saveServerlessWorkerSettings(extension, worker, workerId, name) {
         showServerlessValidationError(extension, "Endpoint ID is required for Runpod serverless workers");
         return;
     }
-    if (!Number.isInteger(jobsPerRun) || jobsPerRun < 1 || jobsPerRun > 16) {
-        showServerlessValidationError(extension, "Jobs per run must be an integer between 1 and 16");
+    if (!RUNPOD_ENDPOINT_ID_RE.test(endpointId)) {
+        showServerlessValidationError(
+            extension,
+            "Enter just the Runpod endpoint ID (for example abc123xyz), not a URL. It is shown on the endpoint's page in the Runpod console.",
+        );
         return;
     }
-    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 16) {
-        showServerlessValidationError(extension, "Concurrency must be an integer between 1 and 16");
+    if (!Number.isInteger(jobsPerRun) || jobsPerRun < 1 || jobsPerRun > 16) {
+        showServerlessValidationError(extension, "Images per run must be a whole number from 1 to 16");
         return;
     }
     if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 30 || timeoutSeconds > 86400) {
@@ -83,7 +98,6 @@ async function saveServerlessWorkerSettings(extension, worker, workerId, name) {
         ...(apiKey.length > 0 && !clearApiKey ? { api_key: apiKey } : {}),
         ...(clearApiKey ? { clear_api_key: true } : {}),
         jobs_per_run: jobsPerRun,
-        concurrency,
         timeout_seconds: timeoutSeconds,
         // Never enable a serverless worker as a side effect of saving credentials.
         enabled: worker.enabled,
@@ -98,7 +112,8 @@ async function saveServerlessWorkerSettings(extension, worker, workerId, name) {
         worker.provider = "runpod";
         worker.endpoint_id = endpointId;
         worker.jobs_per_run = jobsPerRun;
-        worker.concurrency = concurrency;
+        // Replaced by a fixed backend limit; drop any value loaded from an older config.
+        delete worker.concurrency;
         worker.timeout_seconds = timeoutSeconds;
         worker.api_key_configured = clearApiKey
             ? false
@@ -178,6 +193,14 @@ export async function saveWorkerSettings(extension, workerId) {
         return;
     }
     const name = document.getElementById(`name-${workerId}`).value;
+    if (worker.type === "serverless" && worker.api_key_configured) {
+        // The backend deletes the stored key when a worker stops being serverless.
+        const proceed = confirm(
+            `Change "${worker.name}" from Serverless (Runpod) to another type?\n\n` +
+            "Its saved Runpod API key will be deleted. You would need to enter it again to switch back."
+        );
+        if (!proceed) return;
+    }
     const isRemote = workerType === "remote" || workerType === "cloud";
     const isCloud = workerType === "cloud";
     const rawHost = isRemote ? document.getElementById(`host-${workerId}`).value : window.location.hostname;
@@ -352,8 +375,6 @@ export function cancelWorkerSettings(extension, workerId) {
         if (clearApiKeyInput) clearApiKeyInput.checked = false;
         const jobsPerRunInput = document.getElementById(`jobs-per-run-${workerId}`);
         if (jobsPerRunInput) jobsPerRunInput.value = worker.jobs_per_run ?? 1;
-        const concurrencyInput = document.getElementById(`concurrency-${workerId}`);
-        if (concurrencyInput) concurrencyInput.value = worker.concurrency ?? 1;
         const timeoutInput = document.getElementById(`timeout-seconds-${workerId}`);
         if (timeoutInput) timeoutInput.value = worker.timeout_seconds ?? 1800;
 

@@ -16,7 +16,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.server = types.SimpleNamespace(distributed_pending_jobs={"collector": asyncio.Queue()}, distributed_jobs_lock=asyncio.Lock())
         self.path = Path(self.temp.name) / "jobs.json"
         self.manager = runtime.ServerlessManager(self.server, Secrets(), self.path, AsyncMock(return_value=object()))
-        self.worker = {"id": "serverless:pool:1", "pool_id": "pool", "endpoint_id": "ep", "concurrency": 1, "timeout_seconds": 30, "type": "serverless"}
+        self.worker = {"id": "serverless:pool:1", "pool_id": "pool", "endpoint_id": "ep", "timeout_seconds": 30, "type": "serverless"}
         self.prepared = {"worker": self.worker, "workflow": {}, "images": [], "manifest": [{"job_id": "collector", "prefix": "x", "kind": "image"}]}
         self.api = types.SimpleNamespace(submit=AsyncMock(return_value="job"), status=AsyncMock(), cancel=AsyncMock(return_value={"status": "CANCELLED"}))
         self.client_patch = patch.object(runtime, "RunpodClient", return_value=self.api)
@@ -25,6 +25,10 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.decode_patch = patch.object(runtime, "decode_results", AsyncMock(return_value={"collector": ["tensor"]}))
         self.decode_patch.start()
         self.addCleanup(self.decode_patch.stop)
+        # These regressions exercise capacity holding, so use a limit of one.
+        self.limit_patch = patch.object(runtime, "PER_WORKER_JOB_LIMIT", 1)
+        self.limit_patch.start()
+        self.addCleanup(self.limit_patch.stop)
 
     async def asyncTearDown(self):
         await self.manager.cancel()
@@ -176,8 +180,10 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.ledger.all()[0]["status"], "CANCELLED")
 
     async def test_partial_start_cleanup_does_not_leave_waiting_protection(self):
-        with self.assertRaises(ValueError):
-            await self.manager.start("exec", "prompt", [self.prepared, self.second(concurrency=2)])
+        broken = self.second()
+        del broken["worker"]["endpoint_id"]
+        with self.assertRaises(KeyError):
+            await self.manager.start("exec", "prompt", [self.prepared, broken])
         await self.manager.cancel(execution_id="exec")
         self.assertFalse(self.manager.pool_is_active("pool"))
         self.api.submit.assert_not_awaited()

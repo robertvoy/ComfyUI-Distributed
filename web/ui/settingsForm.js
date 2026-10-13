@@ -1,6 +1,9 @@
 import { BUTTON_STYLES } from '../constants.js';
 import { cancelWorkerSettings, deleteWorker, isRemoteWorker, saveWorkerSettings, testServerlessWorker } from '../workerSettings.js';
 
+export const IMAGES_PER_RUN_TOOLTIP =
+    "Separate Runpod jobs submitted each run, all at once. Runpod's max workers decides how many GPUs actually run them.";
+
 export function createWorkerSettingsForm(ui, extension, worker) {
     const form = document.createElement("div");
     form.style.cssText = "display: flex; flex-direction: column; gap: 8px;";
@@ -59,7 +62,6 @@ export function createWorkerSettingsForm(ui, extension, worker) {
             apiKeyGroup.group,
             clearApiKeyGroup,
             jobsPerRunGroup.group,
-            concurrencyGroup.group,
             timeoutGroup.group,
             testServerlessGroup,
         ];
@@ -150,7 +152,17 @@ export function createWorkerSettingsForm(ui, extension, worker) {
     clearApiKeyInput.id = `clear-api-key-${worker.id}`;
     const clearApiKeyLabel = document.createElement("label");
     clearApiKeyLabel.htmlFor = clearApiKeyInput.id;
-    clearApiKeyLabel.textContent = "Clear saved API key (disable pool first)";
+    clearApiKeyLabel.textContent = "Clear saved API key";
+    // The backend rejects clearing the key of an enabled worker; say so up front.
+    // The form is rebuilt when the enable toggle changes, so this stays current.
+    const clearApiKeyBlockedReason = !worker.api_key_configured
+        ? "No API key is saved for this worker."
+        : worker.enabled
+            ? "Turn this worker off before clearing its API key. An enabled serverless worker needs a saved key."
+            : "";
+    clearApiKeyInput.disabled = Boolean(clearApiKeyBlockedReason);
+    clearApiKeyGroup.title = clearApiKeyBlockedReason || "Remove the saved Runpod API key when you save.";
+    clearApiKeyLabel.style.cssText = clearApiKeyBlockedReason ? "opacity: 0.5; cursor: not-allowed;" : "cursor: pointer;";
     clearApiKeyGroup.appendChild(clearApiKeyInput);
     clearApiKeyGroup.appendChild(clearApiKeyLabel);
     clearApiKeyInput.onchange = () => {
@@ -159,23 +171,15 @@ export function createWorkerSettingsForm(ui, extension, worker) {
     };
     form.appendChild(clearApiKeyGroup);
 
-    const jobsPerRunGroup = ui.createFormGroup("Jobs per run:", worker.jobs_per_run ?? 1, `jobs-per-run-${worker.id}`, "number");
+    const jobsPerRunGroup = ui.createFormGroup("Images per run (1–16):", worker.jobs_per_run ?? 1, `jobs-per-run-${worker.id}`, "number");
     jobsPerRunGroup.group.id = `jobs-per-run-group-${worker.id}`;
     jobsPerRunGroup.input.min = "1";
     jobsPerRunGroup.input.max = "16";
     jobsPerRunGroup.input.step = "1";
-    jobsPerRunGroup.input.title = "Maximum jobs submitted in one run";
+    jobsPerRunGroup.input.title = IMAGES_PER_RUN_TOOLTIP;
+    jobsPerRunGroup.group.title = IMAGES_PER_RUN_TOOLTIP;
     jobsPerRunGroup.group.style.display = "none";
     form.appendChild(jobsPerRunGroup.group);
-
-    const concurrencyGroup = ui.createFormGroup("Concurrent jobs (slots):", worker.concurrency ?? 1, `concurrency-${worker.id}`, "number");
-    concurrencyGroup.group.id = `concurrency-group-${worker.id}`;
-    concurrencyGroup.input.min = "1";
-    concurrencyGroup.input.max = "16";
-    concurrencyGroup.input.step = "1";
-    concurrencyGroup.input.title = "Maximum concurrent jobs per serverless worker";
-    concurrencyGroup.group.style.display = "none";
-    form.appendChild(concurrencyGroup.group);
 
     const timeoutGroup = ui.createFormGroup("Timeout (seconds):", worker.timeout_seconds ?? 1800, `timeout-seconds-${worker.id}`, "number");
     timeoutGroup.group.id = `timeout-seconds-group-${worker.id}`;

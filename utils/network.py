@@ -88,7 +88,7 @@ def _split_host_and_port(host):
 def build_worker_url(worker, endpoint=""):
     """Construct the worker base URL with optional endpoint."""
     if worker.get("type") == "serverless":
-        raise ValueError("Serverless pools have no ComfyUI worker URL")
+        raise ValueError("Serverless workers have no ComfyUI worker URL")
     host = (worker.get("host") or "").strip()
     port = int(worker.get("port", worker.get("listen_port", 8188)) or 8188)
 

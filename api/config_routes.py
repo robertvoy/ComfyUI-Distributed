@@ -218,8 +218,7 @@ def _bulk_serverless_changes(old_workers, new_workers):
             if new is None or new.get("type") != "serverless":
                 _ensure_pool_idle(worker_id)
                 secret_ids.add(worker_id)
-            elif (old.get("endpoint_id") != new.get("endpoint_id")
-                  or old.get("concurrency", 1) != new.get("concurrency", 1)):
+            elif old.get("endpoint_id") != new.get("endpoint_id"):
                 _ensure_pool_idle(worker_id)
         elif new is not None and new.get("type") == "serverless":
             secret_ids.add(worker_id)
@@ -299,7 +298,7 @@ async def update_config_endpoint(request):
                         if isinstance(worker, dict) and worker.get("type") == "serverless" and worker.get("enabled", False):
                             store = store or _serverless_secret_store()
                             if worker["id"] in changed_ids or not store.has(worker["id"]):
-                                return _error_response("Save an API key before enabling this pool", 400)
+                                return _error_response("Save an API key before enabling this worker", 400)
                     if changed_ids:
                         store = store or _serverless_secret_store()
                         for worker_id in sorted(changed_ids):
@@ -316,7 +315,7 @@ async def update_config_endpoint(request):
             secret_changes.commit()
             return response
     except _ActivePoolCheckError:
-        return _error_response("Finish or reconcile unresolved serverless jobs before changing this pool", 409)
+        return _error_response("Finish or reconcile unresolved serverless jobs before changing this worker", 409)
     except Exception:
         return _error_response("Unable to update config", 500)
 
@@ -401,7 +400,8 @@ async def _update_worker_endpoint(request, secret_changes):
                 candidate["type"] = "serverless"
                 candidate.setdefault("provider", "runpod")
                 candidate.setdefault("enabled", False)
-                for field in ("provider", "endpoint_id", "jobs_per_run", "concurrency", "timeout_seconds", "enabled", "name"):
+                # Legacy "concurrency" is accepted (see _SERVERLESS_CONFIG_FIELDS) but ignored.
+                for field in ("provider", "endpoint_id", "jobs_per_run", "timeout_seconds", "enabled", "name"):
                     if field in data:
                         candidate[field] = data[field]
                 candidate = _clean_serverless_worker(candidate)
@@ -424,17 +424,13 @@ async def _update_worker_endpoint(request, secret_changes):
                     current_type == "serverless"
                     and existing.get("endpoint_id") != validated.get("endpoint_id")
                 )
-                concurrency_changed = (
-                    current_type == "serverless"
-                    and existing.get("concurrency", 1) != validated.get("concurrency", 1)
-                )
                 if current_type == "serverless" and (
-                    endpoint_changed or concurrency_changed or next_secret != prior_secret
+                    endpoint_changed or next_secret != prior_secret
                 ):
                     _ensure_pool_idle(worker_id)
 
                 if validated.get("enabled", False) and next_secret is None:
-                    return _error_response("Save an API key before enabling this pool; disable it before clearing the key", 400)
+                    return _error_response("Save an API key before enabling this worker; turn the worker off before clearing its key", 400)
 
                 if next_secret != prior_secret:
                     if next_secret is None:
@@ -489,7 +485,7 @@ async def _update_worker_endpoint(request, secret_changes):
 
         return web.json_response(result)
     except _ActivePoolCheckError:
-        return _error_response("Finish or reconcile unresolved serverless jobs before changing this pool", 409)
+        return _error_response("Finish or reconcile unresolved serverless jobs before changing this worker", 409)
     except ValueError:
         return _error_response("Invalid worker configuration", 400)
     except Exception:
@@ -537,7 +533,7 @@ async def _delete_worker_endpoint(request, secret_changes):
 
         return web.json_response(result)
     except _ActivePoolCheckError:
-        return _error_response("Finish or reconcile unresolved serverless jobs before changing this pool", 409)
+        return _error_response("Finish or reconcile unresolved serverless jobs before changing this worker", 409)
     except Exception:
         return _error_response("Unable to delete worker", 500)
 

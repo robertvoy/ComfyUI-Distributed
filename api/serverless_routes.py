@@ -83,7 +83,7 @@ async def _recover(request, *, acknowledge=False):
             result = {"resolved": await manager.reconcile(worker_id=worker_id)}
         return web.json_response(dict(result, ok=True, jobs=manager.public_jobs(worker_id)))
     except ValueError:
-        return web.json_response({"ok": False, "message": "Unresolved inactive job not found for this pool"}, status=409)
+        return web.json_response({"ok": False, "message": "Unresolved inactive job not found for this worker"}, status=409)
     except Exception:
         return web.json_response({"ok": False, "message": "Recovery could not be confirmed; retained jobs remain protected"}, status=502)
 

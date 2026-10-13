@@ -38,11 +38,17 @@ _ENDPOINT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,200}", re.ASCII)
 _UNSUPPORTED_SECRET_STORE_MESSAGE = (
     "Serverless credential storage is currently supported on POSIX masters only"
 )
+# Images per run is also this worker's effective parallelism: every image job
+# is submitted at once (the runtime's fixed PER_WORKER_JOB_LIMIT equals this),
+# and the Runpod endpoint's max workers decides how many actually run together.
+MAX_JOBS_PER_RUN = 16
 _NUMERIC_FIELDS = {
-    "jobs_per_run": (1, 16, 1),
-    "concurrency": (1, 16, 1),
+    "jobs_per_run": (1, MAX_JOBS_PER_RUN, 1),
     "timeout_seconds": (30, 86400, 1800),
 }
+# Older configs saved a separate concurrency setting. It is accepted so they
+# still load, then dropped: PER_WORKER_JOB_LIMIT replaces it.
+_LEGACY_IGNORED_FIELDS = ("concurrency",)
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
 
@@ -67,7 +73,9 @@ def validate_serverless_worker(worker: dict) -> dict:
 
     endpoint_id = result.get("endpoint_id")
     if not isinstance(endpoint_id, str) or not _ENDPOINT_ID_RE.fullmatch(endpoint_id):
-        raise ServerlessConfigError("endpoint_id must be an opaque Runpod identifier")
+        raise ServerlessConfigError(
+            "Endpoint ID must be just the Runpod endpoint ID (letters, numbers, - or _), not a URL"
+        )
 
     if result.get("type", "serverless") != "serverless":
         raise ServerlessConfigError("type must be serverless")
@@ -81,6 +89,8 @@ def validate_serverless_worker(worker: dict) -> dict:
         if type(value) is not int or not minimum <= value <= maximum:
             raise ServerlessConfigError(f"{field} must be an integer from {minimum} to {maximum}")
         result[field] = value
+    for field in _LEGACY_IGNORED_FIELDS:
+        result.pop(field, None)
 
     result["type"] = "serverless"
     result["provider"] = "runpod"
