@@ -61,6 +61,13 @@ async def worker_ws_endpoint(request):
                 })
                 continue
 
+            if not isinstance(data, dict):
+                await ws.send_json({
+                    "type": "dispatch_ack", "request_id": None, "ok": False,
+                    "error": "Expected a websocket message object.",
+                })
+                continue
+
             if data.get("type") != "dispatch_prompt":
                 await ws.send_json({
                     "type": "dispatch_ack",
@@ -81,10 +88,16 @@ async def worker_ws_endpoint(request):
                 continue
 
             try:
+                target_kwargs = {}
+                if "partial_execution_targets" in data:
+                    from ..utils.async_helpers import validate_execution_targets
+                    target_kwargs["partial_execution_targets"] = validate_execution_targets(
+                        prompt, data["partial_execution_targets"])
                 prompt_id = await queue_prompt_payload(
                     prompt,
                     workflow_meta=data.get("workflow"),
                     client_id=data.get("client_id"),
+                    **target_kwargs,
                 )
                 await ws.send_json({
                     "type": "dispatch_ack",

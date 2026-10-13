@@ -376,13 +376,19 @@ def delete_worker_item(token: str) -> bool:
 def create_master_job(start_id: str, end_id: str, prompt: dict[str, Any], items: list[dict[str, Any]],
                       worker_ids: list[str], master_callback_url: str,
                       workflow_meta: dict[str, Any] | None = None,
-                      prompt_id: str | None = None, *, master_participates: bool = False) -> str:
+                      prompt_id: str | None = None, *, master_participates: bool = False,
+                      explicit_targets: bool = False) -> str:
     if not isinstance(prompt, dict):
         raise ValueError("Image List Start requires the original ComfyUI prompt for region extraction")
     if not isinstance(master_participates, bool):
         raise ValueError("master_participates must be a boolean")
     if not worker_ids and not master_participates:
         raise RuntimeError("Distributed Image List requires at least one preflighted direct worker; master fallback is disabled")
+    # Only the target-controlled Start caller may relax the outer prompt guard.
+    regions = validate_image_list_regions(prompt, explicit_targets=explicit_targets is True)
+    if not any(region["start_id"] == str(start_id) and region["end_id"] == str(end_id)
+               for region in regions):
+        raise ValueError("Image-list region does not match the requested Start/End pair")
     context_id = secrets.token_urlsafe(36)
     state = ImageListJob(context_id, str(start_id), str(end_id), prompt, items,
                          [str(worker_id) for worker_id in worker_ids], master_callback_url,
@@ -497,15 +503,23 @@ def _safe_shared_dependency(node: dict[str, Any], prompt: dict[str, Any], regist
     return types <= scalar_types and not any(_prompt_links(node, prompt))
 
 
-def validate_image_list_regions(prompt: dict[str, Any]) -> list[dict[str, Any]]:
-    """Validate pairing, non-nesting, and closed per-image graph boundaries."""
+def _is_output_node(node: dict[str, Any], registry) -> bool:
+    node_class = registry.get(node.get("class_type"))
+    if node_class is None:
+        return False
+    info = node_class.GET_NODE_INFO_V1() if hasattr(node_class, "GET_NODE_INFO_V1") else {}
+    return bool(info.get("output_node", getattr(node_class, "OUTPUT_NODE", False)))
+
+
+def _image_list_pairs(prompt: dict[str, Any]) -> list[tuple[str, str]]:
+    """Pair boundaries before execution-copy pruning or full validation."""
     if not isinstance(prompt, dict):
         raise ValueError("Prompt must be an object")
     starts = sorted(str(k) for k, v in prompt.items() if isinstance(v, dict) and v.get("class_type") == START_CLASS)
     ends = sorted(str(k) for k, v in prompt.items() if isinstance(v, dict) and v.get("class_type") == END_CLASS)
     if len(starts) != len(ends) or not starts:
         raise ValueError("Distributed Image List needs one paired Start and End per region")
-    regions = []
+    pairs = []
     for start_id in starts:
         candidates = []
         for end_id in ends:
@@ -514,7 +528,19 @@ def validate_image_list_regions(prompt: dict[str, Any]) -> list[dict[str, Any]]:
                 candidates.append(end_id)
         if len(candidates) != 1:
             raise ValueError(f"Start node {start_id} must connect its typed context output directly to exactly one End")
-        end_id = candidates[0]
+        pairs.append((start_id, candidates[0]))
+    return pairs
+
+
+def validate_image_list_regions(prompt: dict[str, Any], *, explicit_targets: bool = False) -> list[dict[str, Any]]:
+    """Validate pairing, non-nesting, and closed per-image graph boundaries.
+
+    Required output-node utilities are allowed only when callers explicitly
+    select execution roots, rather than letting every OUTPUT_NODE run independently.
+    All data-boundary checks still apply in that mode.
+    """
+    regions = []
+    for start_id, end_id in _image_list_pairs(prompt):
         if "images" not in prompt[end_id].get("inputs", {}):
             raise ValueError(f"End node {end_id}.images must be connected to the per-item result branch")
         end_inputs = prompt[end_id].get("inputs", {})
@@ -529,8 +555,6 @@ def validate_image_list_regions(prompt: dict[str, Any]) -> list[dict[str, Any]]:
                      {START_CLASS, END_CLASS, "DistributedCollector", "UltimateSDUpscaleDistributed"}}
         if forbidden:
             raise ValueError("Nested/ambiguous regions and other distributed nodes are unsupported in an image-list region: " + ", ".join(sorted(forbidden)))
-        # Output nodes execute independently of the lazy End, so they would
-        # evaluate the processing branch on the master as well as the worker.
         import sys
         registry = getattr(sys.modules.get("nodes"), "NODE_CLASS_MAPPINGS", {})
         shared = region_nodes & _start_ancestors(prompt, start_id)
@@ -545,13 +569,10 @@ def validate_image_list_regions(prompt: dict[str, Any]) -> list[dict[str, Any]]:
                 f"Image-list region {start_id}->{end_id} bypasses Start through upstream nodes "
                 f"{sorted(unsafe)} ({'; '.join(links)}); route per-item data through Start"
             )
-        for node_id in region_nodes - {start_id, end_id}:
-            node_class = registry.get(prompt[node_id].get("class_type"))
-            if node_class is None:
-                continue
-            info = node_class.GET_NODE_INFO_V1() if hasattr(node_class, "GET_NODE_INFO_V1") else {}
-            if info.get("output_node", getattr(node_class, "OUTPUT_NODE", False)):
-                raise ValueError(f"Output node {node_id} must be placed after Distributed Image List End")
+        if not explicit_targets:
+            for node_id in region_nodes - {start_id, end_id}:
+                if _is_output_node(prompt[node_id], registry):
+                    raise ValueError(f"Output node {node_id} must be placed after Distributed Image List End")
         downstream = _downstream_until(prompt, start_id, end_id)
         outside = sorted(downstream - region_nodes)
         if outside:
@@ -822,7 +843,8 @@ async def _run_image_list_job(state: ImageListJob):
     if not workers and not state.master_participates:
         raise RuntimeError("No free, reachable, feature-compatible direct workers are available; master execution is disabled")
     session = await get_client_session() if workers else None
-    regions = validate_image_list_regions(state.original_prompt)
+    # Both item paths below select End explicitly, never all OUTPUT_NODE roots.
+    regions = validate_image_list_regions(state.original_prompt, explicit_targets=True)
     region = next((entry for entry in regions if entry["start_id"] == state.start_id and entry["end_id"] == state.end_id), None)
     if region is None:
         raise RuntimeError("Image-list region no longer matches the submitted prompt")
@@ -892,6 +914,7 @@ async def _run_image_list_job(state: ImageListJob):
             worker, worker_prompt, state.workflow_meta,
             client_id=f"image-list-{context_id[:20]}", use_websocket=use_websocket,
             return_prompt_id=True,
+            partial_execution_targets=[state.end_id],
         )
         if not isinstance(prompt_id, str) or not prompt_id:
             raise RuntimeError(f"Worker {worker_id} did not return a prompt_id; submission status is ambiguous")

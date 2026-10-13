@@ -34,6 +34,23 @@ class MasterSelectionTests(unittest.IsolatedAsyncioTestCase):
     def prepared_inputs(self):
         return self.q.queue_prompt_payload.call_args.args[0]["2"]["inputs"]
 
+    async def test_prepared_master_prunes_side_outputs_without_mutating_input(self):
+        import copy
+        self.prompt['op'] = {'class_type': 'Flagged', 'inputs': {'image': ['2', 0]}}
+        self.prompt['3']['inputs']['images'] = ['op', 0]
+        self.prompt['preview'] = {'class_type': 'Flagged', 'inputs': {'image': ['op', 0]}}
+        self.prompt['save'] = {'class_type': 'Flagged', 'inputs': {'image': ['3', 0]}}
+        original = copy.deepcopy(self.prompt)
+        registry = type('Registry', (), {'NODE_CLASS_MAPPINGS': {
+            'Flagged': type('Flagged', (), {'OUTPUT_NODE': True})}})
+        with patch.dict(sys.modules, {'nodes': registry}):
+            await self.queue()
+        queued = self.q.queue_prompt_payload.call_args
+        self.assertEqual(queued.kwargs['partial_execution_targets'], ['3', 'save'])
+        self.assertIn('op', queued.args[0])
+        self.assertNotIn('preview', queued.args[0])
+        self.assertEqual(self.prompt, original)
+
     async def test_default_includes_master_and_direct_workers(self):
         result = await self.queue()
         self.assertIs(self.prepared_inputs()["image_list_master_participates"], True)

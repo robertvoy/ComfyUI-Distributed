@@ -99,13 +99,18 @@ class DistributedImageListStart(io.ComfyNode):
             raise RuntimeError("Invalid preflighted image-list worker list") from exc
         if not isinstance(worker_ids, list) or not all(isinstance(item, str) for item in worker_ids):
             raise RuntimeError("Invalid preflighted image-list worker list")
+        from comfy_execution.utils import get_executing_context
+        from ..image_list.lifecycle import has_safe_execution_targets
+        import server
+        executing = get_executing_context()
+        explicit_targets = has_safe_execution_targets(
+            getattr(server.PromptServer, "instance", None),
+            executing.prompt_id if executing is not None else None, prompt)
         from ..image_list.runtime import validate_image_list_regions
-        regions = validate_image_list_regions(prompt)
+        regions = validate_image_list_regions(prompt, explicit_targets=explicit_targets)
         region = next((row for row in regions if row["start_id"] == start_id), None)
         if region is None:
             raise RuntimeError(f"No safe paired Image List End was found for Start node {start_id}")
-        from comfy_execution.utils import get_executing_context
-        executing = get_executing_context()
         master_participates = unwrap_single(image_list_master_participates)
         if master_participates is None:
             from ..utils.config import load_config
@@ -118,6 +123,7 @@ class DistributedImageListStart(io.ComfyNode):
             image_list_workflow_meta if isinstance(image_list_workflow_meta, dict) else None,
             prompt_id=executing.prompt_id if executing is not None else None,
             master_participates=master_participates,
+            explicit_targets=explicit_targets,
         )
         return io.NodeOutput(
             [item["image"] for item in items],

@@ -105,23 +105,62 @@ class PromptValidationError(RuntimeError):
         super().__init__(f"Invalid prompt: {merged}")
 
 
+def validate_execution_targets(prompt, targets):
+    """Reject malformed explicit roots instead of falling back to all outputs."""
+    if (not isinstance(targets, list) or not targets
+            or any(not isinstance(node_id, str) or not node_id or node_id not in prompt
+                   for node_id in targets)
+            or len(set(targets)) != len(targets)):
+        raise PromptValidationError({
+            "type": "invalid_partial_execution_targets",
+            "message": "partial_execution_targets must be a non-empty list of unique existing node IDs",
+            "details": "", "extra_info": {},
+        })
+    return list(targets)
+
+
 async def queue_prompt_payload(
     prompt_obj,
     workflow_meta=None,
     client_id=None,
     include_queue_metadata=False,
+    *,
+    partial_execution_targets=None,
 ):
-    """Validate and queue a prompt via ComfyUI's prompt queue."""
+    """Validate and queue a prompt, preserving any explicitly requested roots."""
+    targets = (validate_execution_targets(prompt_obj, partial_execution_targets)
+               if partial_execution_targets is not None else None)
     payload = {"prompt": prompt_obj}
+    if targets is not None:
+        payload["partial_execution_targets"] = list(targets)
     payload = prompt_server.trigger_on_prompt(payload)
     prompt = payload["prompt"]
+    if targets is not None:
+        # Hooks may replace the envelope or mutate its target list. The caller's
+        # requested roots remain authoritative, but must still exist afterwards.
+        validate_execution_targets(prompt, targets)
 
     prompt_id = str(uuid.uuid4())
-    valid = await execution.validate_prompt(prompt_id, prompt, None)
+    valid = await execution.validate_prompt(prompt_id, prompt, targets)
     if not valid[0]:
         error_payload = valid[1] if len(valid) > 1 else "Prompt outputs failed validation"
         node_errors = valid[3] if len(valid) > 3 else {}
         raise PromptValidationError(error_payload, node_errors)
+
+    if targets is not None:
+        node_errors = valid[3] if len(valid) > 3 else {}
+        target_errors = {
+            node_id: entry for node_id, entry in node_errors.items()
+            if node_id in targets or (isinstance(entry, dict)
+                                      and set(entry.get("dependent_outputs", [])) & set(targets))
+        }
+        if set(valid[2]) != set(targets) or target_errors:
+            raise PromptValidationError({
+                "type": "partial_execution_targets_failed_validation",
+                "message": "Not all requested execution targets passed validation",
+                "details": "Refusing to queue a subset or additional output roots",
+                "extra_info": {"requested_targets": targets},
+            }, node_errors)
 
     extra_data = {"create_time": int(time.time() * 1000)}
     if workflow_meta:

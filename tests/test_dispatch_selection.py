@@ -4,7 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 def _load_dispatch_module():
@@ -168,6 +168,7 @@ class _FakeSession:
 def _valid_capability():
     return {
         "supported": True,
+        "execution_targets": True,
         "protocol_version": 2,
         "node_ids": ["DistributedImageListStart", "DistributedImageListEnd"],
     }
@@ -175,6 +176,43 @@ def _valid_capability():
 
 def _valid_queue(running=None, pending=None):
     return {"queue_running": running or [], "queue_pending": pending or []}
+
+
+class ExplicitTargetTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_preserves_targets_and_omits_default_field(self):
+        response = types.SimpleNamespace(raise_for_status=lambda: None)
+        class Response:
+            async def __aenter__(self): return response
+            async def __aexit__(self, *args): pass
+        calls = []
+        def post(url, **kwargs):
+            calls.append(kwargs['json'])
+            return Response()
+        session = types.SimpleNamespace(post=post)
+        with patch.object(dispatch, 'get_client_session', AsyncMock(return_value=session)):
+            await dispatch.dispatch_worker_prompt({'id': 'worker'}, {'9': {}}, None,
+                                                  partial_execution_targets=['9'])
+            await dispatch.dispatch_worker_prompt({'id': 'worker'}, {'9': {}}, None)
+        self.assertEqual(calls[0]['partial_execution_targets'], ['9'])
+        self.assertNotIn('partial_execution_targets', calls[1])
+
+    async def test_websocket_sends_targets_all_the_way_to_wire(self):
+        import json
+        sent = []
+        async def receive():
+            return types.SimpleNamespace(type=dispatch.aiohttp.WSMsgType.TEXT, data=json.dumps({
+                'type': 'dispatch_ack', 'request_id': sent[-1]['request_id'],
+                'ok': True, 'prompt_id': 'worker-prompt'}))
+        ws = types.SimpleNamespace(send_json=AsyncMock(side_effect=sent.append),
+                                   receive=receive, close=AsyncMock())
+        session = types.SimpleNamespace(ws_connect=AsyncMock(return_value=ws))
+        with patch.object(dispatch, 'get_client_session', AsyncMock(return_value=session)):
+            result = await dispatch.dispatch_worker_prompt({'id': 'worker'}, {'9': {}}, None,
+                use_websocket=True, return_prompt_id=True, partial_execution_targets=['9'])
+            await dispatch.dispatch_worker_prompt({'id': 'worker'}, {'9': {}}, None, use_websocket=True)
+        self.assertEqual(result, 'worker-prompt')
+        self.assertEqual(sent[0]['partial_execution_targets'], ['9'])
+        self.assertNotIn('partial_execution_targets', sent[1])
 
 
 class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
@@ -416,6 +454,23 @@ class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "No selected feature-compatible direct worker is idle"):
                 await dispatch.preflight_image_list_workers(workers, require_idle=True)
+
+    async def test_image_list_preflight_requires_exact_execution_targets_support(self):
+        for value in (None, False, 1, "true", []):
+            with self.subTest(value=value):
+                capability = _valid_capability()
+                if value is None:
+                    capability.pop("execution_targets")
+                else:
+                    capability["execution_targets"] = value
+                session = _FakeSession({("worker", "capabilities"): (200, capability)})
+                async def fake_session():
+                    return session
+                with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+                    dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "execution_targets.*upgrade"):
+                        await dispatch.preflight_image_list_workers([{"id": "worker"}])
 
     async def test_image_list_preflight_fails_closed_for_malformed_capabilities(self):
         malformed = {"supported": True, "protocol_version": 2, "node_ids": None}

@@ -84,7 +84,7 @@ class RuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
         # Other legacy test modules replace aiohttp during collection. This
         # controlled provider fixture needs only its explicit timeout/error seam.
         sys.modules['aiohttp'] = types.SimpleNamespace(
-            ClientTimeout=lambda **kwargs: kwargs, ClientError=ConnectionError)
+            ClientTimeout=lambda **kwargs: kwargs, ClientError=ConnectionError, ClientConnectionError=ConnectionError)
         comfy = types.ModuleType('comfy')
         comfy.model_management = types.SimpleNamespace(processing_interrupted=lambda: self.interrupted)
         sys.modules['comfy'] = comfy
@@ -94,6 +94,7 @@ class RuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
         prompt['7']['inputs']['image'] = 'shared/ref.png'
 
     async def dispatch_prompt(self, worker, prompt, meta, **kwargs):
+        self.assertEqual(kwargs.get('partial_execution_targets'), ['5'])
         if self.reject:
             raise RuntimeError('prompt rejected')
         self.prompts.append((json.loads(json.dumps(prompt)), meta))
@@ -135,6 +136,23 @@ class RuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
             [{'image': torch.zeros((1, 2, 2, 3)), 'index': i} for i in range(count)],
             ['worker'], 'http://public-master', self.metadata)
         return self.context
+
+    async def test_runtime_preflight_rejects_old_target_capability_before_upload(self):
+        from test_dispatch_selection import _load_dispatch_module, _FakeSession, _valid_capability
+        real_dispatch = _load_dispatch_module()
+        capability = _valid_capability()
+        capability.pop('execution_targets')
+        session = _FakeSession({('worker', 'capabilities'): (200, capability)})
+        module = sys.modules['_image_list_boundaries.api.orchestration.dispatch']
+        module.preflight_image_list_workers = real_dispatch.preflight_image_list_workers
+        with patch.object(real_dispatch, 'get_client_session', AsyncMock(return_value=session)), patch.object(
+            real_dispatch, 'build_worker_url', side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'execution_targets.*upgrade'):
+                await self.rt.run_image_list_job(self.create(1))
+        self.assertFalse(self.uploads)
+        self.dispatch.assert_not_awaited()
+        self.assertFalse(self.rt._MASTER_JOBS)
 
     async def test_each_assignment_reuses_media_paths_with_fresh_tokens_and_metadata(self):
         context = self.create()

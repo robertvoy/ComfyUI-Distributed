@@ -39,6 +39,7 @@ from .orchestration.prompt_transform import (
     _resolve_direct_workers_for_image_list,
 )
 from ..image_list.runtime import validate_image_list_regions
+from ..image_list.execution_plan import prepare_image_list_execution
 
 
 prompt_server = server.PromptServer.instance
@@ -327,6 +328,12 @@ async def orchestrate_distributed_execution(
         media_sync_timeout_seconds,
     ) = _resolve_orchestration_limits(config)
     requested_ids = enabled_worker_ids if enabled_worker_ids is not None else None
+    image_list_mode = any(isinstance(node, dict) and node.get("class_type") == "DistributedImageListStart"
+                          for node in prompt_obj.values())
+    target_kwargs = {}
+    if image_list_mode:
+        prompt_obj, outer_targets = prepare_image_list_execution(prompt_obj)
+        target_kwargs["partial_execution_targets"] = outer_targets
     prompt_index = PromptIndex(prompt_obj)
     typed_media_mode = bool(prompt_index.nodes_for_class("DistributedMediaCollector"))
     if typed_media_mode:
@@ -349,7 +356,7 @@ async def orchestrate_distributed_execution(
                 "Distributed Image List v1 cannot be mixed with Distributed Collector, "
                 "DistributedMediaCollector or Ultimate SD Upscale nodes in one prompt"
             )
-        validate_image_list_regions(prompt_obj)
+        validate_image_list_regions(prompt_obj, explicit_targets=True)
         configured_serverless = [
             str(worker.get("id")) for worker in config.get("workers", [])
             if worker.get("enabled", False)
@@ -487,6 +494,7 @@ async def orchestrate_distributed_execution(
             workflow_meta,
             client_id,
             include_queue_metadata=True,
+            **target_kwargs,
         )
         return (
             queue_result["prompt_id"],
@@ -594,6 +602,7 @@ async def orchestrate_distributed_execution(
             workflow_meta,
             client_id,
             include_queue_metadata=True,
+            **target_kwargs,
         )
     except Exception:
         if serverless_jobs:
