@@ -184,6 +184,8 @@ Use **Distributed Value** when you want per-worker overrides (for example, diffe
 | **Audio Segment Divider** | Splits an audio waveform into up to ten sequential time segments |
 | **Distributed Model Name** | Passes model paths to workers, enabling workflows to use models not present on the master in orchestrator-only mode |
 | **Distributed Empty Image** | Produces an empty IMAGE batch used when the master delegates all work |
+| **Distributed Image List Start** | Turns an image list or batch into one job per image, scheduled to the next available participant; mask and value inputs are shared across images or paired one per image |
+| **Distributed Image List End** | Closes the paired region and returns images, masks, and texts as lists in the original input order |
 
 ---
 
