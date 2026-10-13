@@ -299,7 +299,7 @@ async def update_config_endpoint(request):
                         if isinstance(worker, dict) and worker.get("type") == "serverless" and worker.get("enabled", False):
                             store = store or _serverless_secret_store()
                             if worker["id"] in changed_ids or not store.has(worker["id"]):
-                                return _error_response("Save an API key before enabling this pool", 400)
+                                return _error_response("Save an API key before enabling this worker", 400)
                     if changed_ids:
                         store = store or _serverless_secret_store()
                         for worker_id in sorted(changed_ids):
@@ -316,7 +316,7 @@ async def update_config_endpoint(request):
             secret_changes.commit()
             return response
     except _ActivePoolCheckError:
-        return _error_response("Finish or reconcile unresolved serverless jobs before changing this pool", 409)
+        return _error_response("Finish or reconcile unresolved serverless jobs before changing this worker", 409)
     except Exception:
         return _error_response("Unable to update config", 500)
 
@@ -434,7 +434,7 @@ async def _update_worker_endpoint(request, secret_changes):
                     _ensure_pool_idle(worker_id)
 
                 if validated.get("enabled", False) and next_secret is None:
-                    return _error_response("Save an API key before enabling this pool; disable it before clearing the key", 400)
+                    return _error_response("Save an API key before enabling this worker; turn the worker off before clearing its key", 400)
 
                 if next_secret != prior_secret:
                     if next_secret is None:
@@ -489,7 +489,7 @@ async def _update_worker_endpoint(request, secret_changes):
 
         return web.json_response(result)
     except _ActivePoolCheckError:
-        return _error_response("Finish or reconcile unresolved serverless jobs before changing this pool", 409)
+        return _error_response("Finish or reconcile unresolved serverless jobs before changing this worker", 409)
     except ValueError:
         return _error_response("Invalid worker configuration", 400)
     except Exception:
@@ -537,7 +537,7 @@ async def _delete_worker_endpoint(request, secret_changes):
 
         return web.json_response(result)
     except _ActivePoolCheckError:
-        return _error_response("Finish or reconcile unresolved serverless jobs before changing this pool", 409)
+        return _error_response("Finish or reconcile unresolved serverless jobs before changing this worker", 409)
     except Exception:
         return _error_response("Unable to delete worker", 500)
 

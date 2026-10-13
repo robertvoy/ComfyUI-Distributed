@@ -1,6 +1,6 @@
-# Runpod serverless pools (preview)
+# Runpod serverless workers (preview)
 
-A **Serverless (Runpod)** worker is a queue-based endpoint/pool, not a permanent
+A **Serverless (Runpod)** worker is a queue-based endpoint, not a permanent
 ComfyUI machine. Runpod chooses the actual GPU workers. Distributed submits one
 normal ComfyUI API workflow per logical slot and collects the returned images.
 The endpoint workers **do not need ComfyUI-Distributed installed**.
@@ -12,13 +12,14 @@ The endpoint workers **do not need ComfyUI-Distributed installed**.
 3. Start with **Jobs per run = 1**, **Concurrent jobs = 1**, and **Timeout = 1800**.
 4. Save, then choose **Test Saved Endpoint**. This checks authentication and
    endpoint health only; it does not start GPU inference or prove model/node compatibility.
-5. Enable the pool when you want queued Distributed workflows to use it.
+5. Enable the worker when you want queued Distributed workflows to use it.
 6. Use an image **Distributed Collector** and queue through Distributed as usual.
    Enable **Delegate Only** if the master should collect without generating locally.
 
 Keys are write-only. Leave the key field blank to retain a saved key, or select
-**Clear saved API key** to remove it (disable the pool first). A saved key is
-required before enabling a pool. Use HTTPS or a trusted local connection when
+**Clear saved API key** to remove it. The checkbox is unavailable while the
+worker is enabled, so turn the worker off first. A saved key is required before
+enabling a worker. Use HTTPS or a trusted local connection when
 entering keys. Like ComfyUI itself, the panel must not be exposed to untrusted
 users: anyone able to queue arbitrary workflows can run code and spend endpoint credits.
 
@@ -73,11 +74,11 @@ incomplete serverless batch.
 
 - **Jobs per run** adds logical collector participants. Each receives its own
   Distributed Seed/Value overrides. It is not a physical GPU count.
-- **Concurrent jobs** bounds this master's outstanding submissions per pool,
+- **Concurrent jobs** bounds this master's outstanding submissions per worker,
   including retained jobs after a restart. Ambiguous submissions and unconfirmed
   cancellations keep their capacity reservation until reconciled. Other
   applications using the same endpoint are unaffected.
-- **Load balance** selects one participant, so it does not fan out every pool slot.
+- **Load balance** selects one participant, so it does not fan out every job slot.
 - **Timeout** includes waiting for a local slot, Runpod queue/cold-start time,
   execution, and output retrieval. Provider policy limits are submitted as well.
 - A zero-worker endpoint can be healthy: Runpod scales from zero on submission.
@@ -98,13 +99,13 @@ available on Windows.
 `distributed/serverless/jobs.json` records provider job IDs and sanitized states,
 not image data, workflow payloads, or API keys. A restarted master cannot resume
 an interrupted collector. It does **not** automatically resubmit jobs. Retained
-IDs are available through `/distributed/serverless/status/<worker_id>`; the pool's
+IDs are available through `/distributed/serverless/status/<worker_id>`; the worker's
 cancel action can request cancellation of known pre-restart jobs. If no job ID
 was received, check Runpod manually. Cancellation is best-effort and may race
 with completion; `CANCEL_REQUESTED` is not a provider-confirmed cancellation.
 
-Unresolved records protect the pool's endpoint, concurrency, API key, worker type,
-and deletion even when no local task remains. Disabling a pool is still allowed;
+Unresolved records protect the worker's endpoint, concurrency, API key, worker type,
+and deletion even when no local task remains. Disabling the worker is still allowed;
 it does not cancel existing jobs. On restart, never-submitted `WAITING` slots are
 closed locally, while interrupted `SUBMITTING` records without IDs become
 `UNKNOWN` and remain protected.
@@ -122,7 +123,7 @@ Recovery uses the same trusted-master API as the panel; it never resubmits a job
    Network errors, expired IDs, or ambiguous responses do not.
 
    ```json
-   {"worker_id": "YOUR_POOL_ID"}
+   {"worker_id": "YOUR_WORKER_ID"}
    ```
 
 3. If no ID was returned, or Runpod no longer retains its status, inspect Runpod
@@ -130,7 +131,7 @@ Recovery uses the same trusted-master API as the panel; it never resubmits a job
    queued**, send `POST /distributed/serverless/resolve` for that one record:
 
    ```json
-   {"worker_id": "YOUR_POOL_ID", "record_id": "LOCAL_RECORD_ID", "provider_checked": true}
+   {"worker_id": "YOUR_WORKER_ID", "record_id": "LOCAL_RECORD_ID", "provider_checked": true}
    ```
 
    This records `RESOLVED`: an explicit operator acknowledgment, **not** a
@@ -139,7 +140,7 @@ Recovery uses the same trusted-master API as the panel; it never resubmits a job
    already-waiting jobs proceed. Never automate this acknowledgment as a retry
    mechanism; an unverified job can still be billable.
 
-Pool changes become available once all its local tasks and unresolved records
+Worker setting changes become available once all its local tasks and unresolved records
 are finished. No credentials or ledger files need to be edited by hand.
 
 ## First-version limits

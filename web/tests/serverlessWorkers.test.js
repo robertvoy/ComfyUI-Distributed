@@ -192,6 +192,23 @@ describe("Runpod serverless worker panel", () => {
         expect(form.children.length).toBeGreaterThan(0);
     });
 
+    it("disables Clear saved API key while the worker is enabled and explains why", () => {
+        vi.spyOn(document, "getElementById").mockReturnValue(null);
+        const base = { name: "Runpod", type: "serverless", endpoint_id: "ep_123" };
+        createWorkerSettingsForm(createFormUi(), {}, { ...base, id: "on", enabled: true, api_key_configured: true });
+        createWorkerSettingsForm(createFormUi(), {}, { ...base, id: "off", enabled: false, api_key_configured: true });
+        createWorkerSettingsForm(createFormUi(), {}, { ...base, id: "nokey", enabled: false, api_key_configured: false });
+
+        expect(elements.get("clear-api-key-on").disabled).toBe(true);
+        expect(elements.get("clear-api-key-group-on").title).toMatch(/turn this worker off/i);
+        expect(elements.get("clear-api-key-off").disabled).toBe(false);
+        expect(elements.get("clear-api-key-nokey").disabled).toBe(true);
+        expect(elements.get("clear-api-key-group-nokey").title).toMatch(/no api key is saved/i);
+        for (const id of ["on", "off", "nokey"]) {
+            expect(elements.get(`clear-api-key-group-${id}`).title).not.toMatch(/pool/i);
+        }
+    });
+
     it("saves fixed Runpod settings without enabling or retaining the API key", async () => {
         const worker = { id: "w2", name: "Old", type: "remote", enabled: false, api_key_configured: false };
         const extension = makeSaveExtension(worker);

@@ -150,7 +150,17 @@ export function createWorkerSettingsForm(ui, extension, worker) {
     clearApiKeyInput.id = `clear-api-key-${worker.id}`;
     const clearApiKeyLabel = document.createElement("label");
     clearApiKeyLabel.htmlFor = clearApiKeyInput.id;
-    clearApiKeyLabel.textContent = "Clear saved API key (disable pool first)";
+    clearApiKeyLabel.textContent = "Clear saved API key";
+    // The backend rejects clearing the key of an enabled worker; say so up front.
+    // The form is rebuilt when the enable toggle changes, so this stays current.
+    const clearApiKeyBlockedReason = !worker.api_key_configured
+        ? "No API key is saved for this worker."
+        : worker.enabled
+            ? "Turn this worker off before clearing its API key. An enabled serverless worker needs a saved key."
+            : "";
+    clearApiKeyInput.disabled = Boolean(clearApiKeyBlockedReason);
+    clearApiKeyGroup.title = clearApiKeyBlockedReason || "Remove the saved Runpod API key when you save.";
+    clearApiKeyLabel.style.cssText = clearApiKeyBlockedReason ? "opacity: 0.5; cursor: not-allowed;" : "cursor: pointer;";
     clearApiKeyGroup.appendChild(clearApiKeyInput);
     clearApiKeyGroup.appendChild(clearApiKeyLabel);
     clearApiKeyInput.onchange = () => {

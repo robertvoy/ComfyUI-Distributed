@@ -130,7 +130,7 @@ class ServerlessManager:
             self.pool_limits[pool_id] = current
         elif current[0] != limit:
             if self.pool_is_active(pool_id):
-                raise ValueError("Wait for this serverless pool's current jobs before changing concurrency")
+                raise ValueError("Wait for this serverless worker's current jobs before changing concurrency")
             current = (limit, asyncio.Semaphore(limit))
             self.pool_limits[pool_id] = current
         return current[1]
@@ -320,7 +320,7 @@ class ServerlessManager:
         async with self.recovery_lock:
             record = next((r for r in self._detached_records(worker_id) if r["record_id"] == record_id), None)
             if record is None:
-                raise ValueError("Unresolved inactive job not found for this pool")
+                raise ValueError("Unresolved inactive job not found for this worker")
             self.ledger.update(record_id, status="RESOLVED", updated_at=time.time(),
                                error="Recovery explicitly acknowledged after operator checked Runpod; not provider-confirmed")
         await self._notify_capacity()
