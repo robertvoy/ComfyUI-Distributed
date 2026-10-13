@@ -24,6 +24,9 @@ def initialize():
 
     ensure_distributed_state(server.PromptServer.instance)
     ensure_tile_jobs_initialized()
+    from ..image_list import runtime as image_list_runtime
+    from ..image_list.lifecycle import install_lifecycle
+    install_lifecycle(server.PromptServer.instance, image_list_runtime)
 
     if not os.environ.get('COMFYUI_IS_WORKER'):
         atexit.register(sync_cleanup)

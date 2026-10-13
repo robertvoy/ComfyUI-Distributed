@@ -29,6 +29,11 @@ def _normalize_media_reference(value):
         return None
     cleaned = re.sub(r"\s*\[\w+\]$", "", value).strip().replace("\\", "/")
     if MEDIA_FILE_RE.search(cleaned):
+        # Output/temp annotations select a different master-side media root.
+        # Preserve them through discovery/loading and as distinct rewrite keys.
+        annotation = re.search(r"\s*\[(output|temp)\]$", value)
+        if annotation:
+            return f"{cleaned} [{annotation.group(1)}]"
         return cleaned
     return None
 
@@ -171,6 +176,12 @@ async def _upload_media_to_worker(worker, filename, file_bytes, file_hash, mime_
     """Upload one media file to worker iff missing or hash-mismatched."""
     session = await get_client_session()
     normalized = filename.replace("\\", "/")
+    annotation = re.search(r"\s*\[(output|temp)\]$", normalized)
+    if annotation:
+        # Worker uploads live under input/. Do not collide across master roots,
+        # or overwrite a different reference with the same basename.
+        basename = normalized[:annotation.start()].rstrip().rsplit("/", 1)[-1]
+        normalized = f"distributed-media/{annotation.group(1)}/{file_hash}/{basename}"
 
     check_url = build_worker_url(worker, "/distributed/check_file")
     try:

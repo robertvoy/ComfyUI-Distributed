@@ -45,7 +45,7 @@ ADDED_OPTIONAL_INPUTS = {
 
 # Nodes added after the V1 baseline; not part of saved-workflow contracts.
 # DistributedWorkerSink is internal (dev-only) and only inserted by the master.
-ADDED_NODES = {'DistributedWorkerSink'}
+ADDED_NODES = {'DistributedWorkerSink', 'DistributedImageListStart', 'DistributedImageListEnd'}
 
 
 def normalized_input(value):
@@ -254,6 +254,108 @@ async def check_execution(mapping, module, prompt_server, asset_manager):
     print('V3_EXECUTION_OK nine nodes; upscale GPU boundary mocked; preview artifact verified; sink writes nothing')
 
 
+async def check_image_list_lazy_executor(mapping, module, prompt_server, asset_manager):
+    """Execute real native V3 list/lazy flow; master must skip the processing branch."""
+    branch_calls = []
+    class ImageListProbe:
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {'required': {'image': ('IMAGE',)}}
+        RETURN_TYPES = ('IMAGE',)
+        FUNCTION = 'run'
+        CATEGORY = 'tests'
+        def run(self, image):
+            branch_calls.append(image)
+            return (image,)
+
+    nodes.NODE_CLASS_MAPPINGS['ImageListTestProbe'] = ImageListProbe
+    runtime = sys.modules[module.__name__ + '.image_list.runtime']
+    original_contexts = set(runtime._MASTER_JOBS)
+    image_list_nodes = sys.modules[module.__name__ + '.nodes.image_list']
+    workflow_meta = {'nodes': [{'id': 2, 'type': 'DistributedImageListStart'}], 'extra': {'acceptance': True}}
+    async def fake_worker_results(_context_id, *, model_callback=None):
+        state = runtime.get_master_job(_context_id)
+        assert state.prompt_id == 'image-list-lazy', state.prompt_id
+        assert state.workflow_meta == workflow_meta, state.workflow_meta
+        assert len(prompt_server.app.cleanup_ctx) >= 1, 'lifecycle cleanup was not registered'
+        return (
+            [torch.full((1, 8, 8, 3), value, dtype=torch.float32) for value in (0.125, 0.5, 0.875)],
+            [None, None, None], [None, None, None],
+        )
+
+    graph = {
+        '1': {'class_type': 'EmptyImage', 'inputs': {'height': 8, 'width': 8, 'batch_size': 3, 'color': 0}},
+        '2': {'class_type': 'DistributedImageListStart', 'inputs': {
+            'images': ['1', 0], 'image_list_enabled_worker_ids': '["test-worker"]',
+            'image_list_master_callback': 'http://127.0.0.1:1',
+            'image_list_workflow_meta': workflow_meta,
+        }},
+        '3': {'class_type': 'ImageListTestProbe', 'inputs': {'image': ['2', 0]}},
+        '4': {'class_type': 'DistributedImageListEnd', 'inputs': {
+            'images': ['3', 0], 'context': ['2', 3],
+        }},
+        '5': {'class_type': 'PreviewImage', 'inputs': {'images': ['4', 0]}},
+    }
+    valid = await execution.validate_prompt('image-list-lazy', graph, None)
+    assert valid[0], valid
+    validator = runtime.validate_image_list_regions
+    assert 'texts' not in graph['4']['inputs']
+    assert len(validator(graph)) == 1
+    connected_text_graph = json.loads(json.dumps(graph))
+    connected_text_graph['6'] = {
+        'class_type': 'ImageListTextProbe', 'inputs': {'text': ['2', 4]},
+    }
+    connected_text_graph['4']['inputs']['texts'] = ['6', 0]
+    assert len(validator(connected_text_graph)) == 1
+    for literal_text in ('', 'per-item text'):
+        literal_text_graph = json.loads(json.dumps(graph))
+        literal_text_graph['4']['inputs']['texts'] = literal_text
+        try:
+            validator(literal_text_graph)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'End accepted unconnected literal text: {literal_text!r}')
+    print('IMAGE_LIST_END_TEXT_INPUT_OK native forceInput; unconnected omitted; linked accepted; literals rejected')
+    import folder_paths
+    scratch = Path(os.environ.get('TMPDIR', Path.home() / '.hermes/cache/scratch'))
+    try:
+        # Resolve genuine Comfy output/temp annotations against the pinned core,
+        # not only the controlled folder_paths seam in unit tests.
+        media = sys.modules[module.__name__ + '.api.orchestration.media_sync']
+        with tempfile.TemporaryDirectory(prefix='media-roots-', dir=scratch) as media_root:
+            for kind in ('input', 'output', 'temp'):
+                source = Path(media_root) / kind / 'shared/ref.png'
+                source.parent.mkdir(parents=True)
+                source.write_bytes(kind.encode())
+            with patch.object(folder_paths, 'input_directory', str(Path(media_root) / 'input')), \
+                 patch.object(folder_paths, 'output_directory', str(Path(media_root) / 'output')), \
+                 patch.object(folder_paths, 'temp_directory', str(Path(media_root) / 'temp')):
+                for kind in ('output', 'temp'):
+                    refs = media._find_media_references({'1': {'inputs': {'image': f'shared/ref.png [{kind}]'}}})
+                    assert len(refs) == 1
+                    assert media._load_media_file_sync(refs[0])[0] == kind.encode()
+        with tempfile.TemporaryDirectory(prefix='image-list-lazy-', dir=scratch) as temp:
+            with patch.object(folder_paths, 'temp_directory', temp), \
+                 patch.object(image_list_nodes, 'run_image_list_job', fake_worker_results):
+                executor = execution.PromptExecutor(
+                    prompt_server, cache_args={'ram': 0, 'ram_inactive': 0}, asset_manager=asset_manager)
+                await asyncio.to_thread(executor.execute, graph, 'image-list-lazy', {}, valid[2])
+                assert executor.success, executor.status_messages
+                assert branch_calls == [], 'master evaluated the lazy per-image branch'
+                records = executor.history_result['outputs']['5']['images']
+                assert len(records) == 3, records
+                for record in records:
+                    preview = Path(temp) / record.get('subfolder', '') / record['filename']
+                    with Image.open(preview) as image:
+                        assert image.size == (8, 8) and image.mode == 'RGB'
+    finally:
+        nodes.NODE_CLASS_MAPPINGS.pop('ImageListTestProbe', None)
+        for context_id in set(runtime._MASTER_JOBS) - original_contexts:
+            runtime.remove_master_job(context_id)
+    print('IMAGE_LIST_LAZY_EXECUTION_OK real PromptExecutor; branch skipped on master; 3 previews verified')
+
+
 async def main():
     asset_manager = default_asset_manager()
     prompt_server = server.PromptServer(asyncio.get_running_loop(), asset_manager)
@@ -264,7 +366,7 @@ async def main():
     extension = await module.comfy_entrypoint()
     classes = await extension.get_node_list()
     mapping = {cls.GET_SCHEMA().node_id: cls for cls in classes}
-    assert len(classes) == len(mapping) == len(BASELINE) + len(ADDED_NODES) == 9
+    assert len(classes) == len(mapping) == len(BASELINE) + len(ADDED_NODES) == 11
     assert set(mapping) == set(BASELINE) | ADDED_NODES
     for node_id in ADDED_NODES:
         assert nodes.NODE_CLASS_MAPPINGS[node_id] is mapping[node_id]
@@ -315,9 +417,63 @@ async def main():
         if old['output_node']:
             expected_hidden.extend(name for name in ['prompt', 'extra_pnginfo'] if name not in expected_hidden)
         assert list(new['input'].get('hidden', {})) == expected_hidden, (node_id, new['input'].get('hidden'))
+    start_schema = mapping['DistributedImageListStart'].GET_SCHEMA()
+    end_schema = mapping['DistributedImageListEnd'].GET_SCHEMA()
+    assert start_schema.node_id == 'DistributedImageListStart'
+    assert start_schema.display_name == 'Distributed Image List Start'
+    assert end_schema.node_id == 'DistributedImageListEnd'
+    assert end_schema.display_name == 'Distributed Image List End'
+    texts_input = next(input for input in end_schema.inputs if input.id == 'texts')
+    texts_schema = texts_input.as_dict()
+    assert texts_schema.get('forceInput') is True, texts_schema
+    assert 'default' not in texts_schema, texts_schema
+    assert [out.io_type for out in start_schema.outputs] == [
+        'IMAGE', 'MASK', 'INT', 'DISTRIBUTED_IMAGE_LIST_CONTEXT'] + ['*'] * 10
+    assert [out.display_name for out in start_schema.outputs][4:] == [f'value_{i}' for i in range(1, 11)]
+    assert all(out.is_output_list for out in start_schema.outputs)
+    assert start_schema.is_input_list and start_schema.accept_all_inputs
+    start_info = json.loads(json.dumps(mapping['DistributedImageListStart'].GET_NODE_INFO_V1()))
+    assert list(start_info['input']['optional']) == ['images', 'mask', 'values'], start_info['input']
+    values_spec = start_info['input']['optional']['values']
+    assert values_spec[0] == 'COMFY_AUTOGROW_V3', values_spec
+    template = values_spec[1]['template']
+    assert template['names'] == [f'value_{i}' for i in range(1, 11)] and template['min'] == 0, template
+    assert template['input']['required']['value'][0] == 'IMAGE,MASK,STRING,INT,FLOAT,BOOLEAN', template
+    # Autogrow + INPUT_IS_LIST through the real parser/list mapper, values
+    # still split 1-or-N, unconnected slots ignored.
+    # get_input_data must accept Autogrow names; constants are wrapped once.
+    parsed, missing, hidden = execution.get_input_data(
+        {'values.value_1': 'shared', 'values.value_3': 4},
+        mapping['DistributedImageListStart'], unique_id='autogrow-probe', extra_data={})
+    assert not missing and parsed['values.value_1'] == ['shared'], parsed
+    # Linked inputs arrive as the upstream output list (one element per value).
+    prepared = {'images': [torch.zeros((3, 2, 2, 3))], 'values.value_1': ['shared'],
+                'values.value_3': [4, 5, 6]}
+    seen = {}
+    runtime_mod = sys.modules[module.__name__ + '.image_list.runtime']
+    def capture(_images, _mask, values):
+        seen['values'] = values
+        raise RuntimeError('captured')
+    nodes_mod = sys.modules[module.__name__ + '.nodes.image_list']
+    with patch.object(nodes_mod, 'normalize_image_list_inputs', capture):
+        try:
+            await asyncio.to_thread(lambda: asyncio.run(execution._async_map_node_over_list(
+                'autogrow-probe', 'autogrow-probe', mapping['DistributedImageListStart'], prepared,
+                'execute', v3_data=hidden)))
+        except RuntimeError as exc:
+            assert 'captured' in str(exc), exc
+    assert seen['values'] == {'value_1': ['shared'], 'value_3': [4, 5, 6]}, seen
+    rows = runtime_mod.normalize_image_list_inputs(prepared['images'], None, seen['values'])
+    assert [row['values'] for row in rows] == [{'value_1': 'shared', 'value_3': n} for n in (4, 5, 6)]
+    print('IMAGE_LIST_AUTOGROW_OK real parser; value_N slots shared/per-item')
+    assert [out.io_type for out in end_schema.outputs] == ['IMAGE', 'MASK', 'STRING']
+    assert all(out.is_output_list for out in end_schema.outputs)
+    assert end_schema.is_input_list and end_schema.is_output_node
+    print('IMAGE_LIST_SCHEMA_OK exact IDs, names, typed list outputs')
     print('SCHEMA_PARITY_OK', len(mapping))
     check_saved_workflows(mapping)
     await check_execution(mapping, module, prompt_server, asset_manager)
+    await check_image_list_lazy_executor(mapping, module, prompt_server, asset_manager)
     print('V3_ACCEPTANCE_OK')
 
 

@@ -5,6 +5,7 @@ import asyncio
 import copy
 import os
 import json
+import math
 from contextlib import asynccontextmanager
 from .logging import log
 from .secret_fields import is_secret_field_name as _is_secret_field_name
@@ -81,7 +82,8 @@ def get_default_config():
             "worker_probe_concurrency": 8,
             "worker_prep_concurrency": 4,
             "media_sync_concurrency": 2,
-            "media_sync_timeout_seconds": 120
+            "media_sync_timeout_seconds": 120,
+            "image_list_job_timeout_seconds": 0.0
         },
         "tunnel": {
             "status": "stopped",
@@ -213,6 +215,37 @@ def get_worker_timeout_seconds(default: int = HEARTBEAT_TIMEOUT) -> int:
         return max(1, val)
     except Exception:
         return max(1, int(default))
+
+
+def get_image_list_job_timeout_seconds(config=None) -> float:
+    """Return the validated image-list total-job timeout in seconds.
+
+    A value of zero disables the total-job deadline. Missing settings default
+    to zero; configured values must be finite, non-negative numbers.
+    """
+    setting_key = "settings.image_list_job_timeout_seconds"
+    cfg = load_config() if config is None else config
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{setting_key} must be a finite non-negative number")
+
+    settings = cfg.get("settings", {})
+    if not isinstance(settings, dict):
+        raise ValueError(f"{setting_key} must be a finite non-negative number")
+
+    value = settings.get("image_list_job_timeout_seconds", 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{setting_key} must be a finite non-negative number")
+    if isinstance(value, str) and not value.strip():
+        raise ValueError(f"{setting_key} must be a finite non-negative number")
+
+    try:
+        timeout = float(value)
+    except (OverflowError, ValueError):
+        raise ValueError(f"{setting_key} must be a finite non-negative number") from None
+
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError(f"{setting_key} must be a finite non-negative number")
+    return timeout
 
 
 def is_master_delegate_only() -> bool:

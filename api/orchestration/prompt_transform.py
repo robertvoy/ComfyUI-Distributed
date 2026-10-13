@@ -458,11 +458,55 @@ def prepare_delegate_master_prompt(prompt_obj, collector_ids):
     return pruned_prompt
 
 
+def _resolve_direct_workers_for_image_list(config, requested_ids):
+    """Resolve enabled workers by default, or exact explicitly selected direct workers."""
+    requested = None if requested_ids is None else {str(worker_id) for worker_id in requested_ids}
+    configured_workers = (config or {}).get("workers", [])
+    configured_ids = {
+        str(worker.get("id") or "").strip()
+        for worker in configured_workers
+        if str(worker.get("id") or "").strip()
+    }
+    if requested is not None:
+        unknown_ids = requested - configured_ids
+        if unknown_ids:
+            raise RuntimeError(
+                "Unknown explicitly selected image-list worker ID(s): "
+                + ", ".join(sorted(unknown_ids))
+            )
+    direct = []
+    for worker in configured_workers:
+        worker_id = str(worker.get("id") or "").strip()
+        if not worker_id:
+            continue
+        if requested is None:
+            if not worker.get("enabled", False):
+                continue
+        elif worker_id not in requested:
+            continue
+        if str(worker.get("type") or "local").strip().lower() == "serverless":
+            continue
+        try:
+            port = int(worker.get("port", worker.get("listen_port", 8188)) or 8188)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid port for image-list worker {worker_id}") from exc
+        direct.append({
+            "id": worker_id,
+            "name": str(worker.get("name") or worker_id),
+            "host": worker.get("host"),
+            "port": port,
+            "type": worker.get("type", "local"),
+        })
+    return direct
+
+
 def generate_job_id_map(prompt_index, prefix):
     """Create stable per-node job IDs for distributed nodes."""
     job_map = {}
-    distributed_nodes = prompt_index.nodes_for_class("DistributedCollector") + prompt_index.nodes_for_class(
-        "UltimateSDUpscaleDistributed"
+    distributed_nodes = (
+        prompt_index.nodes_for_class("DistributedCollector")
+        + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
+        + prompt_index.nodes_for_class("DistributedImageListStart")
     )
     for node_id in distributed_nodes:
         job_map[node_id] = f"{prefix}_{node_id}"
@@ -557,6 +601,22 @@ def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, 
             inputs["worker_id"] = f"worker_{worker_index_map.get(participant_id, 0)}"
 
 
+def _override_image_list_nodes(prompt_copy, prompt_index, participant_id, worker_ids,
+                               job_id_map, master_url, delegate_master, workflow_meta=None):
+    """Attach protocol context to Start without changing its visible V3 sockets."""
+    for node_id in prompt_index.nodes_for_class("DistributedImageListStart"):
+        node = prompt_copy.get(node_id)
+        if not isinstance(node, dict):
+            continue
+        inputs = node.setdefault("inputs", {})
+        inputs["image_list_enabled_worker_ids"] = json.dumps(list(worker_ids))
+        inputs["image_list_master_participates"] = participant_id == "master" and not delegate_master
+        inputs["image_list_master_callback"] = str(master_url or "")
+        inputs["image_list_execution_id"] = job_id_map.get(node_id, node_id)
+        if workflow_meta is not None:
+            inputs["image_list_workflow_meta"] = workflow_meta
+
+
 def apply_participant_overrides(
     prompt_copy,
     participant_id,
@@ -565,6 +625,7 @@ def apply_participant_overrides(
     master_url,
     delegate_master,
     prompt_index,
+    workflow_meta=None,
 ):
     """Return a prompt copy with hidden inputs configured for master/worker."""
     is_master = participant_id == "master"
@@ -591,6 +652,16 @@ def apply_participant_overrides(
         job_id_map,
         master_url,
         enabled_json,
+    )
+    _override_image_list_nodes(
+        prompt_copy,
+        prompt_index,
+        participant_id,
+        enabled_worker_ids,
+        job_id_map,
+        master_url,
+        delegate_master,
+        workflow_meta=workflow_meta,
     )
 
     return prompt_copy
