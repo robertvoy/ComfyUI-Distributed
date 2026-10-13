@@ -2,14 +2,15 @@
 
 A **Serverless (Runpod)** worker is a queue-based endpoint, not a permanent
 ComfyUI machine. Runpod chooses the actual GPU workers. Distributed submits one
-normal ComfyUI API workflow per logical slot and collects the returned images.
+normal ComfyUI API workflow per requested image and collects the returned images.
 The endpoint workers **do not need ComfyUI-Distributed installed**.
 
 ## Setup
 
 1. Add a worker in the Distributed panel and select **Serverless (Runpod)**.
-2. Enter its name, Runpod **endpoint ID** (not a URL), and API key.
-3. Start with **Jobs per run = 1**, **Concurrent jobs = 1**, and **Timeout = 1800**.
+2. Enter its name, Runpod **endpoint ID** (not a URL; a pasted `https://api.runpod.ai/v2/<id>/…`
+   URL is trimmed to the ID), and API key.
+3. Start with **Images per run = 1** and **Timeout = 1800**.
 4. Save, then choose **Test Saved Endpoint**. This checks authentication and
    endpoint health only; it does not start GPU inference or prove model/node compatibility.
 5. Enable the worker when you want queued Distributed workflows to use it.
@@ -72,15 +73,23 @@ incomplete serverless batch.
 
 ## Scheduling and cancellation
 
-- **Jobs per run** adds logical collector participants. Each receives its own
-  Distributed Seed/Value overrides. It is not a physical GPU count.
-- **Concurrent jobs** bounds this master's outstanding submissions per worker,
-  including retained jobs after a restart. Ambiguous submissions and unconfirmed
-  cancellations keep their capacity reservation until reconciled. Other
-  applications using the same endpoint are unaffected.
-- **Load balance** selects one participant, so it does not fan out every job slot.
-- **Timeout** includes waiting for a local slot, Runpod queue/cold-start time,
-  execution, and output retrieval. Provider policy limits are submitted as well.
+- **Images per run** (1–16) is how many separate Runpod jobs this worker submits
+  for each queued run. Each returns one image and receives its own Distributed
+  Seed/Value overrides. All of them are submitted at once.
+- How many of those jobs actually run in parallel is decided by the Runpod
+  endpoint's **max workers**, not by Distributed. Jobs beyond that wait in
+  Runpod's queue. To run every image at the same time, keep Images per run at or
+  below the endpoint's max workers.
+- Distributed also keeps a fixed limit of 16 outstanding jobs per serverless
+  worker (and 64 across all of them). Retained jobs after a restart, ambiguous
+  submissions, and unconfirmed cancellations keep counting against it until
+  reconciled. Other applications using the same endpoint are unaffected.
+- Older configs may contain a `concurrency` field from the previous separate
+  setting. It is still accepted when loading or saving, but ignored and dropped.
+- **Load balance** selects one participant, so it sends one job instead of
+  Images per run.
+- **Timeout** includes Runpod queue/cold-start time, execution, and output
+  retrieval. Provider policy limits are submitted as well.
 - A zero-worker endpoint can be healthy: Runpod scales from zero on submission.
 - Interrupting a collector or using the panel cancellation action requests
   cancellation only for jobs submitted by this master. It never purges the endpoint.
@@ -104,7 +113,7 @@ cancel action can request cancellation of known pre-restart jobs. If no job ID
 was received, check Runpod manually. Cancellation is best-effort and may race
 with completion; `CANCEL_REQUESTED` is not a provider-confirmed cancellation.
 
-Unresolved records protect the worker's endpoint, concurrency, API key, worker type,
+Unresolved records protect the worker's endpoint, API key, worker type,
 and deletion even when no local task remains. Disabling the worker is still allowed;
 it does not cancel existing jobs. On restart, never-submitted `WAITING` slots are
 closed locally, while interrupted `SUBMITTING` records without IDs become
@@ -161,4 +170,4 @@ are finished. No credentials or ledger files need to be edited by hand.
 
 This feature is verified with offline provider/transport tests. A successful
 health test is not a paid end-to-end generation test; test your deployed handler
-and model inventory with one slot before increasing concurrency.
+and model inventory with one image per run before increasing it.

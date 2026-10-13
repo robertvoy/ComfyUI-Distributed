@@ -7,7 +7,7 @@ import { createWorkerSettingsForm } from "../ui/settingsForm.js";
 import { DistributedUI } from "../ui.js";
 import { checkWorkerStatus, formatServerlessStatus, getWorkerUrl, launchWorker, stopWorker, viewWorkerLog } from "../workerLifecycle.js";
 import { handleClearMemory, handleInterruptWorkers } from "../workerUtils.js";
-import { isRemoteWorker, saveWorkerSettings, testServerlessWorker } from "../workerSettings.js";
+import { isRemoteWorker, normalizeRunpodEndpointId, saveWorkerSettings, testServerlessWorker } from "../workerSettings.js";
 import { performPreflightCheck } from "../executionUtils.js";
 
 function createDocumentMock() {
@@ -125,12 +125,14 @@ describe("Runpod serverless worker panel", () => {
             expect(elements.get(`${field}-group-saved`).style.display).toBe("none");
         }
         expect(elements.get("runpod-text-saved").style.display).toBe("none");
-        for (const field of ["endpoint-id", "api-key", "clear-api-key", "jobs-per-run", "concurrency", "timeout-seconds", "serverless-test"]) {
+        for (const field of ["endpoint-id", "api-key", "clear-api-key", "jobs-per-run", "timeout-seconds", "serverless-test"]) {
             expect(elements.get(`${field}-group-saved`).style.display).toBe("flex");
         }
+        // The separate concurrency setting was removed; a legacy value is ignored.
+        expect(elements.has("concurrency-saved")).toBe(false);
+        expect(elements.has("concurrency-group-saved")).toBe(false);
         expect(elements.get("endpoint-id-saved").value).toBe("ep_123");
         expect(elements.get("jobs-per-run-saved").value).toBe("2");
-        expect(elements.get("concurrency-saved").value).toBe("1");
         expect(elements.get("timeout-seconds-saved").value).toBe("900");
         expect(elements.get("api-key-saved").value).toBe("");
         expect(elements.get("api-key-saved").placeholder).toMatch(/leave blank/i);
@@ -170,10 +172,11 @@ describe("Runpod serverless worker panel", () => {
         for (const id of ["host-group-w1", "port-group-w1", "cuda-group-w1", "args-group-w1"]) {
             expect(elements.get(id).style.display).toBe("none");
         }
-        for (const id of ["endpoint-id-w1", "api-key-w1", "jobs-per-run-w1", "concurrency-w1", "timeout-seconds-w1"]) {
+        for (const id of ["endpoint-id-w1", "api-key-w1", "jobs-per-run-w1", "timeout-seconds-w1"]) {
             expect(elements.has(id)).toBe(true);
         }
-        for (const id of ["endpoint-id-group-w1", "api-key-group-w1", "clear-api-key-group-w1", "jobs-per-run-group-w1", "concurrency-group-w1", "timeout-seconds-group-w1", "serverless-test-group-w1"]) {
+        expect(elements.has("concurrency-w1")).toBe(false);
+        for (const id of ["endpoint-id-group-w1", "api-key-group-w1", "clear-api-key-group-w1", "jobs-per-run-group-w1", "timeout-seconds-group-w1", "serverless-test-group-w1"]) {
             expect(elements.get(id).style.display).toBe("flex");
         }
         expect(elements.has("serverless-help-w1")).toBe(false);
@@ -183,9 +186,9 @@ describe("Runpod serverless worker panel", () => {
         expect(elements.get("jobs-per-run-w1").value).toBe("1");
         expect(elements.get("jobs-per-run-w1").min).toBe("1");
         expect(elements.get("jobs-per-run-w1").max).toBe("16");
-        expect(elements.get("concurrency-w1").value).toBe("1");
-        expect(elements.get("concurrency-w1").min).toBe("1");
-        expect(elements.get("concurrency-w1").max).toBe("16");
+        expect(elements.get("jobs-per-run-w1").title).toBe(
+            "Separate Runpod jobs submitted each run, all at once. Runpod's max workers decides how many GPUs actually run them.",
+        );
         expect(elements.get("timeout-seconds-w1").value).toBe("1800");
         expect(elements.get("timeout-seconds-w1").min).toBe("30");
         expect(elements.get("timeout-seconds-w1").max).toBe("86400");
@@ -218,14 +221,13 @@ describe("Runpod serverless worker panel", () => {
         elements.set("api-key-w2", { value: "secret-token" });
         elements.set("clear-api-key-w2", { checked: false });
         elements.set("jobs-per-run-w2", { value: "4" });
-        elements.set("concurrency-w2", { value: "3" });
         elements.set("timeout-seconds-w2", { value: "2400" });
 
         await saveWorkerSettings(extension, "w2");
 
         expect(extension.api.updateWorker).toHaveBeenCalledWith("w2", {
             name: "Runpod worker", type: "serverless", provider: "runpod", endpoint_id: "ep_123",
-            api_key: "secret-token", jobs_per_run: 4, concurrency: 3, timeout_seconds: 2400, enabled: false,
+            api_key: "secret-token", jobs_per_run: 4, timeout_seconds: 2400, enabled: false,
         });
         expect(worker).toMatchObject({ type: "serverless", provider: "runpod", enabled: false, api_key_configured: true });
         expect(worker).not.toHaveProperty("api_key");
@@ -233,6 +235,104 @@ describe("Runpod serverless worker panel", () => {
         expect(elements.get("api-key-w2").value).toBe("");
         expect(extension.state.updateWorker).toHaveBeenCalledWith("w2", { enabled: false });
         expect(JSON.stringify(extension.state.updateWorker.mock.calls)).not.toContain("secret-token");
+    });
+
+    it("labels the single parallelism setting Images per run and drops a legacy concurrency value", async () => {
+        const worker = { id: "legacy", name: "Runpod", type: "serverless", provider: "runpod", enabled: false,
+            api_key_configured: true, jobs_per_run: 1, concurrency: 1 };
+        const extension = makeSaveExtension(worker);
+        elements.set("name-legacy", { value: "Runpod" });
+        elements.set("worker-type-legacy", { value: "serverless" });
+        elements.set("endpoint-id-legacy", { value: "ep_123" });
+        elements.set("api-key-legacy", { value: "" });
+        elements.set("clear-api-key-legacy", { checked: false });
+        elements.set("jobs-per-run-legacy", { value: "2" });
+        elements.set("timeout-seconds-legacy", { value: "1800" });
+
+        await saveWorkerSettings(extension, "legacy");
+
+        const payload = extension.api.updateWorker.mock.calls[0][1];
+        expect(payload.jobs_per_run).toBe(2);
+        expect(payload).not.toHaveProperty("concurrency");
+        expect(worker.jobs_per_run).toBe(2);
+        expect(worker).not.toHaveProperty("concurrency");
+
+        elements.set("jobs-per-run-legacy", { value: "17" });
+        await saveWorkerSettings(extension, "legacy");
+        expect(extension.api.updateWorker).toHaveBeenCalledTimes(1);
+        expect(extension.app.extensionManager.toast.add).toHaveBeenLastCalledWith(
+            expect.objectContaining({ detail: "Images per run must be a whole number from 1 to 16" }),
+        );
+    });
+
+    it("trims a pasted Runpod URL to the endpoint ID and explains other invalid IDs", async () => {
+        expect(normalizeRunpodEndpointId("  abc123xyz ")).toBe("abc123xyz");
+        expect(normalizeRunpodEndpointId("https://api.runpod.ai/v2/abc123xyz/run")).toBe("abc123xyz");
+        expect(normalizeRunpodEndpointId("api.runpod.ai/v2/abc_12-3")).toBe("abc_12-3");
+        expect(normalizeRunpodEndpointId("https://www.runpod.io/console/serverless/user/endpoint/abc")).toBe(
+            "https://www.runpod.io/console/serverless/user/endpoint/abc",
+        );
+
+        const worker = { id: "url", name: "Runpod", type: "serverless", provider: "runpod", enabled: false, api_key_configured: true };
+        const extension = makeSaveExtension(worker);
+        elements.set("name-url", { value: "Runpod" });
+        elements.set("worker-type-url", { value: "serverless" });
+        elements.set("endpoint-id-url", { value: "https://api.runpod.ai/v2/abc123xyz/runsync" });
+        elements.set("api-key-url", { value: "" });
+        elements.set("clear-api-key-url", { checked: false });
+        elements.set("jobs-per-run-url", { value: "1" });
+        elements.set("timeout-seconds-url", { value: "1800" });
+        await saveWorkerSettings(extension, "url");
+        expect(extension.api.updateWorker.mock.calls[0][1].endpoint_id).toBe("abc123xyz");
+
+        elements.set("endpoint-id-url", { value: "https://www.runpod.io/console/serverless/endpoint/abc" });
+        await saveWorkerSettings(extension, "url");
+        expect(extension.api.updateWorker).toHaveBeenCalledTimes(1);
+        expect(extension.app.extensionManager.toast.add).toHaveBeenLastCalledWith(
+            expect.objectContaining({ detail: expect.stringMatching(/just the Runpod endpoint ID/) }),
+        );
+    });
+
+    it("asks before a type change deletes the saved API key, and cancels cleanly", async () => {
+        const worker = { id: "conv", name: "Runpod", type: "serverless", provider: "runpod", enabled: false, api_key_configured: true };
+        const extension = makeSaveExtension(worker);
+        elements.set("name-conv", { value: "Runpod" });
+        elements.set("worker-type-conv", { value: "remote" });
+        elements.set("host-conv", { value: "192.168.1.20" });
+        elements.set("port-conv", { value: "8188" });
+        const confirmSpy = vi.fn().mockReturnValue(false);
+        globalThis.confirm = confirmSpy;
+        try {
+            await saveWorkerSettings(extension, "conv");
+            expect(confirmSpy).toHaveBeenCalledWith(expect.stringMatching(/saved Runpod API key will be deleted/));
+            expect(extension.api.updateWorker).not.toHaveBeenCalled();
+            expect(worker.type).toBe("serverless");
+
+            confirmSpy.mockReturnValue(true);
+            await saveWorkerSettings(extension, "conv");
+            expect(extension.api.updateWorker).toHaveBeenCalledTimes(1);
+            expect(extension.api.updateWorker.mock.calls[0][1].type).toBe("remote");
+        } finally {
+            delete globalThis.confirm;
+        }
+    });
+
+    it("does not ask for confirmation when a serverless worker without a key changes type", async () => {
+        const worker = { id: "nokey2", name: "Runpod", type: "serverless", provider: "runpod", enabled: false, api_key_configured: false };
+        const extension = makeSaveExtension(worker);
+        elements.set("name-nokey2", { value: "Runpod" });
+        elements.set("worker-type-nokey2", { value: "remote" });
+        elements.set("host-nokey2", { value: "192.168.1.20" });
+        elements.set("port-nokey2", { value: "8188" });
+        const confirmSpy = vi.fn().mockReturnValue(false);
+        globalThis.confirm = confirmSpy;
+        try {
+            await saveWorkerSettings(extension, "nokey2");
+            expect(confirmSpy).not.toHaveBeenCalled();
+            expect(extension.api.updateWorker).toHaveBeenCalledTimes(1);
+        } finally {
+            delete globalThis.confirm;
+        }
     });
 
     it("omits a blank API key so the saved key is preserved", async () => {
@@ -244,7 +344,6 @@ describe("Runpod serverless worker panel", () => {
         elements.set("api-key-w-blank", { value: "" });
         elements.set("clear-api-key-w-blank", { checked: false });
         elements.set("jobs-per-run-w-blank", { value: "1" });
-        elements.set("concurrency-w-blank", { value: "1" });
         elements.set("timeout-seconds-w-blank", { value: "1800" });
 
         await saveWorkerSettings(extension, "w-blank");
@@ -265,14 +364,13 @@ describe("Runpod serverless worker panel", () => {
         elements.set("api-key-w3", { value: "" });
         elements.set("clear-api-key-w3", { checked: true });
         elements.set("jobs-per-run-w3", { value: "1" });
-        elements.set("concurrency-w3", { value: "1" });
         elements.set("timeout-seconds-w3", { value: "1800" });
 
         await saveWorkerSettings(extension, "w3");
 
         expect(extension.api.updateWorker).toHaveBeenCalledWith("w3", {
             name: "Runpod", type: "serverless", provider: "runpod", endpoint_id: "ep_123",
-            clear_api_key: true, jobs_per_run: 1, concurrency: 1, timeout_seconds: 1800, enabled: true,
+            clear_api_key: true, jobs_per_run: 1, timeout_seconds: 1800, enabled: true,
         });
         expect(worker.api_key_configured).toBe(false);
         expect(worker).not.toHaveProperty("api_key");
@@ -317,7 +415,7 @@ describe("Runpod serverless worker panel", () => {
         expect(elements.get("serverless-status-compact").textContent).toBe("Queued");
         expect(elements.get("endpoint-id-compact").value).toBe("ep_private_id");
         expect(Number(elements.get("jobs-per-run-compact").value)).toBe(1);
-        expect(Number(elements.get("concurrency-compact").value)).toBe(1);
+        expect(elements.has("concurrency-compact")).toBe(false);
         const box = elements.get("controls-compact").children[0].children[0];
         expect(box.textContent).toBe("Runpod Serverless endpoint");
         expect(box.classList.values.has("dist-info-box")).toBe(true);

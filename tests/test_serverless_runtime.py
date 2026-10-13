@@ -34,7 +34,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.server = types.SimpleNamespace(distributed_pending_jobs={"collector-job": asyncio.Queue()}, distributed_jobs_lock=asyncio.Lock())
         self.manager = runtime.ServerlessManager(self.server, Secrets(), Path(self.temp.name) / "jobs.json", AsyncMock(return_value=object()))
         self.manager.poll_seconds = 0
-        self.worker = {"id": "pool:1", "pool_id": "pool", "endpoint_id": "ep1", "concurrency": 1, "timeout_seconds": 30, "type": "serverless"}
+        self.worker = {"id": "pool:1", "pool_id": "pool", "endpoint_id": "ep1", "timeout_seconds": 30, "type": "serverless"}
         self.prepared = {"worker": self.worker, "workflow": {"1": {}}, "images": [], "manifest": [{"job_id": "collector-job", "prefix": "dist_x", "kind": "image"}]}
 
     async def asyncTearDown(self):
@@ -90,7 +90,34 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.manager.cancel(worker_id="pool")
         api.cancel.assert_awaited_once_with("owned-job")
 
-    async def test_per_pool_concurrency_bounds_submission(self):
+    async def test_all_images_of_a_run_submit_at_once_ignoring_legacy_concurrency(self):
+        self.assertEqual(runtime.PER_WORKER_JOB_LIMIT, 16)
+        gate = asyncio.Event()
+        submitted = []
+        async def submit(*args):
+            submitted.append(args)
+            return f"provider-{len(submitted)}"
+        async def status(_job):
+            await gate.wait()
+            return {"status": "COMPLETED", "output": {"images": []}}
+        api = types.SimpleNamespace(submit=submit, status=status, cancel=AsyncMock())
+        # A config saved before the setting was removed still carries concurrency=1.
+        legacy = dict(self.worker, concurrency=1)
+        jobs = [dict(self.prepared, worker=dict(legacy, id=f"pool:{i}")) for i in range(1, 4)]
+        with patch.object(runtime, "RunpodClient", return_value=api), patch.object(runtime, "decode_results", AsyncMock(return_value={"collector-job": ["tensor"]})):
+            await self.manager.start("execution", "prompt", jobs)
+            for _ in range(50):
+                if len(submitted) == 3:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(len(submitted), 3)
+            gate.set()
+            await self.manager.wait_for_execution("execution")
+
+    async def test_per_pool_job_limit_bounds_submission(self):
+        patcher = patch.object(runtime, "PER_WORKER_JOB_LIMIT", 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         gate = asyncio.Event()
         reached = asyncio.Event()
         count = 0
@@ -135,7 +162,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.prepared["worker"] = dict(self.worker, timeout_seconds=0.01)
         api = types.SimpleNamespace(submit=AsyncMock(return_value="job"), status=AsyncMock(side_effect=lambda _: asyncio.sleep(5)), cancel=AsyncMock(return_value={"status": "CANCELLED"}))
         # A blocked slot expires without a billable submission.
-        self.manager.pool_limits["pool"] = (1, asyncio.Semaphore(0))
+        self.manager.pool_limits["pool"] = asyncio.Semaphore(0)
         with patch.object(runtime, "RunpodClient", return_value=api):
             await self.manager.start("execution", "prompt", [self.prepared])
             await self.manager.wait_for_execution("execution")

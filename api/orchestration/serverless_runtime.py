@@ -12,6 +12,15 @@ from .serverless_state import (
 )
 
 
+# Fixed per-worker cap on this master's outstanding Runpod jobs; equals the
+# Images per run maximum (MAX_JOBS_PER_RUN in utils/serverless_config.py), so
+# every image of a run is submitted at once. Deliberately not configurable or
+# derived from jobs_per_run: unresolved jobs from earlier runs (ambiguous
+# submissions, unconfirmed cancels) still count against it, and a constant
+# never has to change while such jobs exist.
+PER_WORKER_JOB_LIMIT = 16
+
+
 async def decode_results(output, manifest):
     from .serverless_media import collect_images
     import torch
@@ -85,7 +94,7 @@ class ServerlessManager:
                 self._check_master(run)
                 outstanding = sum(belongs_to_pool(record, pool_id) and occupies_capacity(record)
                                   for record in self.ledger.all())
-                if outstanding < run["worker"]["concurrency"]:
+                if outstanding < PER_WORKER_JOB_LIMIT:
                     # Claim atomically before any await that could submit a billed job.
                     self.ledger.update(run["record_id"], status="SUBMITTING", updated_at=time.time())
                     return
@@ -122,18 +131,14 @@ class ServerlessManager:
             return result
 
     def _semaphore(self, worker):
+        # The limit is a constant, so it never has to be swapped while this
+        # worker still has unresolved jobs.
         pool_id = worker.get("pool_id", worker["id"])
-        limit = worker["concurrency"]
-        current = self.pool_limits.get(pool_id)
-        if current is None:
-            current = (limit, asyncio.Semaphore(limit))
-            self.pool_limits[pool_id] = current
-        elif current[0] != limit:
-            if self.pool_is_active(pool_id):
-                raise ValueError("Wait for this serverless worker's current jobs before changing concurrency")
-            current = (limit, asyncio.Semaphore(limit))
-            self.pool_limits[pool_id] = current
-        return current[1]
+        semaphore = self.pool_limits.get(pool_id)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(PER_WORKER_JOB_LIMIT)
+            self.pool_limits[pool_id] = semaphore
+        return semaphore
 
     def ensure_capacity(self, count):
         if sum(not task.done() for task in self.tasks.values()) + count > 64:

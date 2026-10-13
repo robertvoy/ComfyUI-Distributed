@@ -15,7 +15,8 @@ import { parseHostInput, getMasterUrl as buildMasterUrl } from './urlUtils.js';
 
 const WORKERS_CHANGED_EVENT = "distributed:workers-changed";
 
-class DistributedExtension {
+// Exported for tests; ComfyUI only uses the registerExtension side effect below.
+export class DistributedExtension {
     constructor() {
         this.config = null;
         this.originalQueuePrompt = api.queuePrompt.bind(api);
@@ -196,6 +197,7 @@ class DistributedExtension {
 
     async updateWorkerEnabled(workerId, enabled) {
         const worker = this.config.workers.find(w => w.id === workerId);
+        const previousEnabled = worker ? Boolean(worker.enabled) : !enabled;
         if (worker) {
             worker.enabled = enabled;
             this.state.updateWorker(workerId, { enabled });
@@ -219,6 +221,19 @@ class DistributedExtension {
             await this.api.updateWorker(workerId, { enabled });
         } catch (error) {
             this.log("Error updating worker: " + error.message, "error");
+            // The backend kept the old state (e.g. a serverless worker without a
+            // saved API key); show that instead of a toggle that did not stick.
+            if (worker) {
+                worker.enabled = previousEnabled;
+                this.state.updateWorker(workerId, { enabled: previousEnabled });
+                this._emitWorkersChanged();
+            }
+            this.app?.extensionManager?.toast?.add({
+                severity: "error",
+                summary: enabled ? "Could not enable worker" : "Could not disable worker",
+                detail: error.message,
+                life: 5000,
+            });
         }
 
         if (this.panelElement) {

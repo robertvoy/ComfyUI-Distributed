@@ -210,7 +210,8 @@ class ServerlessConfigRouteTests(_ConfigRouteFixture):
         saved = self.read_config_file()["workers"][0]
         self.assertEqual(saved["endpoint_id"], "ep-123")
         self.assertEqual(saved["jobs_per_run"], 3)
-        self.assertEqual(saved["concurrency"], 2)
+        # Legacy field from older browser tabs is accepted but not persisted.
+        self.assertNotIn("concurrency", saved)
         self.assertEqual(saved["timeout_seconds"], 600)
         for obsolete in ("host", "port", "cuda_device", "extra_args", "api_key", "clear_api_key"):
             self.assertNotIn(obsolete, saved)
@@ -233,7 +234,7 @@ class ServerlessConfigRouteTests(_ConfigRouteFixture):
         self.assertTrue(worker["enabled"])
         self.assertEqual(worker["endpoint_id"], "ep-123")
         self.assertEqual(worker["jobs_per_run"], 4)
-        self.assertEqual(worker["concurrency"], 3)
+        self.assertNotIn("concurrency", worker)
         self.assertEqual(worker["timeout_seconds"], 900)
         self.assertEqual(self.secrets.get("pool-1"), "saved-secret")
         self.assertTrue(response.payload["api_key_configured"])
@@ -242,7 +243,7 @@ class ServerlessConfigRouteTests(_ConfigRouteFixture):
         secret = "must-not-leak"
         response = await config_routes.update_worker_endpoint(_FakeRequest({
             "worker_id": "pool-1", "type": "serverless", "provider": "runpod",
-            "endpoint_id": "ep-123", "concurrency": True, "api_key": secret,
+            "endpoint_id": "ep-123", "jobs_per_run": True, "api_key": secret,
         }))
 
         self.assertEqual(response.status, 400)
@@ -507,8 +508,8 @@ class ServerlessConfigRouteTests(_ConfigRouteFixture):
         self.assertEqual(response.status, 400)
         self.assertEqual(self.read_config_file()["workers"], [])
 
-    async def test_bulk_concurrency_change_is_blocked_during_active_run(self):
-        self.config["workers"] = [{"id": "pool-1", "type": "serverless", "endpoint_id": "ep-123", "concurrency": 1}]
+    async def test_bulk_endpoint_change_is_blocked_during_active_run(self):
+        self.config["workers"] = [{"id": "pool-1", "type": "serverless", "endpoint_id": "ep-123"}]
         self.assertTrue(config_module.save_config(self.config))
         runtime_module.manager = types.SimpleNamespace(
             tasks={"run-1": _RunningTask()},
@@ -516,10 +517,10 @@ class ServerlessConfigRouteTests(_ConfigRouteFixture):
             pool_is_active=lambda worker_id: worker_id == "pool-1",
         )
         updated = copy.deepcopy(self.config["workers"])
-        updated[0]["concurrency"] = 2
+        updated[0]["endpoint_id"] = "ep-other"
         response = await config_routes.update_config_endpoint(_FakeRequest({"workers": updated}))
         self.assertEqual(response.status, 409)
-        self.assertEqual(self.read_config_file()["workers"][0]["concurrency"], 1)
+        self.assertEqual(self.read_config_file()["workers"][0]["endpoint_id"], "ep-123")
 
     async def test_non_serverless_update_behavior_is_preserved(self):
         self.config["workers"] = [{"id": "local-1", "name": "Local", "type": "local", "port": 8188}]
@@ -574,18 +575,33 @@ class PersistedPoolGuardTests(_ConfigRouteFixture):
                         runtime_module.manager = self.manager
                     else:
                         self.manager.tasks["retained"] = types.SimpleNamespace(done=lambda: True)
-                    for fields in ({"api_key": "new-key"}, {"clear_api_key": True}, {"endpoint_id": "ep-other"}, {"concurrency": 2}, {"type": "local", "port": 8188}):
+                    for fields in ({"api_key": "new-key"}, {"clear_api_key": True}, {"endpoint_id": "ep-other"}, {"type": "local", "port": 8188}):
                         response = await config_routes.update_worker_endpoint(_FakeRequest(dict(fields, worker_id="pool-1")))
                         self.assertEqual(response.status, 409, fields)
                     response = await config_routes.delete_worker_endpoint(_FakeRequest({"worker_id": "pool-1"}))
                     self.assertEqual(response.status, 409)
                     worker = original["workers"][0]
-                    for workers in ([], [dict(worker, type="local")], [dict(worker, endpoint_id="ep-other")], [dict(worker, concurrency=2)]):
+                    for workers in ([], [dict(worker, type="local")], [dict(worker, endpoint_id="ep-other")]):
                         response = await config_routes.update_config_endpoint(_FakeRequest({"workers": workers}))
                         self.assertEqual(response.status, 409, workers)
                     self.assertEqual(self.read_config_file(), original)
                     self.assertEqual(self.secrets.get("pool-1"), "saved-key")
         self.session_factory.assert_not_awaited()
+
+    async def test_retained_jobs_allow_images_per_run_and_legacy_concurrency_saves(self):
+        # Upgrading from a config with concurrency=1 must not trip the busy guard,
+        # and the image count stays editable while old jobs are unresolved.
+        self.manager.ledger.update("retained", worker_id="pool-1", endpoint_id="ep-123", status="UNKNOWN")
+        response = await config_routes.update_worker_endpoint(_FakeRequest({
+            "worker_id": "pool-1", "endpoint_id": "ep-123", "jobs_per_run": 2, "concurrency": 2,
+        }))
+        self.assertEqual(response.status, 200)
+        saved = self.read_config_file()["workers"][0]
+        self.assertEqual(saved["jobs_per_run"], 2)
+        self.assertNotIn("concurrency", saved)
+        response = await config_routes.update_config_endpoint(_FakeRequest({"workers": [dict(saved, jobs_per_run=3, concurrency=5)]}))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.read_config_file()["workers"][0]["jobs_per_run"], 3)
 
     async def test_retained_job_allows_disable_and_rename_but_not_key_clear(self):
         self.manager.ledger.update("retained", worker_id="pool-1", status="UNKNOWN")
