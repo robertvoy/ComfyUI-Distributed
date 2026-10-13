@@ -187,5 +187,28 @@ class UltimateSDUpscaleDistributed(io.ComfyNode):
             master_url, enabled_worker_ids, worker_id, tile_indices, dynamic_threshold))
 
 
+class DistributedWorkerSink(io.ComfyNode):
+    """Internal output node that terminates pruned worker prompts.
+
+    Worker prompts drop everything downstream of the distributed node, which
+    leaves no output node for ComfyUI to execute towards. This sink provides
+    one without writing preview files (PreviewImage wrote every frame to the
+    worker's temp directory). Hidden from search/menus; inserted by the master.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id='DistributedWorkerSink', display_name='Distributed Worker Sink (internal)', category='utils',
+            inputs=[io.AnyType.Input('value')],
+            is_output_node=True, is_dev_only=True,
+        )
+
+    @classmethod
+    def execute(cls, value):
+        return io.NodeOutput()
+
+
 NODES = [DistributedCollector, DistributedSeed, DistributedModelName, DistributedValue,
-         ImageBatchDivider, AudioBatchDivider, DistributedEmptyImage, UltimateSDUpscaleDistributed]
+         ImageBatchDivider, AudioBatchDivider, DistributedEmptyImage, UltimateSDUpscaleDistributed,
+         DistributedWorkerSink]

@@ -21,7 +21,12 @@ from .orchestration.dispatch import (
     select_active_workers,
     select_least_busy_worker,
 )
-from .orchestration.media_sync import convert_paths_for_platform, fetch_worker_path_separator, sync_worker_media
+from .orchestration.media_sync import (
+    convert_paths_for_platform,
+    fetch_worker_has_node,
+    fetch_worker_path_separator,
+    sync_worker_media,
+)
 from .orchestration.prompt_transform import (
     PromptIndex,
     apply_participant_overrides,
@@ -29,6 +34,7 @@ from .orchestration.prompt_transform import (
     generate_job_id_map,
     prepare_delegate_master_prompt,
     prune_prompt_for_worker,
+    WORKER_SINK_CLASS,
 )
 
 
@@ -162,12 +168,21 @@ async def _prepare_worker_payload(
 
         worker_type = str(worker.get("type") or "local").strip().lower()
         is_remote_like = bool(worker.get("host")) and worker_type != "local"
-        if is_remote_like:
-            path_separator = await fetch_worker_path_separator(worker, trace_execution_id=trace_execution_id)
-            if path_separator:
-                worker_prompt = convert_paths_for_platform(worker_prompt, path_separator)
+        # Older workers lack the sink node; they keep the PreviewImage terminator.
+        has_sink_task = asyncio.ensure_future(
+            fetch_worker_has_node(worker, WORKER_SINK_CLASS, trace_execution_id=trace_execution_id)
+        )
+        try:
+            if is_remote_like:
+                path_separator = await fetch_worker_path_separator(worker, trace_execution_id=trace_execution_id)
+                if path_separator:
+                    worker_prompt = convert_paths_for_platform(worker_prompt, path_separator)
+            use_worker_sink = await has_sink_task
+        finally:
+            if not has_sink_task.done():
+                has_sink_task.cancel()
 
-        worker_prompt = prune_prompt_for_worker(worker_prompt)
+        worker_prompt = prune_prompt_for_worker(worker_prompt, use_worker_sink=use_worker_sink)
         worker_prompt = apply_participant_overrides(
             worker_prompt,
             worker["id"],

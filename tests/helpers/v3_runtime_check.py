@@ -43,6 +43,10 @@ ADDED_OPTIONAL_INPUTS = {
     },
 }
 
+# Nodes added after the V1 baseline; not part of saved-workflow contracts.
+# DistributedWorkerSink is internal (dev-only) and only inserted by the master.
+ADDED_NODES = {'DistributedWorkerSink'}
+
 
 def normalized_input(value):
     kind = value[0]
@@ -222,7 +226,32 @@ async def check_execution(mapping, module, prompt_server, asset_manager):
             with Image.open(preview) as image:
                 assert image.size == (8, 8) and image.mode == 'RGB'
                 assert image.getextrema() == ((0, 0), (0, 0), (0, 0))
-    print('V3_EXECUTION_OK eight nodes; upscale GPU boundary mocked; preview artifact verified')
+
+    # A worker prompt terminated by the sink validates and runs through the
+    # real executor without writing anything to the temp directory.
+    sink_graph = {
+        '1': {'class_type': 'EmptyImage', 'inputs': {'height': 8, 'width': 8, 'batch_size': 4, 'color': 0}},
+        '2': {'class_type': 'DistributedCollector', 'inputs': {'images': ['1', 0], 'load_balance': False,
+                                                              'pass_through': True}},
+        '3': {'class_type': 'DistributedWorkerSink', 'inputs': {'value': ['2', 0]}},
+    }
+    valid = await execution.validate_prompt('v3-sink', sink_graph, None)
+    assert valid[0], valid
+    assert valid[2] == ['3'], valid[2]
+    collected = []
+    def record_run(self, **kwargs):
+        collected.append(kwargs['images'])
+        return (kwargs['images'][0], None)
+    with tempfile.TemporaryDirectory(prefix='v3-sink-', dir=scratch) as temp:
+        with patch.object(folder_paths, 'temp_directory', temp), patch.object(collector_runtime, 'run', record_run):
+            executor = execution.PromptExecutor(
+                prompt_server, cache_args={'ram': 0, 'ram_inactive': 0}, asset_manager=asset_manager)
+            await asyncio.to_thread(executor.execute, sink_graph, 'v3-sink', {}, valid[2])
+            assert executor.success, executor.status_messages
+            assert len(collected) == 1 and collected[0][0].shape == (4, 8, 8, 3), collected
+            assert list(Path(temp).rglob('*')) == [], list(Path(temp).rglob('*'))
+            assert executor.history_result['outputs'].get('3', {}) == {}, executor.history_result
+    print('V3_EXECUTION_OK nine nodes; upscale GPU boundary mocked; preview artifact verified; sink writes nothing')
 
 
 async def main():
@@ -235,9 +264,15 @@ async def main():
     extension = await module.comfy_entrypoint()
     classes = await extension.get_node_list()
     mapping = {cls.GET_SCHEMA().node_id: cls for cls in classes}
-    assert len(classes) == len(mapping) == len(BASELINE) == 8
-    assert set(mapping) == set(BASELINE)
+    assert len(classes) == len(mapping) == len(BASELINE) + len(ADDED_NODES) == 9
+    assert set(mapping) == set(BASELINE) | ADDED_NODES
+    for node_id in ADDED_NODES:
+        assert nodes.NODE_CLASS_MAPPINGS[node_id] is mapping[node_id]
+    sink_info = mapping['DistributedWorkerSink'].GET_NODE_INFO_V1()
+    assert sink_info['output_node'] and sink_info['dev_only'], sink_info
     for node_id, cls in mapping.items():
+        if node_id in ADDED_NODES:
+            continue
         assert issubclass(cls, io.ComfyNode)
         assert nodes.NODE_CLASS_MAPPINGS[node_id] is cls
         old = dict(BASELINE[node_id])
