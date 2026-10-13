@@ -74,6 +74,8 @@ The master can either contribute GPU work or stay in **orchestrator-only** mode:
 
 > ComfyUI instances running on a cloud service like Runpod. 
 
+For faster result transfers and lower bandwidth usage, see [Compressed Result Transfer](compressed-result-transfer.md).
+
 ### Deploy Cloud Worker on Runpod
 
 📺 [Watch Tutorial](https://www.youtube.com/watch?v=wxKKWMQhYTk)

@@ -260,6 +260,40 @@ class PrunePromptForWorkerTests(unittest.TestCase):
         preview_nodes = [n for n in result.values() if n.get("class_type") == "PreviewImage"]
         self.assertEqual(len(preview_nodes), 0)
 
+    def test_worker_sink_replaces_preview_image(self):
+        result = pt.prune_prompt_for_worker(_linear_prompt(), use_worker_sink=True)
+        sinks = [n for n in result.values() if n.get("class_type") == pt.WORKER_SINK_CLASS]
+        self.assertEqual(len(sinks), 1)
+        self.assertEqual(sinks[0]["inputs"], {"value": ["4", 0]})
+        self.assertFalse(any(n.get("class_type") in ("PreviewImage", "PreviewAudio") for n in result.values()))
+
+    def test_worker_sink_uses_audio_output_for_audio_only_collector(self):
+        result = pt.prune_prompt_for_worker(_audio_only_prompt(), use_worker_sink=True)
+        sinks = [n for n in result.values() if n.get("class_type") == pt.WORKER_SINK_CLASS]
+        self.assertEqual([s["inputs"] for s in sinks], [{"value": ["2", 1]}])
+        self.assertFalse(any(n.get("class_type") == "PreviewAudio" for n in result.values()))
+
+    def test_worker_sink_for_distributed_upscale(self):
+        prompt = {
+            "1": {"class_type": "LoadImage", "inputs": {}},
+            "2": {"class_type": "UltimateSDUpscaleDistributed", "inputs": {"upscaled_image": ["1", 0]}},
+            "3": {"class_type": "SaveImage", "inputs": {"images": ["2", 0]}},
+        }
+        result = pt.prune_prompt_for_worker(prompt, use_worker_sink=True)
+        sinks = [n for n in result.values() if n.get("class_type") == pt.WORKER_SINK_CLASS]
+        self.assertEqual([s["inputs"] for s in sinks], [{"value": ["2", 0]}])
+        self.assertNotIn("3", result)
+
+    def test_worker_sink_ids_do_not_collide_with_original_prompt(self):
+        prompt = _linear_prompt()
+        result = pt.prune_prompt_for_worker(prompt, use_worker_sink=True)
+        sink_ids = [k for k, n in result.items() if n.get("class_type") == pt.WORKER_SINK_CLASS]
+        self.assertTrue(all(k not in prompt for k in sink_ids))
+
+    def test_no_worker_sink_when_no_downstream(self):
+        result = pt.prune_prompt_for_worker(_collector_only_prompt(), use_worker_sink=True)
+        self.assertFalse(any(n.get("class_type") == pt.WORKER_SINK_CLASS for n in result.values()))
+
     def test_unrelated_nodes_are_pruned(self):
         prompt = {
             "1": {"class_type": "DistributedCollector", "inputs": {}},
