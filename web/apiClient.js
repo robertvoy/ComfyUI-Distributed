@@ -7,7 +7,7 @@ export function createApiClient(baseUrl) {
     const request = async (
         endpoint,
         options = {},
-        { retries = TIMEOUTS.MAX_RETRIES, retry = true } = {},
+        { retries = TIMEOUTS.MAX_RETRIES, retry = true, redactErrors = false } = {},
     ) => {
         const maxAttempts = retry ? retries : 1;
         let lastError;
@@ -36,7 +36,7 @@ export function createApiClient(baseUrl) {
                 return await response.json();
             } catch (error) {
                 lastError = error;
-                console.log(`API Error (attempt ${attempt + 1}/${maxAttempts}): ${endpoint} - ${error.message}`);
+                console.log(`API Error (attempt ${attempt + 1}/${maxAttempts}): ${endpoint} - ${redactErrors ? "[redacted]" : error.message}`);
                 if (attempt < maxAttempts - 1) {
                     await new Promise(resolve => setTimeout(resolve, delay));
                     delay *= 2; // Exponential backoff
@@ -86,9 +86,35 @@ export function createApiClient(baseUrl) {
         },
         
         async updateWorker(workerId, data) {
-            return request('/distributed/config/update_worker', {
+            const apiKey = data?.api_key;
+            try {
+                return await request('/distributed/config/update_worker', {
+                    method: 'POST',
+                    body: JSON.stringify({ worker_id: workerId, ...data })
+                }, { retry: false, redactErrors: Boolean(apiKey) });
+            } catch (error) {
+                if (apiKey && typeof error?.message === "string") {
+                    error.message = error.message.split(apiKey).join("[redacted]");
+                }
+                throw error;
+            }
+        },
+
+        async testServerlessWorker(workerId) {
+            return request('/distributed/serverless/test', {
                 method: 'POST',
-                body: JSON.stringify({ worker_id: workerId, ...data })
+                body: JSON.stringify({ worker_id: workerId }),
+            }, { retry: false });
+        },
+
+        async getServerlessStatus(workerId) {
+            return request(`/distributed/serverless/status/${encodeURIComponent(workerId)}`);
+        },
+
+        async cancelServerlessWorker(workerId) {
+            return request('/distributed/serverless/cancel', {
+                method: 'POST',
+                body: JSON.stringify({ worker_id: workerId }),
             }, { retry: false });
         },
         

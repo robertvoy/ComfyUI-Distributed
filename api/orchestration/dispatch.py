@@ -55,6 +55,11 @@ async def worker_ws_is_active(worker):
 
 async def _probe_worker_active(worker, use_websocket, semaphore):
     async with semaphore:
+        if worker.get("type") == "serverless":
+            from .serverless_runtime import get_manager
+            # Authentication/configuration failures must surface, not silently skip paid work.
+            status = await get_manager().health(worker)
+            return worker, status["ok"]
         is_active = await (worker_ws_is_active(worker) if use_websocket else worker_is_active(worker))
         return worker, is_active
 
@@ -203,6 +208,10 @@ def _extract_queue_remaining(payload):
 
 async def _probe_worker_queue(worker, semaphore, probe_timeout):
     async with semaphore:
+        if worker.get("type") == "serverless":
+            from .serverless_runtime import get_manager
+            status = await get_manager().health(worker)
+            return {"worker": worker, "queue_remaining": status["queueRemaining"]}
         worker_url = build_worker_url(worker)
         payload = await probe_worker(worker_url, timeout=probe_timeout)
         if payload is None:

@@ -219,6 +219,10 @@ def _load_job_routes_module():
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
     spec.loader.exec_module(module)
+    # Keep response assertions independent of real aiohttp import ordering.
+    module.web = types.SimpleNamespace(
+        json_response=lambda payload, status=200: _FakeResponse(payload, status=status)
+    )
 
     if created_aiohttp_stub:
         sys.modules.pop("aiohttp", None)

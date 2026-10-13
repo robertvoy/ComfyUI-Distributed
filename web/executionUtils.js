@@ -112,6 +112,21 @@ export async function performPreflightCheck(extension, workers) {
     const startTime = Date.now();
     
     const checkPromises = workers.map(async (worker) => {
+        if (worker.type === "serverless") {
+            try {
+                const providerStatus = await extension.api.getServerlessStatus(worker.id);
+                if (providerStatus?.ok) {
+                    extension.log(`Serverless worker ${worker.name} is ready to scale`, "debug");
+                    return { worker, active: true };
+                }
+                extension.log(`Serverless worker ${worker.name} is not ready: ${providerStatus?.message || "unavailable"}`, "debug");
+                return { worker, active: false };
+            } catch (error) {
+                extension.log(`Serverless worker ${worker.name} status check failed: ${error.message}`, "debug");
+                return { worker, active: false };
+            }
+        }
+
         const workerUrl = getWorkerUrl(extension, worker);
         
         extension.log(`Pre-flight checking ${worker.name} at: ${workerUrl}`, "debug");

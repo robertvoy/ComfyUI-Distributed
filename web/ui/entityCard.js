@@ -1,4 +1,4 @@
-import { updateWorkerControls, toggleWorkerExpanded } from "../workerLifecycle.js";
+import { updateWorkerControls, toggleWorkerExpanded, formatServerlessStatus } from "../workerLifecycle.js";
 import { isRemoteWorker } from "../workerSettings.js";
 
 export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
@@ -73,6 +73,17 @@ export function renderEntityCard(ui, cardConfigs, entityType, data, extension) {
     infoSpan.classList.add("dist-worker-info");
     infoSpan.innerHTML = config.infoText(data, extension);
     workerContent.appendChild(infoSpan);
+
+    if (isWorker && data.type === "serverless") {
+        const statusMessage = document.createElement("small");
+        statusMessage.id = `serverless-status-${data.id}`;
+        statusMessage.className = "dist-worker-info__meta dist-serverless-status";
+        statusMessage.setAttribute("aria-live", "polite");
+        const status = extension.state.getWorker(data.id)?.serverlessStatus;
+        statusMessage.textContent = data.enabled ? formatServerlessStatus(status) : "Disabled";
+        statusMessage.title = status?.message || "";
+        infoSpan.appendChild(statusMessage);
+    }
 
     infoRow.appendChild(workerContent);
 

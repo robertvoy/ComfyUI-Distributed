@@ -7,6 +7,14 @@ import { createLogModal } from './ui/logModal.js';
 import { launchWorker, stopWorker, updateWorkerControls, viewWorkerLog } from './workerLifecycle.js';
 import { isRemoteWorker } from './workerSettings.js';
 
+const escapeWorkerInfo = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+}[character]));
+
 const cardConfigs = {
     master: {
         checkbox: { 
@@ -58,7 +66,12 @@ const cardConfigs = {
         infoText: (data, extension) => {
             const isRemote = isRemoteWorker(extension, data);
             const isCloud = data.type === 'cloud';
-            
+            const isServerless = data.type === 'serverless';
+
+            if (isServerless) {
+                return `<span class="dist-worker-info__title">${escapeWorkerInfo(data.name)}</span>`;
+            }
+
             if (isCloud) {
                 // For cloud workers, don't show port (it's always 443)
                 return `<span class="dist-worker-info__title">${data.name}</span><br><span class="dist-worker-info__meta">${data.host}</span>`;
@@ -590,7 +603,10 @@ export class DistributedUI {
             }
             controlsWrapper.appendChild(badge);
         } else if (config.dynamic && data) {
-            if (isRemote) {
+            if (data.type === 'serverless') {
+                // Match the master/remote footer without exposing direct-worker actions.
+                controlsWrapper.appendChild(this.createInfoBox("Runpod Serverless endpoint"));
+            } else if (isRemote) {
                 const isCloud = data.type === 'cloud';
                 const workerTypeText = isCloud ? "Cloud worker" : "Remote worker";
                 const workerTypeBadge = this.createInfoBox(workerTypeText);

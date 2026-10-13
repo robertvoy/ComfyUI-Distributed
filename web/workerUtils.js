@@ -19,12 +19,17 @@ export async function handleWorkerOperation(extension, button, operation, succes
     setButtonStateClass("btn--working");
     
     try {
-        const urlsToProcess = extension.enabledWorkers.map(w => ({ 
-            name: w.name, 
-            url: getWorkerUrl(extension, w)
+        const workersToProcess = extension.enabledWorkers.filter((worker) =>
+            operation.endpoint !== ENDPOINTS.CLEAR_MEMORY || worker.type !== "serverless"
+        );
+        const targets = workersToProcess.map((worker) => ({
+            name: worker.name,
+            worker,
+            serverless: worker.type === "serverless",
+            url: worker.type === "serverless" ? null : getWorkerUrl(extension, worker),
         }));
-        
-        if (urlsToProcess.length === 0) {
+
+        if (targets.length === 0) {
             button.textContent = "No Workers";
             setButtonStateClass("btn--error");
             setTimeout(() => {
@@ -37,14 +42,19 @@ export async function handleWorkerOperation(extension, button, operation, succes
             return;
         }
         
-        const promises = urlsToProcess.map(target =>
-            fetch(`${target.url}${operation.endpoint}`, { 
-                method: 'POST', 
+        const promises = targets.map((target) => {
+            if (target.serverless && operation.name === "Interrupt") {
+                return extension.api.cancelServerlessWorker(target.worker.id)
+                    .then((result) => ({ ok: result?.ok !== false, name: target.name }))
+                    .catch(() => ({ ok: false, name: target.name }));
+            }
+            return fetch(`${target.url}${operation.endpoint}`, {
+                method: 'POST',
                 mode: 'cors'
             })
                 .then(response => ({ ok: response.ok, name: target.name }))
-                .catch(() => ({ ok: false, name: target.name }))
-        );
+                .catch(() => ({ ok: false, name: target.name }));
+        });
         
         const results = await Promise.all(promises);
         const failures = results.filter(r => !r.ok);

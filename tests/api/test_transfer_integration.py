@@ -35,6 +35,9 @@ def _load_modules():
         return web.json_response({"error": str(error)}, status=status)
 
     job_routes.handle_api_error = handle_api_error
+    # The queue-test harness also fakes aiohttp.web for route modules; the
+    # endpoint must build real responses for the real server used here.
+    job_routes.web = web
     # The collector harness stubs aiohttp; this test needs the real client.
     sys.modules["aiohttp"] = real_aiohttp
     collector.aiohttp = real_aiohttp

@@ -18,6 +18,19 @@ export function updateWorkerCard(extension, workerId, newStatus = {}) {
     const workerState = extension.state.getWorker(workerId);
     const isLaunching = Boolean(workerState?.launching);
 
+    if (worker.type === "serverless") {
+        const providerStatus = workerState?.serverlessStatus || {};
+        if (newStatus.online && newStatus.processing) {
+            extension.ui.updateStatusDot(workerId, STATUS_COLORS.PROCESSING_YELLOW, `Runpod active (${newStatus.queueCount || 0} queued)`, false);
+        } else if (newStatus.online) {
+            extension.ui.updateStatusDot(workerId, STATUS_COLORS.ONLINE_GREEN, providerStatus.message || "Runpod ready to scale", false);
+        } else if (worker.enabled) {
+            extension.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, providerStatus.message || "Runpod endpoint unavailable", false);
+        }
+        updateWorkerControls(extension, workerId);
+        return true;
+    }
+
     if (isLaunching && !newStatus.online) {
         extension.ui.updateStatusDot(workerId, STATUS_COLORS.PROCESSING_YELLOW, "Launching...", true);
     } else if (newStatus.online && newStatus.processing) {

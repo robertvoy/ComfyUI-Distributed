@@ -10,6 +10,8 @@ from ..utils.logging import debug_log
 
 async def is_local_worker(worker_config):
     """Check if a worker is running on the same machine as the master."""
+    if worker_config.get('type') == 'serverless':
+        return False
     host = normalize_host(worker_config.get('host', 'localhost')) or 'localhost'
     if host in ['localhost', '127.0.0.1', '0.0.0.0', ''] or worker_config.get('type') == 'local':
         return True
