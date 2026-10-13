@@ -328,8 +328,19 @@ def _find_delegate_master_retained_upstream_nodes(prompt_obj, start_ids):
     return connected
 
 
-def prune_prompt_for_worker(prompt_obj):
-    """Prune worker prompt to distributed nodes and their upstream dependencies."""
+WORKER_SINK_CLASS = "DistributedWorkerSink"
+
+
+def prune_prompt_for_worker(prompt_obj, use_worker_sink=False):
+    """Prune worker prompt to distributed nodes and their upstream dependencies.
+
+    Removing downstream nodes can leave the worker prompt without an output
+    node. One is re-added after each such distributed node: the hidden
+    ``DistributedWorkerSink`` when ``use_worker_sink`` is set (the worker must
+    have it registered), otherwise PreviewImage/PreviewAudio for workers
+    running older versions. The preview nodes write every frame to the
+    worker's temp directory, which the sink avoids.
+    """
     collector_ids = find_nodes_by_class(prompt_obj, "DistributedCollector")
     upscale_ids = find_nodes_by_class(prompt_obj, "UltimateSDUpscaleDistributed")
     distributed_ids = collector_ids + upscale_ids
@@ -364,7 +375,13 @@ def prune_prompt_for_worker(prompt_obj):
                 and len(inputs["audio"]) == 2
             )
 
-            if image_connected:
+            if use_worker_sink and (image_connected or audio_connected):
+                pruned_prompt[next_id()] = {
+                    "inputs": {"value": [dist_id, 0 if image_connected else 1]},
+                    "class_type": WORKER_SINK_CLASS,
+                    "_meta": {"title": "Distributed Worker Sink (auto-added)"},
+                }
+            elif image_connected:
                 preview_id = next_id()
                 pruned_prompt[preview_id] = {
                     "inputs": {"images": [dist_id, 0]},

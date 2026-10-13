@@ -226,6 +226,26 @@ Yes, it is compatible with Docker setups, but you will need to configure your Do
 
 ---
 
+## Community projects
+
+Community-maintained add-ons and forks that extend ComfyUI-Distributed.
+
+### [ComfyUI-H3MC-Distributed](https://github.com/ymiyad/ComfyUI-H3MC-Distributed) by ymiyad
+
+Connects H3 Motion Context with ComfyUI-Distributed to generate multiple candidate takes of the next video clip across your workers. Compare the results, pick your preferred take, and use it as context for the next clip.
+
+Each saved candidate video includes its continuation latent, so you don't need a shared folder or separate latent files. This add-on speeds up iteration through parallel candidates; it does not split a single clip across GPUs.
+
+### [ComfyUI-Deadline-Distributed](https://github.com/doubletwisted/ComfyUI-Deadline-Distributed) by doubletwisted
+
+A fork of ComfyUI-Distributed with Thinkbox/AWS Deadline 10 integration for render farms. Claim Deadline workers from the Distributed panel, register them automatically, and collect their results back into your master workflow.
+
+Requires Deadline 10 and the author's ComfyUI-Deadline-Plugin.
+
+See each repository for installation instructions, requirements, and support.
+
+---
+
 ## Disclaimer
 
 This software is provided "as is" without any warranties, express or implied, including merchantability, fitness for a particular purpose, or non-infringement. The developers and copyright holders are not liable for any claims, damages, or liabilities arising from the use, modification, or distribution of the software. Users are solely responsible for ensuring compliance with applicable laws and regulations and for securing their networks against unauthorized access, hacking, data breaches, or loss. The developers assume no liability for any damages or incidents resulting from misuse, improper configuration, or external threats.

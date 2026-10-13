@@ -294,3 +294,70 @@ class AnnotatedMediaUploadTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# fetch_worker_has_node
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status, payload):
+        self.status = status
+        self._payload = payload
+
+    async def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.urls = []
+
+    def get(self, url, timeout=None):
+        self.urls.append(url)
+        if self.error:
+            raise self.error
+        return self.response
+
+
+class FetchWorkerHasNodeTests(unittest.TestCase):
+    def _probe(self, session):
+        import asyncio
+
+        async def _get_session():
+            return session
+
+        original = ms.get_client_session
+        ms.get_client_session = _get_session
+        try:
+            return asyncio.run(ms.fetch_worker_has_node({"id": "w1"}, "DistributedWorkerSink"))
+        finally:
+            ms.get_client_session = original
+
+    def test_registered_node_is_reported(self):
+        session = _FakeSession(_FakeResponse(200, {"DistributedWorkerSink": {"name": "DistributedWorkerSink"}}))
+        self.assertTrue(self._probe(session))
+        self.assertEqual(session.urls, ["http://localhost/object_info/DistributedWorkerSink"])
+
+    def test_unknown_node_returns_empty_object(self):
+        # ComfyUI answers 200 {} for classes that are not registered.
+        self.assertFalse(self._probe(_FakeSession(_FakeResponse(200, {}))))
+
+    def test_http_error_counts_as_missing(self):
+        self.assertFalse(self._probe(_FakeSession(_FakeResponse(404, None))))
+
+    def test_bad_json_counts_as_missing(self):
+        self.assertFalse(self._probe(_FakeSession(_FakeResponse(200, ValueError("bad json")))))
+
+    def test_connection_error_counts_as_missing(self):
+        self.assertFalse(self._probe(_FakeSession(error=OSError("unreachable"))))

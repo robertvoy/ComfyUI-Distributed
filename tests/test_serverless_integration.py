@@ -31,7 +31,7 @@ def load_modules():
     modules[PKG + ".utils.async_helpers"] = module("async_helpers", queue_prompt_payload=AsyncMock())
     modules[PKG + ".utils.network"] = module("network", build_master_url=lambda **k: "http://master", build_master_callback_url=lambda *a, **k: "http://master")
     modules[PKG + ".api.orchestration.dispatch"] = module("dispatch", dispatch_worker_prompt=AsyncMock(), select_active_workers=AsyncMock(), select_least_busy_worker=AsyncMock())
-    modules[PKG + ".api.orchestration.media_sync"] = module("media_sync", convert_paths_for_platform=lambda p, _: p, fetch_worker_path_separator=AsyncMock(), sync_worker_media=AsyncMock())
+    modules[PKG + ".api.orchestration.media_sync"] = module("media_sync", convert_paths_for_platform=lambda p, _: p, fetch_worker_path_separator=AsyncMock(), fetch_worker_has_node=AsyncMock(return_value=False), sync_worker_media=AsyncMock())
     with patch.dict(sys.modules, modules):
         spec = importlib.util.spec_from_file_location(PKG + ".api.queue_orchestration", ROOT / "api/queue_orchestration.py")
         q = importlib.util.module_from_spec(spec)

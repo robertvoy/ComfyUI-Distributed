@@ -30,6 +30,23 @@ import torch
 
 BASELINE = json.loads((ROOT / 'tests/fixtures/v1_node_contracts.json').read_text())
 
+# Inputs intentionally added after the V1 baseline was captured. They must be
+# optional, appended after the baseline inputs, and keep legacy behaviour as
+# their default so saved workflows are unaffected.
+ADDED_OPTIONAL_INPUTS = {
+    'DistributedCollector': {
+        'transfer_format': [
+            ['legacy_png', 'png', 'ffv1', 'jpeg', 'webp', 'h264', 'h265', 'av1'],
+            {'default': 'legacy_png'},
+        ],
+        'transfer_quality': ['INT', {'default': 90, 'min': 1, 'max': 100, 'step': 1}],
+    },
+}
+
+# Nodes added after the V1 baseline; not part of saved-workflow contracts.
+# DistributedWorkerSink is internal (dev-only) and only inserted by the master.
+ADDED_NODES = {'DistributedWorkerSink', 'DistributedImageListStart', 'DistributedImageListEnd'}
+
 
 def normalized_input(value):
     kind = value[0]
@@ -134,6 +151,22 @@ async def check_execution(mapping, module, prompt_server, asset_manager):
     assert torch.equal(result[0].result[0], images[:3])
     assert 'v3-aggregate' not in prompt_server.distributed_pending_jobs
 
+    # The registered node must forward the transfer options to the runtime
+    # helper, and default to the legacy transfer when they are not set.
+    collector_runtime = sys.modules[module.__name__ + '.nodes.collector'].DistributedCollectorNode
+    forwarded = []
+    def fake_run(self, **kwargs):
+        forwarded.append(kwargs)
+        return (kwargs['images'], kwargs['audio'])
+    with patch.object(collector_runtime, 'run', fake_run):
+        await map_node(collector, {'images': images[:1], 'load_balance': False, 'pass_through': True,
+                                   'transfer_format': 'av1', 'transfer_quality': 70})
+        await map_node(collector, {'images': images[:1], 'load_balance': False, 'pass_through': True})
+    # Set values arrive list-wrapped (is_input_list); unset ones use the
+    # execute() defaults. The runtime helper unwraps both forms.
+    assert [(kw['transfer_format'], kw['transfer_quality']) for kw in forwarded] == [
+        (['av1'], [70]), ('legacy_png', 90)], forwarded
+
     # Prove V3's per-execution class clones do not leak helper instance state;
     # replace only the GPU/model boundary, not the input parser or executor.
     upscale_runtime = sys.modules[module.__name__ + '.nodes.distributed_upscale'].UltimateSDUpscaleDistributed
@@ -193,7 +226,32 @@ async def check_execution(mapping, module, prompt_server, asset_manager):
             with Image.open(preview) as image:
                 assert image.size == (8, 8) and image.mode == 'RGB'
                 assert image.getextrema() == ((0, 0), (0, 0), (0, 0))
-    print('V3_EXECUTION_OK eight nodes; upscale GPU boundary mocked; preview artifact verified')
+
+    # A worker prompt terminated by the sink validates and runs through the
+    # real executor without writing anything to the temp directory.
+    sink_graph = {
+        '1': {'class_type': 'EmptyImage', 'inputs': {'height': 8, 'width': 8, 'batch_size': 4, 'color': 0}},
+        '2': {'class_type': 'DistributedCollector', 'inputs': {'images': ['1', 0], 'load_balance': False,
+                                                              'pass_through': True}},
+        '3': {'class_type': 'DistributedWorkerSink', 'inputs': {'value': ['2', 0]}},
+    }
+    valid = await execution.validate_prompt('v3-sink', sink_graph, None)
+    assert valid[0], valid
+    assert valid[2] == ['3'], valid[2]
+    collected = []
+    def record_run(self, **kwargs):
+        collected.append(kwargs['images'])
+        return (kwargs['images'][0], None)
+    with tempfile.TemporaryDirectory(prefix='v3-sink-', dir=scratch) as temp:
+        with patch.object(folder_paths, 'temp_directory', temp), patch.object(collector_runtime, 'run', record_run):
+            executor = execution.PromptExecutor(
+                prompt_server, cache_args={'ram': 0, 'ram_inactive': 0}, asset_manager=asset_manager)
+            await asyncio.to_thread(executor.execute, sink_graph, 'v3-sink', {}, valid[2])
+            assert executor.success, executor.status_messages
+            assert len(collected) == 1 and collected[0][0].shape == (4, 8, 8, 3), collected
+            assert list(Path(temp).rglob('*')) == [], list(Path(temp).rglob('*'))
+            assert executor.history_result['outputs'].get('3', {}) == {}, executor.history_result
+    print('V3_EXECUTION_OK nine nodes; upscale GPU boundary mocked; preview artifact verified; sink writes nothing')
 
 
 async def check_image_list_lazy_executor(mapping, module, prompt_server, asset_manager):
@@ -308,10 +366,15 @@ async def main():
     extension = await module.comfy_entrypoint()
     classes = await extension.get_node_list()
     mapping = {cls.GET_SCHEMA().node_id: cls for cls in classes}
-    assert len(classes) == len(mapping) == len(BASELINE) + 2 == 10
-    assert set(mapping) == set(BASELINE) | {'DistributedImageListStart', 'DistributedImageListEnd'}
-    for node_id in BASELINE:
-        cls = mapping[node_id]
+    assert len(classes) == len(mapping) == len(BASELINE) + len(ADDED_NODES) == 11
+    assert set(mapping) == set(BASELINE) | ADDED_NODES
+    for node_id in ADDED_NODES:
+        assert nodes.NODE_CLASS_MAPPINGS[node_id] is mapping[node_id]
+    sink_info = mapping['DistributedWorkerSink'].GET_NODE_INFO_V1()
+    assert sink_info['output_node'] and sink_info['dev_only'], sink_info
+    for node_id, cls in mapping.items():
+        if node_id in ADDED_NODES:
+            continue
         assert issubclass(cls, io.ComfyNode)
         assert nodes.NODE_CLASS_MAPPINGS[node_id] is cls
         old = dict(BASELINE[node_id])
@@ -324,7 +387,15 @@ async def main():
         new = json.loads(json.dumps(cls.GET_NODE_INFO_V1()))
         for group in ('required', 'optional'):
             old_inputs = old['input'].get(group, {})
-            new_inputs = new['input'].get(group, {})
+            new_inputs = dict(new['input'].get(group, {}))
+            if group == 'optional':
+                for name, expected in ADDED_OPTIONAL_INPUTS.get(node_id, {}).items():
+                    assert name in new_inputs, (node_id, name, 'added input missing')
+                    actual = normalized_input(new_inputs.pop(name))
+                    kind, opts = normalized_input(expected)
+                    assert actual[0] == kind, (node_id, name, actual)
+                    for key, value in opts.items():
+                        assert actual[1].get(key) == value, (node_id, name, key, actual)
             assert list(old_inputs) == list(new_inputs), (node_id, group, 'input order')
             for name, original in old_inputs.items():
                 assert normalized_input(original) == normalized_input(new_inputs[name]), (node_id, name, original, new_inputs[name])
