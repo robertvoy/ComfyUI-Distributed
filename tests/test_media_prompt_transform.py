@@ -1,4 +1,4 @@
-"""Pure integration of participant identity, typed compilation and delegate pruning."""
+"""Participant identity, typed compilation and legacy Collector pruning."""
 import copy
 import importlib
 import json
@@ -16,17 +16,17 @@ for suffix in ("", ".api", ".api.orchestration", ".utils", ".serverless_bridge")
     sys.modules[module.__name__] = module
 pt = importlib.import_module(PACKAGE + ".api.orchestration.prompt_transform")
 compiler = importlib.import_module(PACKAGE + ".api.orchestration.serverless_media_prompt")
-contract = importlib.import_module(PACKAGE + ".serverless_bridge.contract")
+SOCKETS = ("images", "audio")
 
 
-def prompt():
+def prompt(sockets=SOCKETS):
     nodes = {
         "source": {"class_type": "MediaSource", "inputs": {}},
-        "collector": {"class_type": "DistributedMediaCollector", "inputs": {
-            socket: ["source", index] for index, socket in enumerate(contract.SOCKET_KINDS)}},
+        "collector": {"class_type": "DistributedCollector", "inputs": {
+            socket: ["source", SOCKETS.index(socket)] for socket in sockets}},
     }
-    for index, socket in enumerate(contract.SOCKET_KINDS):
-        nodes["sink:" + socket] = {"class_type": "Capture", "inputs": {"value": ["collector", index]}}
+    for socket in sockets:
+        nodes["sink:" + socket] = {"class_type": "Capture", "inputs": {"value": ["collector", SOCKETS.index(socket)]}}
     return nodes
 
 
@@ -38,47 +38,41 @@ def prepare(graph, participant, delegate):
         ["serverless:pool:1", "serverless:pool:2"], jobs, "http://master", delegate, index)
 
 
-def test_typed_worker_preparation_compiles_all_bindings_without_source_mutation():
+def test_typed_worker_preparation_compiles_both_bindings_without_source_mutation():
     graph = prompt()
     before = copy.deepcopy(graph)
     worker = prepare(graph, "serverless:pool:2", True)
     compiled, bindings = compiler.compile_media_prompt(worker, "request:2")
-    assert len(bindings) == 5
+    assert len(bindings) == 2
     assert {row["participant_id"] for row in bindings} == {"serverless:pool:2"}
     assert {row["job_id"] for row in bindings} == {"run_collector"}
-    assert {row["socket"] for row in bindings} == set(contract.SOCKET_KINDS)
+    assert {row["socket"] for row in bindings} == set(SOCKETS)
     assert set(compiled) == {"source"} | {row["node_id"] for row in bindings}
     assert graph == before
 
 
-def test_typed_delegate_master_keeps_outputs_without_sources_or_placeholders():
-    graph = prompt()
+@pytest.mark.parametrize("sockets", [("images",), ("audio",), SOCKETS])
+def test_delegate_master_keeps_collector_socket_contract_and_legacy_placeholder(sockets):
+    graph = prompt(sockets)
     prepared = prepare(graph, "master", True)
     before = copy.deepcopy(prepared)
     delegated = pt.prepare_delegate_master_prompt(prepared, ["collector"])
-    assert set(delegated) == {"collector"} | {"sink:" + s for s in contract.SOCKET_KINDS}
+    assert "source" not in delegated
+    assert {"collector"} | {"sink:" + s for s in sockets} <= set(delegated)
     inputs = delegated["collector"]["inputs"]
-    assert not set(contract.SOCKET_KINDS) & set(inputs)
-    assert json.loads(inputs["expected_media"]) == list(contract.SOCKET_KINDS)
+    assert "audio" not in inputs and "expected_media" not in inputs
+    placeholders = [key for key, node in delegated.items() if node['class_type'] == 'DistributedEmptyImage']
+    if "images" in sockets:
+        assert len(placeholders) == 1
+        assert inputs['images'] == [placeholders[0], 0]
+    else:
+        assert not placeholders and 'images' not in inputs
     assert inputs["delegate_only"] is True
+    assert json.loads(inputs["enabled_worker_ids"]) == ["serverless:pool:1", "serverless:pool:2"]
     assert prepared == before
 
 
-def test_text_source_is_not_retained_as_lightweight_delegate_scalar(monkeypatch):
-    graph = {
-        "text": {"class_type": "PrimitiveString", "inputs": {"value": "local text"}},
-        "collector": {"class_type": "DistributedMediaCollector", "inputs": {"texts": ["text", 0]}},
-        "sink": {"class_type": "Capture", "inputs": {"value": ["collector", 3]}},
-    }
-    monkeypatch.setattr(pt, "_delegate_master_input_is_safe_scalar", lambda *args: True)
-    monkeypatch.setattr(pt, "_is_delegate_master_retained_upstream_node", lambda *args: True)
-    delegated = pt.prepare_delegate_master_prompt(prepare(graph, "master", True), ["collector"])
-    assert "text" not in delegated
-    assert "texts" not in delegated["collector"]["inputs"]
-    assert json.loads(delegated["collector"]["inputs"]["expected_media"]) == ["texts"]
-
-
-@pytest.mark.parametrize("socket", contract.SOCKET_KINDS)
+@pytest.mark.parametrize("socket", SOCKETS)
 def test_participating_master_retains_exact_media_links(socket):
     graph = prompt()
     original = copy.deepcopy(graph)

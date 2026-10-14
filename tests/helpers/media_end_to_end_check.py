@@ -93,11 +93,12 @@ async def check(base):
     contract = load("serverless_bridge.contract")
     video_codec = load("serverless_bridge.video_codec")
     bridge = load("serverless_bridge")
-    collector = load("nodes.media_collector").DistributedMediaCollector
+    collector = load("nodes.v3").DistributedCollector
     extension = await bridge.comfy_entrypoint()
     bridge_classes = await extension.get_node_list()
     assert {cls.GET_SCHEMA().node_id for cls in bridge_classes} == {"MediaImportV1", "MediaExportV1"}
     sockets = list(contract.SOCKET_KINDS)
+    collector_sockets = ["images", "audio"]
     kinds = list(contract.SOCKET_KINDS.values())
     assert kinds == ["IMAGE", "AUDIO", "MASK", "STRING", "VIDEO"]
     io_types = [io.Image, io.Audio, io.Mask, io.String, io.Video]
@@ -165,9 +166,10 @@ async def check(base):
             assert set(media) == set(expected)
             for socket in expected:
                 assert len(media[socket]) == len(expected[socket]), (tag, socket)
-                # Collector must preserve native objects and ordered item lists,
-                # not merge batches, resample, convert types, or encode again.
-                assert all(a is e for a, e in zip(media[socket], expected[socket])), (tag, socket)
+                # Existing Collector outputs are a batched IMAGE and one AUDIO,
+                # not lists. Native V3 wraps each output once for this list sink.
+                for actual, wanted in zip(media[socket], expected[socket]):
+                    exact(contract.SOCKET_KINDS[socket], actual, wanted)
             counts = {socket: len(media[socket]) for socket in expected}
             seen_sinks[tag[0]] = counts
             return io.NodeOutput(ui={"accepted": [counts]})
@@ -179,6 +181,19 @@ async def check(base):
 
     def node(class_type, **inputs):
         return {"class_type": class_type, "inputs": inputs}
+
+    def add_bridge_exports(workflow, manifest, request_id, participant, job_id, links):
+        """Exercise bridge-only kinds without inventing Collector sockets."""
+        for socket, link in links.items():
+            export_id = "bridge-export:" + socket
+            binding = {"binding_id": "bridge-binding:" + socket, "collector_id": "bridge-only",
+                       "job_id": job_id, "participant_id": participant, "node_id": export_id,
+                       "socket": socket, "kind": contract.SOCKET_KINDS[socket]}
+            assert export_id not in workflow
+            manifest.append(binding)
+            workflow[export_id] = node("MediaExportV1", request_id=request_id,
+                                      binding_json=json.dumps(binding), **{socket: link})
+        contract.validate_bindings(manifest)
 
     def tiny_video(variant):
         buffer = bytes_io.BytesIO()
@@ -199,7 +214,7 @@ async def check(base):
         image[0, 0, 0, 0] = -0.0
         mask = torch.tensor([[[-0.0, 0.125, 0.875]]], dtype=torch.bfloat16)
         audio = {"waveform": torch.arange(38, dtype=torch.float64).reshape(1, 2, 19) / 997,
-                 "sample_rate": 44100 + variant}
+                 "sample_rate": 44100}
         audio["waveform"][0, 0, 0] = -0.0
         component = VideoFromComponents(VideoComponents(
             images=image[..., :3], frame_rate=Fraction(30000, 1001), alpha=mask.reshape(1, 1, 3, 1).repeat(2, 2, 1, 1),
@@ -220,7 +235,7 @@ async def check(base):
     with wave.open(str(wav), "wb") as out:
         out.setnchannels(2)
         out.setsampwidth(2)
-        out.setframerate(22050)
+        out.setframerate(44100)
         out.writeframes(pcm.tobytes())
     waveform, sample_rate = nodes_audio.load(str(wav))
     clip = native_root / "native.mkv"
@@ -278,17 +293,22 @@ async def check(base):
             participant = "serverless:" + key
             request_id = "acceptance-" + key
             graph = {"source": node("AcceptanceMediaSource", key=key),
-                     "collector": node("DistributedMediaCollector", load_balance=False,
+                     "collector": node("DistributedCollector", load_balance=False, transfer_format="exact",
                          multi_job_id="job-main", worker_id=participant,
-                         **{socket: ["source", index] for index, socket in enumerate(sockets)}),
-                     "text-collector": node("DistributedMediaCollector", load_balance=False,
-                         multi_job_id="job-text", worker_id=participant, texts=["source", 3])}
+                         **{socket: ["source", index] for index, socket in enumerate(collector_sockets)}),
+                     "audio-collector": node("DistributedCollector", load_balance=False,
+                         multi_job_id="job-audio", worker_id=participant, audio=["source", 1])}
             if key == "worker-a":
                 graph.update({"wav": node("LoadAudio", audio=wav.name), "clip": node("LoadVideo", file=clip.name)})
-                graph["collector"]["inputs"].update(audio=["wav", 0], video=["clip", 0])
+                graph["collector"]["inputs"]["audio"] = ["wav", 0]
             before = copy.deepcopy(graph)
             workflow, manifest = compiler.compile_media_prompt(graph, request_id)
             assert graph == before
+            bridge_links = {socket: ["source", sockets.index(socket)] for socket in sockets[2:]}
+            if key == "worker-a":
+                workflow["clip"] = copy.deepcopy(graph["clip"])
+                bridge_links["video"] = ["clip", 0]
+            add_bridge_exports(workflow, manifest, request_id, participant, "job-bridge", bridge_links)
             assert len(manifest) == 6 and {b["kind"] for b in manifest} == set(kinds)
             folder_paths.set_input_directory(str(native_root))
             workflow_before = copy.deepcopy(workflow)
@@ -335,17 +355,19 @@ async def check(base):
             # Exercise the wire format, not an in-memory handler-only object.
             result = json.loads(json.dumps(result, allow_nan=False))
             grouped = await decoder.collect_typed_results(result, media, manifest)
-            assert set(grouped) == {"job-main", "job-text"}
-            assert set(grouped["job-main"]) == set(sockets)
-            assert grouped["job-text"]["texts"] == expectations[key]["texts"]
+            assert set(grouped) == {"job-main", "job-audio", "job-bridge"}
+            assert set(grouped["job-main"]) == set(collector_sockets)
+            assert set(grouped["job-bridge"]) == set(sockets[2:])
+            exact("AUDIO", grouped["job-audio"]["audio"][0], fixtures[key]["audio"][0])
+            all_media = {**grouped["job-main"], **grouped["job-bridge"]}
             for socket, kind in zip(sockets, kinds):
-                values, expected = grouped["job-main"][socket], expectations[key][socket]
+                values, expected = all_media[socket], expectations[key][socket]
                 assert len(values) == len(expected), (key, socket)
                 for actual, wanted in zip(values, expected):
                     exact(kind, actual, wanted)
             if key == "worker-b":
                 original = fixtures[key]["video"][0].get_components()
-                decoded = grouped["job-main"]["video"][0].get_components()
+                decoded = grouped["job-bridge"]["video"][0].get_components()
                 for field in ("images", "alpha"):
                     assert getattr(decoded, field).data_ptr() != getattr(original, field).data_ptr()
                 assert decoded.audio["waveform"].data_ptr() != original.audio["waveform"].data_ptr()
@@ -363,7 +385,7 @@ async def check(base):
             assert ps.distributed_pending_jobs == {}
         # Exercise user-selected image return encoding through the actual
         # compiler, HTTP handler, V3 exporter and atomic response decoder.
-        for fmt in ("png", "jpeg", "h264"):
+        for fmt in ("legacy_png", "png", "jpeg", "h264"):
             key = "encoded-" + fmt
             fixtures[key] = native_fixtures(3)
             # Keep full alpha precision and use nontrivial image dimensions.
@@ -372,12 +394,23 @@ async def check(base):
             fixtures[key]["images"] = [rgba]
             request_id = "request-" + key
             graph = {"source": node("AcceptanceMediaSource", key=key),
-                     "collector": node("DistributedMediaCollector", transfer_format=fmt,
+                     "collector": node("DistributedCollector", transfer_format=fmt,
                          transfer_quality=73, multi_job_id="job-" + key,
                          worker_id="serverless:" + key,
-                         **{socket: ["source", i] for i, socket in enumerate(sockets)})}
+                         **{socket: ["source", i] for i, socket in enumerate(collector_sockets)})}
+            if fmt == "legacy_png":
+                # A saved Collector with no newly selected controls still uses
+                # legacy_png / 90, mapped to PNG by the serverless compiler.
+                graph["collector"]["inputs"].pop("transfer_format")
+                graph["collector"]["inputs"].pop("transfer_quality")
             original = copy.deepcopy(graph)
             workflow, manifest = compiler.compile_media_prompt(graph, request_id)
+            if fmt == "legacy_png":
+                binding = next(b for b in manifest if b["kind"] == "IMAGE")
+                controls = workflow[binding["node_id"]]["inputs"]
+                assert (controls["transfer_format"], controls["transfer_quality"]) == ("png", 90)
+            add_bridge_exports(workflow, manifest, request_id, "serverless:" + key, "job-bridge-" + key,
+                               {socket: ["source", sockets.index(socket)] for socket in sockets[2:]})
             media = {"version": 1, "profile": contract.PROFILE, "request_id": request_id,
                      "artifacts": [], "inputs": [], "outputs": manifest}
             body = json.loads(serializer(workflow, [], 30, media=media))
@@ -385,23 +418,32 @@ async def check(base):
                         input_dir=base / "input", temp_dir=base / "temp", timeout_seconds=30)
             assert graph == original
             grouped = await decoder.collect_typed_results(result, media, manifest)
-            actual = grouped["job-" + key]
+            actual = {**grouped["job-" + key], **grouped["job-bridge-" + key]}
             image = actual["images"][0]
             assert image.shape == rgba.shape and image.dtype == rgba.dtype
             assert torch.equal(image[..., 3], rgba[..., 3]), "alpha must not be discarded/narrowed"
             assert not torch.equal(image[..., :3], rgba[..., :3]), "selection must actually encode"
-            if fmt == "png":
+            if fmt in ("legacy_png", "png"):
                 pixels = (rgba[..., :3].float().clamp(0, 1) * 255).to(torch.uint8)
                 assert torch.equal(image[..., :3], (pixels.float() / 255).to(rgba.dtype))
             for socket, kind in zip(sockets[1:], kinds[1:]):
                 for got, wanted in zip(actual[socket], fixtures[key][socket]):
                     exact(kind, got, video_codec.encode_video(wanted) if kind == "VIDEO" else wanted)
             assert not list((base / "temp").rglob("*.bin"))
-        print("IMAGE_TRANSFER_HTTP_OK png jpeg h264; alpha and other media exact")
-        print("REAL_HTTP_BRIDGE_RESULTS_OK all five kinds; 6 bindings/request; native VIDEO remains readable after cleanup")
+        print("IMAGE_TRANSFER_HTTP_OK default legacy_png -> png/90; png jpeg h264; alpha and other media exact")
+        print("REAL_HTTP_BRIDGE_RESULTS_OK Collector IMAGE/AUDIO + independent MASK/STRING/VIDEO bridge exports; native VIDEO survives cleanup")
         print("ATOMIC_DECODE_REJECTION_OK corrupt final artifact rejected before delivery")
 
     participants = list(grouped_results)
+
+    def expected_batches(ordered, include_images=True):
+        audio_items = [item for media in ordered for item in media["audio"]]
+        expected = {"audio": [{"waveform": torch.cat([item["waveform"] for item in audio_items], dim=-1),
+                                "sample_rate": audio_items[0]["sample_rate"]}]}
+        if include_images:
+            expected["images"] = [torch.cat([image for media in ordered for image in media["images"]])]
+        return expected
+
     for delegate in (False, True):
         tag = "delegate" if delegate else "master"
         job = "collect-" + tag
@@ -410,39 +452,40 @@ async def check(base):
             await queue.put({"worker_id": participant, "media": grouped_results[participant]["job-main"], "is_last": True})
         ps.distributed_pending_jobs[job] = queue
         ordered = ([] if delegate else [fixtures["local"]]) + [grouped_results[p]["job-main"] for p in participants]
-        expected_sinks[tag] = {socket: [item for values in ordered for item in values[socket]] for socket in sockets}
-        graph = {"collector": node("DistributedMediaCollector", load_balance=False, multi_job_id=job,
-                    enabled_worker_ids=json.dumps(participants), expected_media=json.dumps(sockets), delegate_only=delegate),
+        expected_sinks[tag] = expected_batches(ordered)
+        graph = {"collector": node("DistributedCollector", load_balance=False, multi_job_id=job,
+                    enabled_worker_ids=json.dumps(participants), delegate_only=delegate, transfer_format="exact"),
                  "assert": node("AcceptanceMediaAssert", tag=tag,
-                    **{socket: ["collector", index] for index, socket in enumerate(sockets)})}
+                    **{socket: ["collector", index] for index, socket in enumerate(collector_sockets)})}
         if not delegate:
             graph["source"] = node("AcceptanceMediaSource", key="local")
-            graph["collector"]["inputs"].update({socket: ["source", index] for index, socket in enumerate(sockets)})
-        # The second group from the very same complete response must reach its
-        # own Collector, rather than being folded into the first collector job.
-        text_job, text_tag = job + "-text", tag + "-text"
-        text_queue = asyncio.Queue()
+            graph["collector"]["inputs"].update({socket: ["source", index] for index, socket in enumerate(collector_sockets)})
+        # A second audio-only Collector consumes its own job group from the same
+        # atomic response. It must return None for images and batch audio in order.
+        audio_job, audio_tag = job + "-audio", tag + "-audio"
+        audio_queue = asyncio.Queue()
         for participant in reversed(participants):
-            await text_queue.put({"worker_id": participant,
-                "media": grouped_results[participant]["job-text"], "is_last": True})
-        ps.distributed_pending_jobs[text_job] = text_queue
-        text_ordered = ([] if delegate else [fixtures["local"]]) + [grouped_results[p]["job-text"] for p in participants]
-        expected_sinks[text_tag] = {"texts": [item for values in text_ordered for item in values["texts"]]}
-        graph["text-collector"] = node("DistributedMediaCollector", load_balance=False, multi_job_id=text_job,
-            enabled_worker_ids=json.dumps(participants), expected_media='["texts"]', delegate_only=delegate)
-        graph["text-assert"] = node("AcceptanceMediaAssert", tag=text_tag, texts=["text-collector", 3])
+            await audio_queue.put({"worker_id": participant,
+                "media": grouped_results[participant]["job-audio"], "is_last": True})
+        ps.distributed_pending_jobs[audio_job] = audio_queue
+        audio_ordered = ([] if delegate else [fixtures["local"]]) + [grouped_results[p]["job-audio"] for p in participants]
+        expected_sinks[audio_tag] = expected_batches(audio_ordered, include_images=False)
+        graph["audio-collector"] = node("DistributedCollector", load_balance=False, multi_job_id=audio_job,
+            enabled_worker_ids=json.dumps(participants), delegate_only=delegate)
+        graph["audio-assert"] = node("AcceptanceMediaAssert", tag=audio_tag, audio=["audio-collector", 1])
         if not delegate:
-            graph["text-collector"]["inputs"]["texts"] = ["source", 3]
+            graph["audio-collector"]["inputs"]["audio"] = ["source", 1]
         valid = await execution.validate_prompt(job, graph, None)
         assert valid[0] and not valid[3], valid
         executor = execution.PromptExecutor(ps, cache_args={"ram": 0, "ram_inactive": 0}, asset_manager=asset_manager)
         await asyncio.to_thread(executor.execute, graph, job, {}, valid[2])
         assert executor.success, executor.status_messages
         assert executor.history_result["outputs"]["assert"]["accepted"] == [seen_sinks[tag]]
-        assert executor.history_result["outputs"]["text-assert"]["accepted"] == [seen_sinks[text_tag]]
-        assert job not in ps.distributed_pending_jobs and text_job not in ps.distributed_pending_jobs
-    assert source_calls == ["worker-a", "worker-b", "encoded-png", "encoded-jpeg", "encoded-h264", "local"], source_calls
-    assert set(seen_sinks) == {"master", "delegate", "master-text", "delegate-text"}
+        assert executor.history_result["outputs"]["audio-assert"]["accepted"] == [seen_sinks[audio_tag]]
+        assert job not in ps.distributed_pending_jobs and audio_job not in ps.distributed_pending_jobs
+    assert source_calls == ["worker-a", "worker-b", "encoded-legacy_png", "encoded-png", "encoded-jpeg", "encoded-h264", "local"], source_calls
+    assert set(seen_sinks) == {"master", "delegate", "master-audio", "delegate-audio"}
+
     assert not list((base / "output").rglob("*"))
     assert not torch.cuda.is_initialized()
     print("MASTER_AND_DELEGATE_ORDER_OK", json.dumps(seen_sinks, sort_keys=True))

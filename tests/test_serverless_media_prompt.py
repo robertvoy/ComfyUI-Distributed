@@ -24,7 +24,7 @@ compiler = importlib.import_module(f"{PACKAGE}.api.orchestration.serverless_medi
 legacy = importlib.import_module(f"{PACKAGE}.api.orchestration.serverless_prompt")
 contract = importlib.import_module(f"{PACKAGE}.serverless_bridge.contract")
 compile_media_prompt = compiler.compile_media_prompt
-SOCKETS = {"images": "IMAGE", "audio": "AUDIO", "masks": "MASK", "texts": "STRING", "video": "VIDEO"}
+SOCKETS = {"images": "IMAGE", "audio": "AUDIO"}
 
 
 def _node(class_type, **inputs):
@@ -33,7 +33,7 @@ def _node(class_type, **inputs):
 
 def _collector(**sockets):
     return _node(
-        "DistributedMediaCollector", multi_job_id="job/42", worker_id="worker_0", **sockets
+        "DistributedCollector", multi_job_id="job/42", worker_id="worker_0", **sockets
     )
 
 
@@ -72,26 +72,26 @@ def test_one_export_for_each_typed_socket_with_exact_canonical_binding(socket, k
             "request_id": "request:1",
             "binding_json": json.dumps(binding),
             socket: ["source", 0],
+            **({"transfer_format": "png", "transfer_quality": 90} if kind == "IMAGE" else {}),
         },
     }
     assert set(graph) == {"source", binding["node_id"]}
 
 
-def test_mixed_collectors_all_five_kinds_have_independent_dispatch_targets():
+def test_multiple_collectors_have_independent_image_audio_targets():
     prompt = {
         "shared": _node("MultiMediaSource"),
-        "collector:z": _collector(audio=["shared", 1], video=["shared", 4]),
-        "collector:a": _collector(images=["shared", 0], masks=["shared", 2], texts=["shared", 3]),
+        "collector:z": _collector(audio=["shared", 1]),
+        "collector:a": _collector(images=["shared", 0], audio=["shared", 1]),
     }
     prompt["collector:z"]["inputs"].update(multi_job_id="job:z", worker_id="participant:z")
     graph, bindings = _run(prompt)
     assert [(b["collector_id"], b["socket"]) for b in bindings] == [
-        ("collector:a", "images"), ("collector:a", "masks"), ("collector:a", "texts"),
-        ("collector:z", "audio"), ("collector:z", "video"),
+        ("collector:a", "images"), ("collector:a", "audio"), ("collector:z", "audio"),
     ]
-    assert len({b["binding_id"] for b in bindings}) == 5
+    assert len({b["binding_id"] for b in bindings}) == 3
     targets = {b["node_id"] for b in bindings}
-    assert len(targets) == 5
+    assert len(targets) == 3
     assert set(graph) == {"shared"} | targets
     for binding in bindings:
         export = graph[binding["node_id"]]
@@ -119,12 +119,15 @@ def test_prunes_descendants_and_unrelated_outputs_preserving_required_output_uti
     assert not {"load_balance", "pass_through"} & graph[bindings[0]["node_id"]]["inputs"].keys()
 
 
-def test_stock_primitive_string_preserves_empty_and_link_looking_text():
+def test_upstream_primitive_string_preserves_empty_and_link_looking_text():
     for text in ("", '["source:1", 0]', "hello\nworld"):
-        prompt = {"text": _node("PrimitiveString", value=text), "collector": _collector(texts=["text", 0])}
+        prompt = {"text": _node("PrimitiveString", value=text),
+                  "source": _node("TextToImage", text=["text", 0]),
+                  "collector": _collector(images=["source", 0])}
         graph, bindings = _run(prompt)
         assert graph["text"] == prompt["text"]
-        assert graph[bindings[0]["node_id"]]["inputs"]["texts"] == ["text", 0]
+        assert graph["source"]["inputs"]["text"] == ["text", 0]
+        assert graph[bindings[0]["node_id"]]["inputs"]["images"] == ["source", 0]
 
 
 @pytest.mark.parametrize("class_type,inputs", [
@@ -176,11 +179,13 @@ def test_distributed_text_value_can_be_wrapped_by_primitive_string():
     prompt = {
         "value": _node("DistributedModelName", text="model.safetensors"),
         "text": _node("PrimitiveString", value=["value", 0]),
-        "collector": _collector(texts=["text", 0]),
+        "source": _node("TextToImage", text=["text", 0]),
+        "collector": _collector(images=["source", 0]),
     }
     graph, bindings = _run(prompt)
     assert graph["text"]["inputs"]["value"] == "model.safetensors"
-    assert graph[bindings[0]["node_id"]]["inputs"]["texts"] == ["text", 0]
+    assert graph["source"]["inputs"]["text"] == ["text", 0]
+    assert graph[bindings[0]["node_id"]]["inputs"]["images"] == ["source", 0]
     assert "value" not in graph
 
 
@@ -321,7 +326,7 @@ def test_rejects_invalid_links_everywhere_before_pruning(location, link):
 
 
 @pytest.mark.parametrize("class_type", [
-    "DistributedCollector", "DistributedEmptyImage", "UltimateSDUpscaleDistributed",
+    "DistributedMediaCollector", "DistributedEmptyImage", "UltimateSDUpscaleDistributed",
     "DistributedImageListStart", "DistributedImageListEnd", "DistributedWorkerSink",
     "ImageBatchDivider", "AudioBatchDivider", "CustomDistributedNode", "custombatchdivider",
 ])
@@ -353,9 +358,9 @@ def test_rejects_collector_chains_across_different_media(indirect):
     prompt = _prompt()
     source = "collector:1"
     if indirect:
-        prompt["processing"] = _node("ImageToVideo", images=[source, 0])
+        prompt["processing"] = _node("ImageToAudio", images=[source, 0])
         source = "processing"
-    prompt["collector:2"] = _collector(video=[source, 0])
+    prompt["collector:2"] = _collector(audio=[source, 0])
     with pytest.raises(ValueError, match="collector-to-collector"):
         _run(prompt)
 
@@ -413,7 +418,7 @@ def guarded_import(name, *args, **kwargs):
     return original_import(name, *args, **kwargs)
 builtins.__import__ = guarded_import
 module = importlib.import_module(name + ".api.orchestration.serverless_media_prompt")
-prompt = {"s": {"class_type": "Source", "inputs": {}}, "c": {"class_type": "DistributedMediaCollector", "inputs": {"texts": ["s", 0], "multi_job_id": "job", "worker_id": "worker"}}}
+prompt = {"s": {"class_type": "Source", "inputs": {}}, "c": {"class_type": "DistributedCollector", "inputs": {"images": ["s", 0], "multi_job_id": "job", "worker_id": "worker"}}}
 graph, bindings = module.compile_media_prompt(prompt, "request")
 assert graph[bindings[0]["node_id"]]["class_type"] == "MediaExportV1"
 '''

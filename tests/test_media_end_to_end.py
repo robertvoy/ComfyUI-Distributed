@@ -1,4 +1,4 @@
-"""Opt-in, isolated CPU acceptance of the complete typed-media data path.
+"""Opt-in CPU acceptance of Collector IMAGE/AUDIO and the five-kind bridge.
 
 COMFYUI_SOURCE_ROOT must name an existing compatible checkout; run with that
 checkout's Python environment. No installation, normal instance, or provider is
@@ -42,6 +42,7 @@ def test_typed_media_end_to_end_cpu():
     assert result.returncode == 0, result.stdout + result.stderr
     for marker in ("NATIVE_INPUTS_AND_DIRECT_EXPORT_REFS_OK", "REAL_HTTP_BRIDGE_RESULTS_OK",
                    "MASTER_AND_DELEGATE_ORDER_OK", "ATOMIC_DECODE_REJECTION_OK",
+                   "IMAGE_TRANSFER_HTTP_OK",
                    "MEDIA_END_TO_END_CPU_OK"):
         assert marker in result.stdout, result.stdout + result.stderr
     print(result.stdout)

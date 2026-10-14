@@ -1,9 +1,12 @@
 # Runpod serverless workers (preview)
 
 A **Serverless (Runpod)** worker is a queue-based endpoint, not a permanent
-ComfyUI machine. Runpod chooses the actual GPU workers. Distributed submits one
-normal ComfyUI API workflow per requested image and collects the returned images.
-The endpoint workers do not need ComfyUI-Distributed installed.
+ComfyUI machine. Runpod chooses the actual GPU workers. This page describes the
+default **`legacy-image-v1`** profile: Distributed submits normal ComfyUI API
+workflows and collects returned image files. For image/audio collection and
+opt-in exact IMAGE returns, use [the `comfy-media-v1` profile](serverless-media.md)
+with the same **Distributed Collector** (`DistributedCollector`). The endpoint
+workers do not need the full ComfyUI-Distributed extension installed.
 
 ## Setup
 
@@ -14,7 +17,8 @@ The endpoint workers do not need ComfyUI-Distributed installed.
 4. Save, then choose **Test Saved Endpoint**. This checks authentication and
    endpoint health only; it does not start GPU inference or prove model/node compatibility.
 5. Enable the worker when you want queued Distributed workflows to use it.
-6. Use an image **Distributed Collector** and queue through Distributed as usual.
+6. Connect the **Distributed Collector**'s `images` input and queue through
+   Distributed as usual. Leave `audio` unconnected for this legacy profile.
    Enable **Delegate Only** if the master should collect without generating locally.
 
 Keys are write-only. Leave the key field blank to retain a saved key, or select
@@ -152,9 +156,16 @@ Recovery uses the same trusted-master API as the panel; it never resubmits a job
 Worker setting changes become available once all its local tasks and unresolved records
 are finished. No credentials or ledger files need to be edited by hand.
 
-## First-version limits
+## Legacy profile limits
 
-- Image collectors only. Audio/video transfer and audio collectors are rejected.
+- Only the Collector's image branch is supported by `legacy-image-v1`; connected
+  audio is rejected. `comfy-media-v1` adds audio through the same Collector and
+  supports the configured image-return formats.
+- `exact` is opt-in and requires direct workers or `comfy-media-v1` pools. If any
+  Collector requests it, a selected legacy pool is rejected before dispatch,
+  not used as an 8-bit fallback. Other Collector transfer-format controls do not
+  change this legacy profile's `SaveImage`/image-file contract. With
+  `comfy-media-v1`, the saved `legacy_png` default is mapped to compressed `png`.
 - Coordinated `UltimateSDUpscaleDistributed` workloads and unsupported Distributed
   node types are rejected before submission.
 - Downstream post-collector processing remains local; the remote graph contains
@@ -168,6 +179,6 @@ are finished. No credentials or ledger files need to be edited by hand.
 - No remote GPU discovery, endpoint provisioning, model synchronization, automatic
   scaling changes, or inbound master callback/tunnel is needed.
 
-This feature is verified with offline provider/transport tests. A successful
-health test is not a paid end-to-end generation test; test your deployed handler
+These docs describe the implementation, not a test result. A successful health
+check is not a paid end-to-end generation test; validate your deployed handler
 and model inventory with one image per run before increasing it.

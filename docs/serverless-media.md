@@ -1,12 +1,19 @@
-# Typed serverless media (PR2)
+# Serverless images and audio
 
-`comfy-media-v1` adds typed list results, exact by default, for `IMAGE`, `AUDIO`, `MASK`,
-`STRING`, and native ComfyUI `VIDEO`. It is an **explicit endpoint profile**, not
-an automatically detected capability. Omitting `media_profile` still selects
-`legacy-image-v1`; existing image collectors and handlers keep their old contract.
+**Distributed Collector** (`DistributedCollector`) collects `IMAGE` and/or `AUDIO`
+from direct workers and serverless pools. There is no separate
+`DistributedMediaCollector`; replace that removed node with `DistributedCollector`
+for image/audio workflows. The Collector has no MASK, STRING, or native VIDEO
+output sockets.
+
+`comfy-media-v1` is an **explicit endpoint profile**, not an automatically detected
+capability. It returns typed image/audio items to the Collector. The standalone
+bridge's generic contract also supports `MASK`, `STRING`, and native ComfyUI
+`VIDEO`, but that does not add those outputs to the Collector. Omitting
+`media_profile` still selects the image-only `legacy-image-v1` contract.
 See [legacy serverless setup](serverless-workers.md) for credentials and recovery.
 
-## Use a typed collector
+## Use the Collector with a typed endpoint
 
 1. Prepare an endpoint with the [standalone media bridge](../serverless_bridge/README.md)
    and the workflow's models/custom nodes. The endpoint needs only the bridge,
@@ -15,9 +22,9 @@ See [legacy serverless setup](serverless-workers.md) for credentials and recover
    **Typed media v1 (requires endpoint bridge)** (`media_profile: "comfy-media-v1"`).
    Start with **Images per run = 1**. This existing setting counts remote jobs,
    not the number of typed items each job returns.
-3. Use **Distributed Media Collector** (`DistributedMediaCollector`), connect at
-   least one typed input, and connect its outputs to the appropriate downstream
-   nodes. For literal text, connect a `PrimitiveString` node to `texts`.
+3. Use **Distributed Collector** (`DistributedCollector`), connect `images`,
+   `audio`, or both, and connect the corresponding outputs downstream. Image-only
+   and audio-only workflows use the same node.
 4. Queue through Distributed. **Delegate Only** excludes local upstream
    generation; normal collection includes the master's local values.
 
@@ -25,41 +32,55 @@ See [legacy serverless setup](serverless-workers.md) for credentials and recover
 installation, model availability, or typed execution. Selecting a profile does
 not install or upgrade anything on the endpoint.
 
-The collector has five optional inputs and five **list outputs**, in this order:
+The Collector accepts optional `images` and `audio` inputs, including ComfyUI list
+inputs, and returns two ordinary outputs—not list outputs:
 
-| Socket / output index | Native type | Each list item |
+| Socket / output index | Native type | Aggregation |
 | --- | --- | --- |
-| `images` / 0 | `IMAGE` | One BHWC tensor, including its batch dimension |
-| `audio` / 1 | `AUDIO` | `{ "waveform": BCT_tensor, "sample_rate": positive_int }` |
-| `masks` / 2 | `MASK` | One BHW tensor |
-| `texts` / 3 | `STRING` | Exact text, including whitespace or an empty string |
-| `video` / 4 | `VIDEO` | One supported native video object |
+| `images` / 0 | `IMAGE` | Concatenate BHWC tensors along the batch dimension |
+| `audio` / 1 | `AUDIO` | Concatenate waveforms along the sample dimension |
 
-For each connected socket, order is **master first, then the prepared participant
+For each connected socket, order is **master first, then prepared participant
 order, then that participant's item order**—never completion order. Delegate-only
-mode omits the master. An unconnected socket returns `[]`. A connected remote
-socket must return 1–64 items; an empty string is an item, an empty list is not.
-Lists are not concatenated into one tensor, resampled, resized, or aligned across
-sockets. Different items may have different valid shapes or audio sample rates.
-The entire remote response is validated and decoded before any of its results
-are delivered; missing, duplicate, mismatched, or corrupt results fail collection.
+mode omits the master. Image dimensions/channels and audio batch/channel dimensions
+must be compatible for concatenation. Use a common audio sample rate; the Collector
+does not resample or align streams. Audio-only collection returns `None` for images;
+when no audio is supplied it returns a silent placeholder, not an empty list.
+
+The typed wire contract carries 1–64 items per connected socket. The entire remote
+response is validated and decoded before any of its results are delivered;
+missing, duplicate, mismatched, or corrupt typed results fail collection. Validated
+wire lists are then combined into the Collector's ordinary outputs.
+
+Direct workers, `legacy-image-v1` pools and `comfy-media-v1` pools can share an
+image-only Collector run. Audio requires direct workers or `comfy-media-v1` pools.
+If any Collector requests `exact`, a selected `legacy-image-v1` pool is rejected
+before dispatch instead of silently returning 8-bit images.
 
 ## Image return format and quality
 
-`transfer_format` defaults to **`exact`** and `transfer_quality` to **90**.
+The Collector's saved `transfer_format` default remains **`legacy_png`**, with
+`transfer_quality` **90**. For `comfy-media-v1`, the compiler maps `legacy_png` to
+**`png`**, so normal serverless returns use compressed 8-bit PNG. `exact` is opt-in.
 These controls affect **remote IMAGE returns only**, not master-local images,
-uploaded inputs, MASK, AUDIO, STRING or native VIDEO values.
+uploaded inputs or AUDIO. The bridge's generic MASK, STRING and native VIDEO
+codecs are also unaffected.
 
-- `exact`: preserve floating-point dtype and values, with no image quantization.
+- `exact`: preserve supported floating-point dtype and values, with no image
+  quantization. Available for direct workers and `comfy-media-v1` pools; it is
+  never downgraded to an 8-bit format. An older master that rejects exact transfer
+  causes an error, not a legacy retry. Update both sides before selecting it.
 - `legacy_png`, `png`, `ffv1`: lossless **8-bit image pixels**, not exact float
-  tensors. Image values are clipped to [0,1] and quantized as in the existing
-  Collector. `legacy_png` uses PNG without compression; `png` compresses it.
+  tensors. For typed serverless returns, image values are clipped to [0,1] and
+  quantized; `legacy_png` is sent as `png`. Direct workers retain the original
+  JSON/base64 framing for `legacy_png`.
 - `jpeg`, `webp`: lossy still-image compression.
-- `h264`, `h265`, `av1`: lossy video encoding of each IMAGE tensor's frame batch.
-  This does not transcode the native `video` socket or combine separate list items.
+- `h264`, `h265` (**experimental**), `av1`: lossy video encoding of each IMAGE
+  tensor's frame batch. This is an image-return encoding, not a native VIDEO output.
 - Quality 1–100 affects lossy formats only, using the existing Collector's
   quality-to-CRF mapping for video. Dimensions, frame order and channel count
-  are preserved; alpha is carried separately where needed, not silently dropped.
+  are preserved for typed serverless returns; alpha is carried separately where
+  needed, not silently dropped.
 
 Both master and endpoint must have this bridge revision for compressed image
 returns. Pillow handles still formats and CPU/software PyAV encoders handle video;
@@ -67,8 +88,11 @@ unavailable codecs fail clearly rather than silently changing the selection.
 Compression can reduce result egress and inline response size, but does not relax
 encoded/decoded byte budgets or the input request limit. Compressed IMAGE batches
 are capped at 240 frames and 8192 pixels per dimension, with a conservative
-256 MiB aggregate decode budget (including codec scratch and alpha). The original Collector's
-settings, default and fallback behavior are unchanged.
+256 MiB aggregate decode budget (including codec scratch and alpha). Direct
+workers have different limits and non-exact compatibility fallbacks; see
+[result transfer](compressed-result-transfer.md). The bridge's internal
+`MediaExportV1` default is still `exact` for generic callers that omit controls;
+the Collector compiler explicitly supplies `png` for the normal saved default.
 
 ## Inputs and fidelity
 
@@ -92,7 +116,11 @@ becoming endpoint-local paths. Models and custom nodes are never transferred.
   the pure codec itself rejects non-CPU storage. Remote decoding returns
   independently owned CPU values. STRING transport is exact UTF-8 (`utf8-v1`).
 
-### Native VIDEO is not a generic video converter
+### Bridge-level native VIDEO support
+
+The generic bridge can import/export native VIDEO, and the typed input adapter
+can stage `LoadVideo` for upstream processing. This is not a Collector VIDEO
+output or a generic video converter.
 
 The adapter supports the pinned native classes **exactly**, not arbitrary
 subclasses or objects exposing `save_to()` / `get_components()`:
@@ -127,11 +155,12 @@ invalidate a returned VIDEO.
   **10,000,000 bytes**. Larger results require an operator-supplied publisher
   returning expiring public HTTPS artifact URLs. See the bridge guide for
   bounded download/upload responsibilities and retention.
-- Remote typed transport is **serverless only**. Direct-worker typed transport
-  is not implemented. Do not mix a typed collector with legacy image collectors,
-  unsupported distributed/batch nodes, or collector-to-collector dependencies.
-  Downstream processing stays on the master. Image-list scheduling is separate
-  PR3 work, not part of this contract.
+- The generic five-kind typed envelope is a serverless bridge contract. Direct
+  workers support Collector images/audio, including opt-in exact IMAGE transport,
+  not generic MASK/STRING/VIDEO Collector outputs. The typed compiler rejects
+  unsupported distributed/batch nodes and collector-to-collector dependencies.
+  Downstream processing stays on the master. [Image-list scheduling](image-list-queue.md)
+  is a separate execution mode.
 
 ## Timeout is not proof that Comfy stopped
 
@@ -154,5 +183,5 @@ the request or turn every handler exception into a safely reusable terminal
 provider job. Master-side provider status/reconciliation alone is not proof
 that a surviving local Comfy process or callback has stopped.
 
-These docs describe the implementation and its offline tests; they do not claim
-live Runpod/provider or GPU end-to-end validation.
+These docs describe the implementation, not a test result or live Runpod/provider
+or GPU end-to-end validation.

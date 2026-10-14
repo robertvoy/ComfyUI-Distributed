@@ -17,9 +17,13 @@ jpeg, webp  Lossy per-frame stills.
 h264, h265, av1
             Lossy video for the whole batch. Smallest by far for video
             frame batches, where consecutive frames are similar.
+exact       Original floating-point tensors (raw little-endian bytes, dtype,
+            channels and values preserved). Largest; opt-in. Encoded by the
+            Collector/job_complete route with serverless_bridge.codec, never by
+            encode_chunks/decode_chunk below.
 
-All formats quantize to 8-bit exactly like the legacy path did, so the
-lossless formats reproduce the legacy master tensors bit-for-bit.
+All formats except exact quantize to 8-bit exactly like the legacy path did,
+so the lossless formats reproduce the legacy master tensors bit-for-bit.
 """
 import io
 import math
@@ -29,20 +33,25 @@ import numpy as np
 from PIL import Image
 
 LEGACY_FORMAT = "legacy_png"
+EXACT_FORMAT = "exact"
 IMAGE_FORMATS = ("png", "jpeg", "webp")
 VIDEO_FORMATS = ("ffv1", "h264", "h265", "av1")
 LOSSLESS_FORMATS = (LEGACY_FORMAT, "png", "ffv1")
-TRANSFER_FORMATS = (LEGACY_FORMAT, "png", "ffv1", "jpeg", "webp", "h264", "h265", "av1")
+# Appended, so the pre-existing option order (and saved widget values) is unchanged.
+TRANSFER_FORMATS = (LEGACY_FORMAT, "png", "ffv1", "jpeg", "webp", "h264", "h265", "av1", EXACT_FORMAT)
 
 DEFAULT_TRANSFER_FORMAT = LEGACY_FORMAT
 DEFAULT_TRANSFER_QUALITY = 90
 
 TRANSFER_FORMAT_TOOLTIP = (
-    "How workers send images back to the master. "
+    "How remote workers send images back to the master; the master's own images are never re-encoded. "
     "legacy_png: original uncompressed PNG (largest). "
     "png / ffv1: lossless, identical result. "
     "jpeg / webp: lossy stills. "
-    "h264 / h265 / av1: lossy video of the whole batch, smallest for frame sequences."
+    "h264 / h265 / av1: lossy video of the whole batch, smallest for frame sequences "
+    "(h265 is experimental). "
+    "exact: original floating-point values, no 8-bit rounding; much larger, opt-in. "
+    "Serverless media pools send legacy_png as png (same pixels) and never substitute another format."
 )
 TRANSFER_QUALITY_TOOLTIP = (
     "Quality for lossy transfer formats (ignored by lossless ones). "
@@ -298,6 +307,8 @@ def encode_chunks(frames, fmt, quality, max_chunk_bytes, max_frame_bytes=None):
     fmt = normalize_format(fmt)
     if fmt == LEGACY_FORMAT:
         raise TransferCodecError("legacy_png is sent through the JSON path, not encode_chunks")
+    if fmt == EXACT_FORMAT:
+        raise TransferCodecError("exact tensors are not encoded by encode_chunks")
     total = int(frames.shape[0])
     if total == 0:
         return
@@ -378,6 +389,8 @@ def decode_chunk(envelope, parts):
     fmt = normalize_format(envelope.get("format"))
     if fmt == LEGACY_FORMAT:
         raise TransferCodecError("legacy_png chunks are not sent as multipart")
+    if fmt == EXACT_FORMAT:
+        raise TransferCodecError("exact chunks are decoded as tensors, not frames")
     count = envelope.get("count")
     width = envelope.get("width")
     height = envelope.get("height")

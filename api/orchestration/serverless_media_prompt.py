@@ -1,8 +1,9 @@
-"""Pure compilation of prepared typed-media collectors for serverless workers.
+"""Pure compilation of prepared Distributed Collectors for comfy-media-v1 pools.
 
 The legacy image compiler remains separate. This compiler emits one MediaExportV1
-execution target per connected socket, retaining only its upstream computation.
-It never imports ComfyUI or inspects/executes runtime node classes.
+execution target per connected Collector socket (``images`` and/or ``audio``),
+retaining only its upstream computation. It never imports ComfyUI or
+inspects/executes runtime node classes.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import json
 from graphlib import CycleError, TopologicalSorter
 
 from ...serverless_bridge.contract import SOCKET_KINDS, identifier, validate_bindings
-from ...serverless_bridge.image_transfer import DEFAULT_FORMAT, DEFAULT_QUALITY, validate_options
+from ...serverless_bridge.image_transfer import DEFAULT_FORMAT, validate_options
 from .serverless_prompt import (
     _PRIMITIVE_NODES,
     _REMOVED_SCALAR_NODES,
@@ -24,7 +25,24 @@ from .serverless_prompt import (
 )
 
 
-_COLLECTOR = "DistributedMediaCollector"
+_COLLECTOR = "DistributedCollector"
+# Collector inputs, in output-slot order, that a typed pool returns.
+COLLECTOR_SOCKETS = ("images", "audio")
+# Collector widget defaults (the saved-workflow contract is legacy_png / 90).
+COLLECTOR_DEFAULT_FORMAT = "legacy_png"
+COLLECTOR_DEFAULT_QUALITY = 90
+
+
+def collector_image_policy(inputs):
+    """Return the endpoint IMAGE (format, quality) for one Collector.
+
+    legacy_png is the Collector's saved default and names a JSON/base64 framing
+    that only applies to direct workers; serverless returns the same 8-bit
+    pixels as compressed png. exact stays opt-in. No other format is altered.
+    """
+    fmt, quality = validate_options(inputs.get("transfer_format", COLLECTOR_DEFAULT_FORMAT),
+                                    inputs.get("transfer_quality", COLLECTOR_DEFAULT_QUALITY))
+    return ("png" if fmt == "legacy_png" else fmt), quality
 
 
 def _validate_identifier(value, context):
@@ -51,7 +69,7 @@ def _validate_prompt(prepared_prompt):
             raise ValueError(f"prompt node {node_id!r} must have a nonempty class_type")
         if class_type == _COLLECTOR:
             collectors.append(node_id)
-        elif class_type == "DistributedCollector" or _is_unsupported_distributed(class_type):
+        elif _is_unsupported_distributed(class_type):
             raise ValueError(f"unsupported distributed or batch node: {class_type}")
         inputs = node.get("inputs", {})
         if not isinstance(inputs, dict):
@@ -60,7 +78,7 @@ def _validate_prompt(prepared_prompt):
             raise ValueError(f"prompt node {node_id!r} input names must be nonempty strings")
 
     if not collectors:
-        raise ValueError("prepared prompt contains no DistributedMediaCollector nodes")
+        raise ValueError("prepared prompt contains no DistributedCollector nodes")
 
     dependencies = {}
     for node_id, node in prepared_prompt.items():
@@ -81,18 +99,17 @@ def _validate_prompt(prepared_prompt):
             if source_class in _REMOVED_SCALAR_NODES or source_class in _PRIMITIVE_NODES:
                 if slot != 0:
                     raise ValueError(f"invalid output slot {slot} for scalar node {source_id!r}")
-            elif source_class == _COLLECTOR and slot >= len(SOCKET_KINDS):
+            elif source_class == _COLLECTOR and slot >= len(COLLECTOR_SOCKETS):
                 raise ValueError(f"invalid output slot {slot} for collector {source_id!r}")
             parents.add(source_id)
         dependencies[node_id] = parents
 
     for collector_id in collectors:
         inputs = prepared_prompt[collector_id].get("inputs", {})
-        validate_options(inputs.get("transfer_format", DEFAULT_FORMAT),
-                         inputs.get("transfer_quality", DEFAULT_QUALITY))
+        collector_image_policy(inputs)
         for field in ("multi_job_id", "worker_id"):
             _validate_identifier(inputs.get(field), f"collector {collector_id!r} {field}")
-        connected = [socket for socket in SOCKET_KINDS if socket in inputs]
+        connected = [socket for socket in COLLECTOR_SOCKETS if socket in inputs]
         if not connected:
             raise ValueError(f"collector {collector_id!r} requires at least one connected media socket")
         for socket in connected:
@@ -129,7 +146,8 @@ def _build_exports(source_nodes, collector_ids, request_id):
     reserved = set(source_nodes)
     for collector_id in collector_ids:
         inputs = source_nodes[collector_id].get("inputs", {})
-        for socket, kind in SOCKET_KINDS.items():
+        for socket in COLLECTOR_SOCKETS:
+            kind = SOCKET_KINDS[socket]
             if socket not in inputs:
                 continue
             # Hashing avoids separator ambiguity and keeps long valid source
@@ -163,8 +181,7 @@ def _build_exports(source_nodes, collector_ids, request_id):
                 },
             }
             if kind == "IMAGE":
-                fmt, quality = validate_options(inputs.get("transfer_format", DEFAULT_FORMAT),
-                                                inputs.get("transfer_quality", DEFAULT_QUALITY))
+                fmt, quality = collector_image_policy(inputs)
                 if fmt != DEFAULT_FORMAT:
                     exports[node_id]["inputs"].update(transfer_format=fmt, transfer_quality=quality)
     validate_bindings(bindings)
@@ -174,10 +191,11 @@ def _build_exports(source_nodes, collector_ids, request_id):
 def compile_media_prompt(prepared_prompt: dict, request_id: str) -> tuple[dict, list[dict]]:
     """Return a worker graph and canonical typed-media export bindings.
 
-    Each DistributedMediaCollector must have prepared literal ``multi_job_id``
-    and ``worker_id`` identities and at least one linked media input. Present
-    media inputs (including texts) must be API links; literal text belongs in a
-    PrimitiveString node. Nonmedia collector controls are not exported.
+    Each DistributedCollector must have prepared literal ``multi_job_id`` and
+    ``worker_id`` identities and at least one linked ``images``/``audio`` input.
+    Present media inputs must be API links. Collector transport controls become
+    the IMAGE export policy (``legacy_png`` is sent as ``png``); other controls
+    are not exported.
 
     Only MediaExportV1 targets and their ancestors survive. Required ordinary
     output/utility nodes are preserved regardless of their runtime OUTPUT_NODE
