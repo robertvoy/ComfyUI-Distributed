@@ -92,7 +92,9 @@ def assert_item_execution(prompt, index):
     from comfy_execution.utils import get_executing_context
     context = get_executing_context()
     assert context is not None
-    assert prompt['2']['inputs'].get('worker_item_token'), 'per-item node ran in outer graph'
+    assert prompt['4']['inputs'].get('worker_result_token'), 'per-item node ran in outer graph'
+    assert (prompt['2']['inputs'].get('worker_item_identity')
+            or prompt['2']['inputs'].get('worker_item_token')), 'per-item source binding missing'
     running, _ = server.PromptServer.instance.prompt_queue.get_current_queue_volatile()
     assert len(running) == 1, running
     entry = running[0]
@@ -513,6 +515,8 @@ async def coordinator():
             config['settings']['master_delegate_only'] = False
             participation_counts = {}
             for mode, selected in [('mixed', [w['id'] for w in workers]), ('master-only', [])]:
+                # Keep cold-run exact-once assertions independent of other modes.
+                importlib.import_module(module.__name__ + '.image_list.local_executor')._RETAINED_OUTPUTS = None
                 executor = execution.PromptExecutor(ps, cache_args={'ram': 0, 'ram_inactive': 0}, asset_manager=assets)
                 before_sources, before_local, before_models = len(SOURCE_CALLS), len(BRANCH_CALLS), len(MODEL_CALLS)
                 before_utilities, before_events = len(UTILITY_CALLS), len(ITEM_EXECUTIONS)
@@ -567,9 +571,36 @@ async def coordinator():
                     assert texts[i] == f'item-{i}:seed-{100 + i}', (mode, texts)
                 assert not runtime._MASTER_JOBS and not runtime._WORKER_ITEMS
                 participation_counts[mode] = {'master': len(local_calls), 'workers': len(remote_calls)}
+            # Repeat the completed master-only queue with a fresh outer executor.
+            # Every item must be delivered again without recomputing its branch.
+            before_sources, before_local = len(SOURCE_CALLS), len(BRANCH_CALLS)
+            before_models, before_utilities = len(MODEL_CALLS), len(UTILITY_CALLS)
+            before_captures = len(CAPTURED)
+            previous_outputs = CAPTURED[-1]
+            executor = execution.PromptExecutor(ps, cache_args={'ram': 0, 'ram_inactive': 0}, asset_manager=assets)
+            with patch.object(config_mod, 'load_config', return_value=config), \
+                 patch.object(orchestration, 'load_config', return_value=config), \
+                 patch.object(orchestration, 'queue_prompt_payload', enqueue), \
+                 patch.object(config_mod, 'get_worker_timeout_seconds', return_value=15):
+                await asyncio.wait_for(orchestration.orchestrate_distributed_execution(
+                    prompt, None, 'test', []), 45)
+            assert executor.success, executor.status_messages
+            assert len(SOURCE_CALLS) == before_sources + 1
+            assert len(BRANCH_CALLS) == before_local
+            assert len(MODEL_CALLS) == before_models
+            assert len(UTILITY_CALLS) == before_utilities
+            assert len(CAPTURED) == before_captures + 1
+            for before, after in zip(previous_outputs[:2], CAPTURED[-1][:2]):
+                assert len(before) == len(after) == COUNT
+                assert all(torch.equal(a, b) for a, b in zip(before, after))
+            assert previous_outputs[2] == CAPTURED[-1][2]
+            check_carried_values()
+            assert not runtime._MASTER_JOBS and not runtime._WORKER_ITEMS
+            assert prompt == saved_prompt
+            print('IMAGE_LIST_CACHE_REQUEUE_OK unchanged items reused; fresh ordered delivery and cleanup')
             print('IMAGE_LIST_MASTER_OK ' + json.dumps(participation_counts))
             print('IMAGE_LIST_VALUES_OK passthrough all six types; sparse override/add; Get; sequential Get-to-Start; direct/mixed/master-only')
-            assert len(outer_executions) == 4 and all(row['captures'] == 1 for row in outer_executions)
+            assert len(outer_executions) == 5 and all(row['captures'] == 1 for row in outer_executions)
             print('IMAGE_LIST_TARGETS_OK ' + json.dumps({
                 'modes': ['delegate-only', 'mixed', 'master-only'],
                 'outer_targets': outer_executions[0]['targets'], 'worker_targets': ['4'],

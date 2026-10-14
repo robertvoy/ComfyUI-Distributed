@@ -18,7 +18,38 @@ from ..image_list.runtime import (
     encode_result,
     encode_request_payload,
     unwrap_single,
+    is_valid_item_identity,
 )
+
+
+def _stable_worker_binding(prompt, start_id, identity):
+    """Resolve transient state only from the exact Start -> End context wire."""
+    if not is_valid_item_identity(identity):
+        raise ValueError("Invalid worker item identity")
+    start = prompt.get(start_id) if isinstance(prompt, dict) else None
+    if (not isinstance(start, dict) or start.get("class_type") != "DistributedImageListStart"
+            or start.get("inputs", {}).get("worker_item_identity") != identity):
+        raise RuntimeError("Worker item identity is missing its paired Start")
+    candidates = []
+    for end_id, node in prompt.items():
+        if not isinstance(node, dict) or node.get("class_type") != "DistributedImageListEnd":
+            continue
+        inputs = node.get("inputs", {})
+        link = inputs.get("context")
+        if isinstance(link, (list, tuple)) and list(link) == [start_id, 3]:
+            candidates.append((end_id, inputs))
+    if len(candidates) != 1:
+        raise RuntimeError("Worker Start must have exactly one paired End context wire")
+    end_id, inputs = candidates[0]
+    if inputs.get("worker_item_identity") != identity:
+        raise ValueError("Paired End worker item identity does not match Start")
+    for name in ("worker_result_token", "worker_context_id"):
+        if not isinstance(inputs.get(name), str) or not inputs[name]:
+            raise RuntimeError(f"Worker paired End is missing {name}")
+    index = inputs.get("worker_item_index")
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError("Worker paired End item index is invalid")
+    return end_id, inputs
 
 
 # Types the transport can carry exactly. Anything else (models, latents, ...)
@@ -70,10 +101,26 @@ class DistributedImageListStart(io.ComfyNode):
                 worker_item_token="", worker_context_id="", image_list_enabled_worker_ids="[]",
                 image_list_master_callback="", image_list_execution_id="",
                 image_list_workflow_meta=None, image_list_master_participates=None,
-                image_list_local_execution=False):
+                image_list_local_execution=False, worker_item_identity=None):
         worker_item_token = unwrap_single(worker_item_token)
         worker_context_id = unwrap_single(worker_context_id)
+        worker_item_identity = unwrap_single(worker_item_identity)
         image_list_workflow_meta = unwrap_single(image_list_workflow_meta)
+        if worker_item_identity is not None:
+            prompt = getattr(cls.hidden, "prompt", None)
+            start_id = str(getattr(cls.hidden, "unique_id", ""))
+            _, delivery = _stable_worker_binding(prompt, start_id, worker_item_identity)
+            # Only cache misses execute Start. Never put this token/context in
+            # Start's literal inputs or returned context: both would poison reuse.
+            from ..image_list.runtime import consume_worker_item
+            item = consume_worker_item(delivery["worker_result_token"],
+                                       item_identity=worker_item_identity,
+                                       item_index=delivery["worker_item_index"])
+            item_values = item.get("values") or {}
+            return io.NodeOutput(
+                [item["image"]], [item.get("mask")], [item["index"]], [worker_item_identity],
+                *[[item_values.get(name)] for name in VALUE_NAMES],
+            )
         if worker_item_token:
             if unwrap_single(image_list_local_execution):
                 from ..image_list.runtime import consume_worker_item
@@ -203,18 +250,45 @@ class DistributedImageListEnd(io.ComfyNode):
     @classmethod
     def execute(cls, images=None, masks=None, texts=None, context=None,
                 worker_result_token="", worker_item_index=-1, master_callback_url="",
-                image_list_local_execution=False, **values):
+                image_list_local_execution=False, worker_context_id="",
+                worker_item_identity=None, **values):
         worker_result_token = unwrap_single(worker_result_token)
         master_callback_url = unwrap_single(master_callback_url)
+        worker_context_id = unwrap_single(worker_context_id)
+        worker_item_identity = unwrap_single(worker_item_identity)
+        if worker_item_identity is not None and not worker_result_token:
+            raise RuntimeError("Worker item identity is missing its delivery token")
         if worker_result_token:
             context_values = [item for item in (context if isinstance(context, (list, tuple)) else [context])
                               if isinstance(item, str) and item]
             if not context_values or len(set(context_values)) != 1:
                 raise RuntimeError("Worker Image List End is missing its paired context")
             prompt = getattr(cls.hidden, "prompt", {}) or {}
-            end_inputs = next((node.get("inputs", {}) for node in prompt.values()
-                               if isinstance(node, dict) and node.get("class_type") == "DistributedImageListEnd"
-                               and node.get("inputs", {}).get("worker_result_token") == worker_result_token), {})
+            context_id = context_values[0]
+            if worker_item_identity is not None:
+                end_id = str(getattr(cls.hidden, "unique_id", ""))
+                node = prompt.get(end_id, {})
+                link = node.get("inputs", {}).get("context")
+                if (node.get("class_type") != "DistributedImageListEnd"
+                        or not isinstance(link, (list, tuple)) or len(link) != 2):
+                    raise RuntimeError("Worker End is missing its paired Start context wire")
+                paired_id, end_inputs = _stable_worker_binding(prompt, link[0], worker_item_identity)
+                if (paired_id != end_id or context_values != [worker_item_identity]
+                        or end_inputs["worker_context_id"] != worker_context_id
+                        or end_inputs["worker_result_token"] != worker_result_token
+                        or end_inputs["worker_item_index"] != unwrap_single(worker_item_index)
+                        or end_inputs.get("master_callback_url", "") != master_callback_url):
+                    raise RuntimeError("Worker End identity/context does not match its current delivery")
+                from ..image_list.runtime import finish_worker_item
+                # On a miss this consumes Start's receipt; on a hit it validates
+                # and drops the current staged tensors. Both paths enforce TTL.
+                finish_worker_item(worker_result_token, worker_item_identity,
+                                   unwrap_single(worker_item_index))
+                context_id = worker_context_id
+            else:
+                end_inputs = next((node.get("inputs", {}) for node in prompt.values()
+                                   if isinstance(node, dict) and node.get("class_type") == "DistributedImageListEnd"
+                                   and node.get("inputs", {}).get("worker_result_token") == worker_result_token), {})
             expected = end_override_names(end_inputs)
             # Missing connected lazy values must fail instead of becoming an
             # implicit fallback to the original Start value.
@@ -223,13 +297,13 @@ class DistributedImageListEnd(io.ComfyNode):
             result = normalize_worker_result(images, masks, texts, supplied)
             if unwrap_single(image_list_local_execution):
                 from ..image_list.runtime import set_master_result
-                set_master_result(context_values[0], int(unwrap_single(worker_item_index)),
+                set_master_result(context_id, int(unwrap_single(worker_item_index)),
                                   str(worker_result_token), result)
             else:
                 payload = encode_result(result)
                 run_async_in_server_loop(
                     submit_worker_result(str(master_callback_url), str(worker_result_token),
-                                         context_values[0], int(unwrap_single(worker_item_index)), payload), timeout=60,
+                                         context_id, int(unwrap_single(worker_item_index)), payload), timeout=60,
                 )
             return io.NodeOutput([result["image"]], [result.get("mask")], [result.get("text")],
                                  [result.get("values", {})])

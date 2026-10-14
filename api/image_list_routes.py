@@ -53,8 +53,9 @@ async def image_list_item_endpoint(request):
         if not isinstance(context_id, str) or not context_id:
             raise ValueError("context_id must be a non-empty string")
         item = data.get("item")
-        store_worker_item(data.get("token"), item)
-        return web.json_response({"status": "stored", "item_index": item["index"]})
+        identity = store_worker_item(data.get("token"), item)
+        return web.json_response({"status": "stored", "item_index": item["index"],
+                                  "item_identity": identity})
     except (ValueError, TypeError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:

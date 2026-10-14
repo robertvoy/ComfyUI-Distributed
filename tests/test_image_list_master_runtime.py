@@ -440,6 +440,8 @@ def real_framework_probe(comfy_root):
             rt.remove_master_job(context)
 
         for behavior in ('normal', 'expand', 'error', 'cancel', 'interrupt', 'sync', 'already-interrupted'):
+            # Independent lifecycle cases start cold; retention is tested separately.
+            local._RETAINED_OUTPUTS = None
             mode[0] = behavior
             prompt['op']['class_type'] = 'Expanded' if behavior == 'expand' else 'Operation'
             loads.clear()

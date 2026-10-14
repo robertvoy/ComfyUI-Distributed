@@ -86,6 +86,17 @@ End's optional `texts` is a connection-only socket. For workflows saved before t
 
 File-based dependencies keep ComfyUI's `[output]` / `[temp]` root annotations and are read on the master. Their worker copies use separate content-addressed paths under `input/distributed-media/`; each worker's rewritten prompt is reused across items without reusing item tokens.
 
+## Native cache reuse
+
+Repeated items can reuse **ComfyUI's native processing cache** on the same participant. Start uses a deterministic identity of the exact image, optional mask, all supplied value slots and source index; tensor dtype, shape and bytes are preserved. Fresh job IDs, assignment tokens and callback addresses live at End, so they no longer invalidate otherwise unchanged upstream processing. End still validates the current assignment and delivers results in source order on every run.
+
+- Processing settings, seeds, links and node fingerprints still participate in ComfyUI's normal signatures. Changed content invalidates reuse; nodes that declare themselves noncacheable still run.
+- The master's private executor retains one native LRU output cache between successful slots, capped at **128 entries when retained**. An active graph may temporarily exceed that target; oversized generations are not retained. Failed or cancelled local slots do not seed reuse, and `--cache-none` disables the local output cache. Direct workers use their own configured native caches.
+- Cache hits are best-effort, not guaranteed: eviction, restarts, changed ordering/index, changed settings and assignment to a different worker can cause misses. There is no worker affinity, disk cache or separate completed-result store.
+- Reuse retains tensor/model references and can increase RAM/VRAM use; the entry cap is **not a byte limit**. Exact identity calculation also adds CPU hashing and, for GPU-resident inputs, a CPU copy.
+- Remote items are still uploaded. Each upload returns a worker-computed identity; if a compatible older worker does not return a valid identity, that assignment uses the legacy graph without stable-input reuse. A worker downgrade between items also falls back safely. Assignment expiry and current-item validation apply even when processing hits the cache.
+- Keep side-effect nodes outside the region when they must run on every submission. A cached processing node follows ordinary ComfyUI semantics and does not repeat its save/preview side effects; End's delivery and downstream saving still run.
+
 ## Scope and failure behavior
 
 - This version supports the master and direct workers, not Runpod serverless pools. Unsupported pools are excluded without contacting the provider for this job.
