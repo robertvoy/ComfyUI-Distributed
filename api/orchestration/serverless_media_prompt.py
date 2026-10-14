@@ -13,6 +13,7 @@ import json
 from graphlib import CycleError, TopologicalSorter
 
 from ...serverless_bridge.contract import SOCKET_KINDS, identifier, validate_bindings
+from ...serverless_bridge.image_transfer import DEFAULT_FORMAT, DEFAULT_QUALITY, validate_options
 from .serverless_prompt import (
     _PRIMITIVE_NODES,
     _REMOVED_SCALAR_NODES,
@@ -87,6 +88,8 @@ def _validate_prompt(prepared_prompt):
 
     for collector_id in collectors:
         inputs = prepared_prompt[collector_id].get("inputs", {})
+        validate_options(inputs.get("transfer_format", DEFAULT_FORMAT),
+                         inputs.get("transfer_quality", DEFAULT_QUALITY))
         for field in ("multi_job_id", "worker_id"):
             _validate_identifier(inputs.get(field), f"collector {collector_id!r} {field}")
         connected = [socket for socket in SOCKET_KINDS if socket in inputs]
@@ -159,6 +162,11 @@ def _build_exports(source_nodes, collector_ids, request_id):
                     socket: copy.deepcopy(inputs[socket]),
                 },
             }
+            if kind == "IMAGE":
+                fmt, quality = validate_options(inputs.get("transfer_format", DEFAULT_FORMAT),
+                                                inputs.get("transfer_quality", DEFAULT_QUALITY))
+                if fmt != DEFAULT_FORMAT:
+                    exports[node_id]["inputs"].update(transfer_format=fmt, transfer_quality=quality)
     validate_bindings(bindings)
     return bindings, exports
 

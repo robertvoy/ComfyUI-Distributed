@@ -8,6 +8,8 @@ import folder_paths
 from comfy_api.v0_0_2 import io
 
 from .codec import decode_payload, encode_payload
+from .image_transfer import (FORMATS, DEFAULT_FORMAT, DEFAULT_QUALITY,
+                             FORMAT_TOOLTIP, QUALITY_TOOLTIP, validate_options)
 from .contract import (
     MAX_ARTIFACT_BYTES, MAX_ITEMS, MAX_TOTAL_BYTES, SOCKET_KINDS,
     bounded_int, identifier, validate_binding, validate_json,
@@ -43,7 +45,11 @@ def _cpu(kind, value):
     return value
 
 
-def encode_value(kind, value):
+def encode_value(kind, value, *, transfer_format=DEFAULT_FORMAT, transfer_quality=DEFAULT_QUALITY):
+    fmt, quality = validate_options(transfer_format, transfer_quality)
+    if kind == "IMAGE" and fmt != DEFAULT_FORMAT:
+        from .image_codec import encode_image
+        return encode_image(_cpu(kind, value), transfer_format=fmt, transfer_quality=quality)
     if kind == "VIDEO":
         from .video_codec import encode_video_cpu
         return encode_video_cpu(value)
@@ -57,10 +63,13 @@ def decode_value(kind, descriptor, payload):
     return decode_payload(kind, descriptor, payload)
 
 
-def export_values(request_id, binding, values):
+def export_values(request_id, binding, values, *, transfer_format=DEFAULT_FORMAT, transfer_quality=DEFAULT_QUALITY):
     """Write bounded owned payloads; history contains metadata, never base64."""
     identifier(request_id)
     validate_binding(binding)
+    fmt, quality = validate_options(transfer_format, transfer_quality)
+    if binding["kind"] != "IMAGE" and fmt != DEFAULT_FORMAT:
+        raise ValueError("Image transfer controls apply only to IMAGE exports")
     if not isinstance(values, list) or not 1 <= len(values) <= MAX_ITEMS:
         raise ValueError("Connected media output has no values or exceeds item limit")
     request_key = hashlib.sha256(request_id.encode()).hexdigest()
@@ -74,7 +83,8 @@ def export_values(request_id, binding, values):
     total = 0
     try:
         for index, value in enumerate(values):
-            descriptor, payload = encode_value(binding["kind"], value)
+            descriptor, payload = encode_value(binding["kind"], value,
+                                               transfer_format=fmt, transfer_quality=quality)
             validate_json(descriptor)
             total += len(payload)
             if total > MAX_TOTAL_BYTES:
@@ -144,14 +154,22 @@ class MediaExportV1(io.ComfyNode):
             inputs=[io.String.Input("request_id"), io.String.Input("binding_json"),
                     io.Image.Input("images", optional=True), io.Audio.Input("audio", optional=True),
                     io.Mask.Input("masks", optional=True), io.String.Input("texts", optional=True, force_input=True),
-                    io.Video.Input("video", optional=True)], outputs=[], is_output_node=True, is_input_list=True)
+                    io.Video.Input("video", optional=True),
+                    io.Combo.Input("transfer_format", options=list(FORMATS), default=DEFAULT_FORMAT,
+                                   optional=True, tooltip=FORMAT_TOOLTIP),
+                    io.Int.Input("transfer_quality", default=DEFAULT_QUALITY, min=1, max=100,
+                                 optional=True, tooltip=QUALITY_TOOLTIP)],
+            outputs=[], is_output_node=True, is_input_list=True)
 
     @classmethod
-    def execute(cls, request_id, binding_json, images=None, audio=None, masks=None, texts=None, video=None):
+    def execute(cls, request_id, binding_json, images=None, audio=None, masks=None, texts=None, video=None,
+                transfer_format=DEFAULT_FORMAT, transfer_quality=DEFAULT_QUALITY):
         binding = _json(_scalar(binding_json))
         validate_binding(binding)
         provided = dict(images=images, audio=audio, masks=masks, texts=texts, video=video)
         if {name for name, value in provided.items() if value is not None} != {binding["socket"]}:
             raise ValueError("Media export must receive exactly its declared typed socket")
-        exported = export_values(_scalar(request_id), binding, provided[binding["socket"]])
+        exported = export_values(_scalar(request_id), binding, provided[binding["socket"]],
+                                 transfer_format=_scalar(transfer_format),
+                                 transfer_quality=_scalar(transfer_quality))
         return io.NodeOutput(ui={"media_exports": [exported]})

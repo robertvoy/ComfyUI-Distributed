@@ -361,6 +361,43 @@ async def check(base):
             else:
                 raise AssertionError("Result decoder accepted a corrupt final artifact")
             assert ps.distributed_pending_jobs == {}
+        # Exercise user-selected image return encoding through the actual
+        # compiler, HTTP handler, V3 exporter and atomic response decoder.
+        for fmt in ("png", "jpeg", "h264"):
+            key = "encoded-" + fmt
+            fixtures[key] = native_fixtures(3)
+            # Keep full alpha precision and use nontrivial image dimensions.
+            torch.manual_seed(41)
+            rgba = torch.rand((2, 64, 64, 4), dtype=torch.float64)
+            fixtures[key]["images"] = [rgba]
+            request_id = "request-" + key
+            graph = {"source": node("AcceptanceMediaSource", key=key),
+                     "collector": node("DistributedMediaCollector", transfer_format=fmt,
+                         transfer_quality=73, multi_job_id="job-" + key,
+                         worker_id="serverless:" + key,
+                         **{socket: ["source", i] for i, socket in enumerate(sockets)})}
+            original = copy.deepcopy(graph)
+            workflow, manifest = compiler.compile_media_prompt(graph, request_id)
+            media = {"version": 1, "profile": contract.PROFILE, "request_id": request_id,
+                     "artifacts": [], "inputs": [], "outputs": manifest}
+            body = json.loads(serializer(workflow, [], 30, media=media))
+            result = await handler.execute_media_request(body["input"], comfy_url=url,
+                        input_dir=base / "input", temp_dir=base / "temp", timeout_seconds=30)
+            assert graph == original
+            grouped = await decoder.collect_typed_results(result, media, manifest)
+            actual = grouped["job-" + key]
+            image = actual["images"][0]
+            assert image.shape == rgba.shape and image.dtype == rgba.dtype
+            assert torch.equal(image[..., 3], rgba[..., 3]), "alpha must not be discarded/narrowed"
+            assert not torch.equal(image[..., :3], rgba[..., :3]), "selection must actually encode"
+            if fmt == "png":
+                pixels = (rgba[..., :3].float().clamp(0, 1) * 255).to(torch.uint8)
+                assert torch.equal(image[..., :3], (pixels.float() / 255).to(rgba.dtype))
+            for socket, kind in zip(sockets[1:], kinds[1:]):
+                for got, wanted in zip(actual[socket], fixtures[key][socket]):
+                    exact(kind, got, video_codec.encode_video(wanted) if kind == "VIDEO" else wanted)
+            assert not list((base / "temp").rglob("*.bin"))
+        print("IMAGE_TRANSFER_HTTP_OK png jpeg h264; alpha and other media exact")
         print("REAL_HTTP_BRIDGE_RESULTS_OK all five kinds; 6 bindings/request; native VIDEO remains readable after cleanup")
         print("ATOMIC_DECODE_REJECTION_OK corrupt final artifact rejected before delivery")
 
@@ -404,7 +441,7 @@ async def check(base):
         assert executor.history_result["outputs"]["assert"]["accepted"] == [seen_sinks[tag]]
         assert executor.history_result["outputs"]["text-assert"]["accepted"] == [seen_sinks[text_tag]]
         assert job not in ps.distributed_pending_jobs and text_job not in ps.distributed_pending_jobs
-    assert source_calls == ["worker-a", "worker-b", "local"], source_calls
+    assert source_calls == ["worker-a", "worker-b", "encoded-png", "encoded-jpeg", "encoded-h264", "local"], source_calls
     assert set(seen_sinks) == {"master", "delegate", "master-text", "delegate-text"}
     assert not list((base / "output").rglob("*"))
     assert not torch.cuda.is_initialized()

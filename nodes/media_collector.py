@@ -13,6 +13,8 @@ from comfy_api.v0_0_2 import io
 import server
 
 from ..serverless_bridge.contract import MAX_ITEMS, SOCKET_KINDS, identifier
+from ..serverless_bridge.image_transfer import (FORMATS, DEFAULT_FORMAT, DEFAULT_QUALITY,
+                                               FORMAT_TOOLTIP, QUALITY_TOOLTIP, validate_options)
 from ..utils.async_helpers import run_async_in_server_loop
 
 POLL_SECONDS = 0.1
@@ -193,7 +195,11 @@ class DistributedMediaCollector(io.ComfyNode):
                     *[kind.Input(socket, optional=True,
                                  **({'force_input': True} if socket == 'texts'
                                     else {'extra_dict': {'forceInput': True}}))
-                      for socket, kind in zip(SOCKET_KINDS, types)]],
+                      for socket, kind in zip(SOCKET_KINDS, types)],
+                    io.Combo.Input("transfer_format", options=list(FORMATS), default=DEFAULT_FORMAT,
+                                   optional=True, tooltip=FORMAT_TOOLTIP),
+                    io.Int.Input("transfer_quality", default=DEFAULT_QUALITY, min=1, max=100,
+                                 optional=True, tooltip=QUALITY_TOOLTIP)],
             outputs=[kind.Output(display_name=socket, is_output_list=True)
                      for socket, kind in zip(SOCKET_KINDS, types)],
             is_input_list=True, accept_all_inputs=True,
@@ -203,7 +209,9 @@ class DistributedMediaCollector(io.ComfyNode):
     def execute(cls, images=None, audio=None, masks=None, texts=None, video=None,
                 load_balance=False, multi_job_id='', is_worker=False,
                 enabled_worker_ids='[]', delegate_only=False, pass_through=False,
-                expected_media='[]'):
+                expected_media='[]', transfer_format=DEFAULT_FORMAT, transfer_quality=DEFAULT_QUALITY):
+        validate_options(_control(transfer_format, 'transfer_format', str),
+                         _control(transfer_quality, 'transfer_quality', int))
         media = dict(images=images, audio=audio, masks=masks, texts=texts, video=video)
         controls = dict(load_balance=load_balance, is_worker=is_worker,
                         enabled_worker_ids=enabled_worker_ids, delegate_only=delegate_only,

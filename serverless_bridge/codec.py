@@ -146,6 +146,10 @@ def decode_payload(kind: str, descriptor: dict, payload: bytes, *, max_bytes: in
         raise ValueError("Payload must be bytes")
     if len(payload) > limit:
         raise ValueError("Payload exceeds byte limit")
+    if kind == "IMAGE" and descriptor.get("encoding") == "image-transfer-v1":
+        # Lazy and IMAGE-only: exact tensors and other kinds stay unchanged.
+        from .image_codec import decode_image
+        return decode_image(descriptor, payload, max_bytes=limit)
     if kind == "STRING":
         if set(descriptor) != {"encoding"} or descriptor["encoding"] != "utf8-v1":
             raise ValueError("Invalid STRING descriptor encoding or fields")
