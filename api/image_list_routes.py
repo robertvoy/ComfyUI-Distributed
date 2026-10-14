@@ -37,8 +37,9 @@ async def image_list_capabilities_endpoint(_request):
     return web.json_response({
         "supported": True,
         "execution_targets": True,
+        "value_results": True,
         "protocol_version": PROTOCOL_VERSION,
-        "node_ids": ["DistributedImageListStart", "DistributedImageListEnd"],
+        "node_ids": ["DistributedImageListStart", "DistributedImageListEnd", "DistributedImageListGetValue"],
         "transport": "typed-float-tensor-json-v1",
         "image_transfer_formats": list(IMAGE_TRANSFER_FORMATS),
     })
@@ -54,8 +55,9 @@ async def image_list_item_endpoint(request):
         if not isinstance(context_id, str) or not context_id:
             raise ValueError("context_id must be a non-empty string")
         item = data.get("item")
-        store_worker_item(data.get("token"), item)
-        return web.json_response({"status": "stored", "item_index": item["index"]})
+        identity = store_worker_item(data.get("token"), item)
+        return web.json_response({"status": "stored", "item_index": item["index"],
+                                  "item_identity": identity})
     except (ValueError, TypeError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:

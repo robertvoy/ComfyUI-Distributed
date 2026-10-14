@@ -35,11 +35,11 @@ def node(class_type, **inputs):
     return {"class_type": class_type, "inputs": inputs}
 
 
-def text_prompt():
+def collector_prompt():
     return {
-        "text": node("PrimitiveString", value=" café雪\n"),
-        "collector": node("DistributedMediaCollector", texts=["text", 0], load_balance=False),
-        "save": node("TextSink", texts=["collector", 3]),
+        "source": node("EmptyImage", width=32, height=32, batch_size=1, color=0),
+        "collector": node("DistributedCollector", images=["source", 0], load_balance=False),
+        "save": node("SaveImage", images=["collector", 0], filename_prefix="local"),
     }
 
 
@@ -95,7 +95,7 @@ def media_paths(tmp_path, monkeypatch):
 
 def run(h, prompt=None, **kwargs):
     return asyncio.run(h.q.orchestrate_distributed_execution(
-        prompt if prompt is not None else text_prompt(), None, "client", **kwargs))
+        prompt if prompt is not None else collector_prompt(), None, "client", **kwargs))
 
 
 def assert_no_dispatch(h, *, no_probe=False):
@@ -117,10 +117,11 @@ def test_real_compile_pack_serialize_and_canonical_bindings(harness, media_paths
     image_path = media_paths / "picture.png"
     Image.new("RGBA", (2, 3), color=(17, 29, 41, 53)).save(image_path)
     image_bytes = image_path.read_bytes()
-    prompt = text_prompt()
+    prompt = collector_prompt()
     prompt["image"] = node("LoadImage", image="picture.png")
-    prompt["collector"]["inputs"].update(images=["image", 0], masks=["image", 1])
-    prompt["collector2"] = node("DistributedMediaCollector", texts=["text", 0])
+    prompt["audio"] = node("GeneratedAudio")
+    prompt["collector"]["inputs"].update(images=["image", 0], audio=["audio", 0])
+    prompt["collector2"] = node("DistributedCollector", audio=["audio", 0])
     prompt["unused"] = node("PreviewImage", images=["image", 0])
     source = copy.deepcopy(prompt)
     with patch.object(h.compiler, "compile_media_prompt", wraps=h.compiler.compile_media_prompt) as compile_call, \
@@ -145,8 +146,8 @@ def test_real_compile_pack_serialize_and_canonical_bindings(harness, media_paths
         assert media["outputs"] == job["manifest"]
         assert media["outputs"] is not job["manifest"]
         assert media["artifacts"] == media["inputs"] == []
-        assert {b["socket"] for b in job["manifest"]} == {"texts", "images", "masks"}
-        assert len(job["manifest"]) == 4
+        assert {b["socket"] for b in job["manifest"]} == {"images", "audio"}
+        assert len(job["manifest"]) == 3
         assert base64.b64decode(job["images"][0]["image"]) == image_bytes
         assert job["workflow"]["image"]["inputs"]["image"] == job["images"][0]["name"]
         assert not ({"save", "unused", "collector", "collector2"} & set(job["workflow"]))
@@ -164,40 +165,50 @@ def test_real_compile_pack_serialize_and_canonical_bindings(harness, media_paths
             assert json.loads(controls["binding_json"]) == binding
             assert controls["request_id"] == media["request_id"]
     assert master["collector"]["inputs"]["delegate_only"] is delegate
-    assert json.loads(master["collector"]["inputs"]["expected_media"]) == ["images", "masks", "texts"]
+    assert "expected_media" not in master["collector"]["inputs"]
     if delegate:
-        assert "text" not in master and "image" not in master
-        assert not any(name in master["collector"]["inputs"] for name in ("images", "audio", "masks", "texts", "video"))
-        assert not any(n["class_type"] == "DistributedEmptyImage" for n in master.values())
+        assert not {"source", "audio"} & set(master)
+        # LoadImage is an existing explicitly retained lightweight source; the
+        # Collector is nevertheless detached from it and uses the placeholder.
+        assert master["image"] == prompt["image"]
+        assert "audio" not in master["collector"]["inputs"]
+        placeholder = master["collector"]["inputs"]["images"][0]
+        assert master[placeholder]["class_type"] == "DistributedEmptyImage"
     else:
-        assert master["collector"]["inputs"]["texts"] == ["text", 0]
-        assert "text" in master and "image" in master
+        assert master["collector"]["inputs"]["audio"] == ["audio", 0]
+        assert "audio" in master and "image" in master
 
 
-def test_delegate_disconnects_every_media_socket(harness):
-    prompt = text_prompt()
-    for index, name in enumerate(("images", "audio", "masks", "video")):
-        source_id = "source-" + name
-        prompt[source_id] = node("GeneratedMedia", seed=index)
-        prompt["collector"]["inputs"][name] = [source_id, 0]
+@pytest.mark.parametrize("audio_only", [False, True])
+def test_delegate_prunes_image_audio_sources_and_audio_only_needs_no_placeholder(harness, audio_only):
+    prompt = collector_prompt()
+    prompt["audio"] = node("GeneratedAudio")
+    prompt["collector"]["inputs"]["audio"] = ["audio", 0]
+    if audio_only:
+        del prompt["collector"]["inputs"]["images"]
+        prompt["save"] = node("AudioSink", audio=["collector", 1])
     original = copy.deepcopy(prompt)
     run(harness, prompt)
     master = harness.q.queue_prompt_payload.call_args.args[0]
     inputs = master["collector"]["inputs"]
-    sockets = {"images", "audio", "masks", "texts", "video"}
-    assert set(json.loads(inputs["expected_media"])) == sockets
-    assert not sockets.intersection(inputs)
-    assert set(master) == {"collector", "save"}
+    assert "audio" not in inputs and "expected_media" not in inputs
+    assert "source" not in master and "audio" not in master
+    if audio_only:
+        assert "images" not in inputs and set(master) == {"collector", "save"}
+    else:
+        assert master[inputs["images"][0]]["class_type"] == "DistributedEmptyImage"
     for job in harness.manager.start.call_args.args[2]:
-        assert {b["socket"] for b in job["manifest"]} == sockets
-        assert {"text", "source-images", "source-audio", "source-masks", "source-video"} <= set(job["workflow"])
+        assert {b["socket"] for b in job["manifest"]} == ({"audio"} if audio_only else {"images", "audio"})
+        assert "audio" in job["workflow"]
+        assert ("source" in job["workflow"]) is not audio_only
+        assert harness.validator.validate_prepared_job(job) is True
     assert prompt == original
 
 
 @pytest.mark.parametrize("selected", ["master", "worker"])
 def test_typed_load_balance_selects_master_or_one_serverless_slot(harness, selected):
     h = harness
-    prompt = text_prompt()
+    prompt = collector_prompt()
     prompt["collector"]["inputs"]["load_balance"] = "true"
     h.q.select_least_busy_worker.side_effect = lambda candidates, **kw: next(
         w for w in candidates if (w["id"] == "master") == (selected == "master"))
@@ -208,23 +219,24 @@ def test_typed_load_balance_selects_master_or_one_serverless_slot(harness, selec
         assert result[2] == 0
         h.manager.start.assert_not_awaited()
         assert master["collector"]["inputs"]["delegate_only"] is False
-        assert "text" in master
+        assert "source" in master
     else:
         assert result[2] == 1
         assert len(h.manager.start.call_args.args[2]) == 1
         assert master["collector"]["inputs"]["delegate_only"] is True
-        assert "text" not in master
+        assert "source" not in master
 
 
-@pytest.mark.parametrize("profile", [None, "legacy-image-v1", PROFILE])
-def test_explicit_profile_compatibility_rejected_before_probe(harness, profile):
+@pytest.mark.parametrize("profile", [None, "legacy-image-v1"])
+def test_exact_rejects_legacy_pool_before_probe(harness, profile):
     h = harness
-    prompt = legacy_prompt() if profile == PROFILE else text_prompt()
+    prompt = collector_prompt()
+    prompt["collector"]["inputs"]["transfer_format"] = "exact"
     if profile is None:
         h.pool.pop("media_profile")
     else:
         h.pool["media_profile"] = profile
-    with pytest.raises(ValueError, match="requires|require"):
+    with pytest.raises(ValueError, match="exact requires comfy-media-v1"):
         run(h, prompt)
     assert_no_dispatch(h, no_probe=True)
 
@@ -239,19 +251,26 @@ def test_invalid_explicit_profiles_fail_closed(harness, profile):
 
 @pytest.mark.parametrize("direct_type", ["local", "remote", "cloud"])
 @pytest.mark.parametrize("explicit", [False, True])
-def test_direct_workers_never_silently_skipped_or_fallback(harness, direct_type, explicit):
+def test_direct_workers_participate_alongside_typed_pools(harness, direct_type, explicit):
     h = harness
     h.config["workers"].append({"id": "direct", "type": direct_type, "host": "offline.invalid",
                                 "enabled": not explicit, "port": 8188})
-    prompt = text_prompt()
-    prompt["collector"]["inputs"]["load_balance"] = True
     kwargs = {"enabled_worker_ids": ["pool", "direct"]} if explicit else {}
-    with pytest.raises(ValueError, match="direct workers"):
-        run(h, prompt, delegate_master=False, **kwargs)
-    assert_no_dispatch(h, no_probe=True)
+    prompt = collector_prompt()
+    original = copy.deepcopy(prompt)
+    assert run(h, prompt, delegate_master=False, **kwargs)[2] == 3
+    assert prompt == original
+    h.q.dispatch_worker_prompt.assert_awaited_once()
+    master = h.q.queue_prompt_payload.call_args.args[0]
+    assert json.loads(master["collector"]["inputs"]["enabled_worker_ids"]) == [
+        "serverless:pool:1", "serverless:pool:2", "direct"]
+    jobs = h.manager.start.call_args.args[2]
+    assert len(jobs) == 2 and all(j["media"]["profile"] == PROFILE for j in jobs)
+    if direct_type != "local":
+        h.q.sync_worker_media.assert_awaited_once()
 
 
-def test_disabled_or_unselected_incompatible_workers_do_not_block(harness):
+def test_disabled_or_unselected_workers_do_not_participate(harness):
     h = harness
     h.config["workers"] += [
         {"id": "direct", "type": "local", "enabled": False},
@@ -262,27 +281,32 @@ def test_disabled_or_unselected_incompatible_workers_do_not_block(harness):
     assert run(h, enabled_worker_ids=["pool"])[2] == 2
 
 
-@pytest.mark.parametrize("other", ["DistributedCollector", "UltimateSDUpscaleDistributed", "DistributedImageListStart"])
 @pytest.mark.parametrize("workers", [True, False])
-def test_mixed_collectors_or_image_list_rejected_even_master_only(harness, other, workers):
-    h = harness
+def test_image_list_cannot_mix_with_collector_even_master_only(harness, workers):
     if not workers:
-        h.config["workers"] = []
-    prompt = text_prompt()
-    prompt["incompatible"] = node(other)
+        harness.config["workers"] = []
+    prompt = collector_prompt()
+    prompt["incompatible"] = node("DistributedImageListStart")
     with pytest.raises(ValueError, match="cannot be mixed"):
-        run(h, prompt, delegate_master=False)
-    assert_no_dispatch(h, no_probe=True)
+        run(harness, prompt, delegate_master=False)
+    assert_no_dispatch(harness, no_probe=True)
 
 
-def test_mixed_pool_profiles_rejected_before_load_balancing(harness):
+def test_mixed_direct_typed_and_legacy_profiles_keep_each_wire_contract(harness):
     h = harness
-    h.config["workers"].append(dict(h.pool, id="legacy", media_profile="legacy-image-v1"))
-    prompt = text_prompt()
-    prompt["collector"]["inputs"]["load_balance"] = True
-    with pytest.raises(ValueError, match="requires"):
-        run(h, prompt, delegate_master=False)
-    assert_no_dispatch(h, no_probe=True)
+    h.config["workers"] += [dict(h.pool, id="legacy", media_profile="legacy-image-v1"),
+                             {"id": "direct", "type": "local", "enabled": True}]
+    assert run(h, collector_prompt())[2] == 5
+    h.q.dispatch_worker_prompt.assert_awaited_once()
+    jobs = h.manager.start.call_args.args[2]
+    assert len(jobs) == 4
+    for job in jobs:
+        if job["worker"]["media_profile"] == PROFILE:
+            assert job["media"]["outputs"] == job["manifest"]
+            assert h.validator.validate_prepared_job(job) is True
+        else:
+            assert "media" not in job
+            assert any(n["class_type"] == "SaveImage" for n in job["workflow"].values())
 
 
 def test_typed_master_only_is_supported_without_serverless_work(harness):
@@ -291,27 +315,23 @@ def test_typed_master_only_is_supported_without_serverless_work(harness):
     assert run(h, delegate_master=False)[2] == 0
     master = h.q.queue_prompt_payload.call_args.args[0]
     assert master["collector"]["inputs"]["enabled_worker_ids"] == "[]"
-    assert master["collector"]["inputs"]["texts"] == ["text", 0]
+    assert master["collector"]["inputs"]["images"] == ["source", 0]
     h.manager.start.assert_not_awaited()
     h.q.dispatch_worker_prompt.assert_not_awaited()
 
 
 @pytest.mark.parametrize("offline", [False, True])
-def test_typed_delegate_requires_available_worker_without_master_fallback(harness, offline):
+def test_collector_delegate_without_workers_preserves_master_fallback(harness, offline):
     h = harness
     if offline:
         h.q.select_active_workers.side_effect = lambda *a, **kw: ([], False)
     else:
         h.config["workers"] = []
-    with pytest.raises(RuntimeError, match="comfy-media-v1"):
-        run(h)
-    assert_no_dispatch(h)
-
-
-def test_unknown_explicit_typed_worker_is_rejected(harness):
-    with pytest.raises(ValueError, match="Unknown explicitly selected"):
-        run(harness, enabled_worker_ids=["unknown"], delegate_master=False)
-    assert_no_dispatch(harness, no_probe=True)
+    assert run(h)[2] == 0
+    master = h.q.queue_prompt_payload.call_args.args[0]
+    assert master["collector"]["inputs"]["delegate_only"] is False
+    assert master["collector"]["inputs"]["images"] == ["source", 0]
+    h.manager.start.assert_not_awaited()
 
 
 @pytest.mark.parametrize("bad", [" pool ", "pool white", "pool\n"])
@@ -323,9 +343,9 @@ def test_pool_media_identity_is_not_repaired(harness, bad):
 
 
 def test_integer_source_node_identity_is_not_normalized(harness):
-    prompt = text_prompt()
-    prompt[1] = prompt.pop("text")
-    prompt["collector"]["inputs"]["texts"] = [1, 0]
+    prompt = collector_prompt()
+    prompt[1] = prompt.pop("source")
+    prompt["collector"]["inputs"]["images"] = [1, 0]
     with pytest.raises(ValueError, match="identifier"):
         run(harness, prompt)
     assert_no_dispatch(harness, no_probe=True)
@@ -334,18 +354,18 @@ def test_integer_source_node_identity_is_not_normalized(harness):
 @pytest.mark.parametrize("broken", ["dangling-unused", "literal", "missing-file", "bad-loader-controls", "oversize"])
 def test_compilation_packing_and_size_errors_precede_all_dispatch(harness, media_paths, broken):
     h = harness
-    prompt = text_prompt()
+    prompt = collector_prompt()
     if broken == "dangling-unused":
         prompt["unused"] = node("PreviewImage", images=["missing", 0])
     elif broken == "literal":
-        prompt["collector"]["inputs"]["texts"] = "must use a linked string node"
+        prompt["collector"]["inputs"]["images"] = "must use a linked image node"
     elif broken in ("missing-file", "bad-loader-controls"):
         prompt["audio"] = node("LoadAudio", audio="missing.wav")
         prompt["collector"]["inputs"]["audio"] = ["audio", 0]
         if broken == "bad-loader-controls":
             prompt["audio"]["inputs"]["duration"] = 5
     else:
-        prompt["text"]["inputs"]["value"] = "雪" * 1000
+        prompt["source"]["inputs"]["label"] = "雪" * 1000
     original = copy.deepcopy(prompt)
     with patch.object(h.client, "MAX_REQUEST_BYTES", 100 if broken == "oversize" else h.client.MAX_REQUEST_BYTES):
         with pytest.raises((ValueError, OSError)):
@@ -418,9 +438,9 @@ def test_master_queue_failure_cleans_queues_and_never_starts_manager(harness):
 
 def test_manager_setup_failure_emits_one_terminal_per_collector_participant(harness):
     h = harness
-    prompt = text_prompt()
-    prompt["image"] = node("EmptyImage", width=2, height=2, batch_size=1, color=0)
-    prompt["collector"]["inputs"]["images"] = ["image", 0]
+    prompt = collector_prompt()
+    prompt["audio"] = node("GeneratedAudio")
+    prompt["collector"]["inputs"]["audio"] = ["audio", 0]
     h.manager.start.side_effect = ValueError("journal failure")
     with pytest.raises(ValueError, match="journal failure"):
         run(h, prompt)
@@ -481,6 +501,7 @@ import comfy.cli_args
 comfy.cli_args.args.cpu = True
 import torch
 
+
 def forbidden(*args, **kwargs):
     raise AssertionError('CPU audio integration may not initialize a GPU')
 torch.cuda.is_available = lambda: False
@@ -507,7 +528,7 @@ raise SystemExit(pytest.main([sys.argv[2], '-q', '-p', 'no:cacheprovider', '-k',
         stream.setframerate(8000)
         stream.writeframes(pcm.numpy().tobytes())
     original_bytes = path.read_bytes()
-    prompt = text_prompt()
+    prompt = collector_prompt()
     prompt["audio"] = node("LoadAudio", audio="tone.wav")
     prompt["collector"]["inputs"]["audio"] = ["audio", 0]
     original = copy.deepcopy(prompt)

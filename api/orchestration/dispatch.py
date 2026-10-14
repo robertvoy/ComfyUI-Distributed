@@ -189,7 +189,7 @@ async def dispatch_worker_prompt(
 
 
 async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0, *,
-                                       required_transfer_formats=()):
+                                       required_transfer_formats=(), require_value_results=False):
     """Require protocol/node support and report which direct workers are idle.
 
     This performs read-only GETs only; it never submits a prompt or contacts a
@@ -261,6 +261,11 @@ async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0, 
                             f"{sorted(required_formats)}; upgrade that worker before compressed IMAGE returns; "
                             "no work was submitted"
                         )
+                if require_value_results and capability.get("value_results") is not True:
+                    raise RuntimeError(
+                        f"Image-list worker {worker_id} lacks explicit value_results support; "
+                        "upgrade that worker before using End overrides; no work was submitted"
+                    )
 
                 check = "queue"
                 queue_url = build_worker_url(worker, "/queue")

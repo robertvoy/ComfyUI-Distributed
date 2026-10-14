@@ -37,6 +37,8 @@ prompt_server = server.PromptServer.instance
 #   envelope: JSON { "job_id", "worker_id", "format", "start_index", "count", "width", "height",
 #                    "is_last", "audio"?: {...} }
 #   media:    one part per frame for still formats, or one video file for video formats
+#   format "exact" adds envelope "descriptors" (one tensor-le-v1 descriptor per
+#   frame) and sends one raw tensor part per frame; values are not quantized.
 
 
 def _decode_image_sync(image_path):
@@ -299,11 +301,42 @@ async def _enqueue_worker_items(multi_job_id, items):
 
 def _decode_compressed_chunk_sync(envelope, parts):
     """Decode a compressed chunk into per-frame IMAGE tensors (threadpool)."""
+    if envelope.get("format") == transfer_codec.EXACT_FORMAT:
+        return _decode_exact_chunk_sync(envelope, parts)
     frames = transfer_codec.decode_chunk(envelope, parts)
     return [
         ensure_contiguous(torch.from_numpy(transfer_codec.uint8_frame_to_tensor_array(frame)))
         for frame in frames
     ]
+
+
+def _decode_exact_chunk_sync(envelope, parts):
+    """Decode raw exact IMAGE frames, checking each against the envelope geometry."""
+    from ..serverless_bridge import codec as bridge_codec
+    count, width, height = envelope.get("count"), envelope.get("width"), envelope.get("height")
+    for name, value in (("count", count), ("width", width), ("height", height)):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise transfer_codec.TransferCodecError(f"envelope.{name}: expected positive integer")
+    descriptors = envelope.get("descriptors")
+    if not isinstance(descriptors, list) or len(descriptors) != count or len(parts) != count:
+        raise transfer_codec.TransferCodecError(
+            f"exact chunk expected {count} descriptors and frames, got "
+            f"{len(descriptors) if isinstance(descriptors, list) else 'no'} descriptors and {len(parts)} frames"
+        )
+    tensors = []
+    for descriptor, payload in zip(descriptors, parts):
+        if not isinstance(descriptor, dict) or descriptor.get("encoding") != "tensor-le-v1":
+            raise transfer_codec.TransferCodecError("exact frames require tensor-le-v1 encoding")
+        shape = descriptor.get("shape") if isinstance(descriptor, dict) else None
+        if not isinstance(shape, list) or len(shape) != 4 or shape[:3] != [1, height, width]:
+            raise transfer_codec.TransferCodecError(
+                f"exact frame shape {shape} does not match the envelope's 1x{height}x{width} frames"
+            )
+        try:
+            tensors.append(bridge_codec.decode_payload("IMAGE", descriptor, payload))
+        except ValueError as exc:
+            raise transfer_codec.TransferCodecError(f"exact frame: {exc}") from None
+    return tensors
 
 
 def _validate_compressed_envelope(envelope):
@@ -384,6 +417,7 @@ async def _job_complete_compressed(request):
             "image_index": start_index + pos,
             "is_last": bool(is_last and pos == last_pos),
             "audio": decoded_audio if pos == last_pos else None,
+            "format": envelope["format"],
         }
         for pos, tensor in enumerate(tensors)
     ]
@@ -462,6 +496,7 @@ async def job_complete_endpoint(request):
                     "image_index": int(batch_idx),
                     "is_last": is_last,
                     "audio": decoded_audio,
+                    "format": transfer_codec.LEGACY_FORMAT,
                 }
             ],
         )

@@ -36,7 +36,7 @@ BASELINE = json.loads((ROOT / 'tests/fixtures/v1_node_contracts.json').read_text
 ADDED_OPTIONAL_INPUTS = {
     'DistributedCollector': {
         'transfer_format': [
-            ['legacy_png', 'png', 'ffv1', 'jpeg', 'webp', 'h264', 'h265', 'av1'],
+            ['legacy_png', 'png', 'ffv1', 'jpeg', 'webp', 'h264', 'h265', 'av1', 'exact'],
             {'default': 'legacy_png'},
         ],
         'transfer_quality': ['INT', {'default': 90, 'min': 1, 'max': 100, 'step': 1}],
@@ -45,7 +45,8 @@ ADDED_OPTIONAL_INPUTS = {
 
 # Nodes added after the V1 baseline; not part of saved-workflow contracts.
 # DistributedWorkerSink is internal (dev-only) and only inserted by the master.
-ADDED_NODES = {'DistributedWorkerSink', 'DistributedImageListStart', 'DistributedImageListEnd', 'DistributedMediaCollector'}
+ADDED_NODES = {'DistributedWorkerSink', 'DistributedImageListStart', 'DistributedImageListEnd',
+               'DistributedImageListGetValue'}
 
 
 def normalized_input(value):
@@ -273,7 +274,7 @@ async def check_image_list_lazy_executor(mapping, module, prompt_server, asset_m
     original_contexts = set(runtime._MASTER_JOBS)
     image_list_nodes = sys.modules[module.__name__ + '.nodes.image_list']
     workflow_meta = {'nodes': [{'id': 2, 'type': 'DistributedImageListStart'}], 'extra': {'acceptance': True}}
-    async def fake_worker_results(_context_id, *, model_callback=None):
+    async def fake_worker_results(_context_id, *, model_callback=None, include_values=False):
         state = runtime.get_master_job(_context_id)
         assert state.prompt_id == 'image-list-lazy', state.prompt_id
         assert state.workflow_meta == workflow_meta, state.workflow_meta
@@ -281,6 +282,7 @@ async def check_image_list_lazy_executor(mapping, module, prompt_server, asset_m
         return (
             [torch.full((1, 8, 8, 3), value, dtype=torch.float32) for value in (0.125, 0.5, 0.875)],
             [None, None, None], [None, None, None],
+            [{}, {}, {}],
         )
 
     graph = {
@@ -366,14 +368,16 @@ async def main():
     extension = await module.comfy_entrypoint()
     classes = await extension.get_node_list()
     mapping = {cls.GET_SCHEMA().node_id: cls for cls in classes}
-    assert len(classes) == len(mapping) == len(BASELINE) + len(ADDED_NODES)
+    assert len(classes) == len(mapping) == len(BASELINE) + len(ADDED_NODES) == 12
     assert set(mapping) == set(BASELINE) | ADDED_NODES
     for node_id in ADDED_NODES:
         assert nodes.NODE_CLASS_MAPPINGS[node_id] is mapping[node_id]
-    media_info = mapping['DistributedMediaCollector'].GET_NODE_INFO_V1()
-    assert media_info['output'] == ['IMAGE', 'AUDIO', 'MASK', 'STRING', 'VIDEO'], media_info
-    assert all(media_info['output_is_list']), media_info
-    assert media_info['input']['optional']['texts'][1]['forceInput'] is True
+    assert 'DistributedMediaCollector' not in mapping
+    collector_info = mapping['DistributedCollector'].GET_NODE_INFO_V1()
+    assert collector_info['output'] == ['IMAGE', 'AUDIO'], collector_info
+    assert not any(collector_info['output_is_list']), collector_info
+    assert list(collector_info['input']['optional']) == [
+        'images', 'audio', 'transfer_format', 'transfer_quality']
     sink_info = mapping['DistributedWorkerSink'].GET_NODE_INFO_V1()
     assert sink_info['output_node'] and sink_info['dev_only'], sink_info
     for node_id, cls in mapping.items():
@@ -427,6 +431,42 @@ async def main():
     assert start_schema.display_name == 'Distributed Image List Start'
     assert end_schema.node_id == 'DistributedImageListEnd'
     assert end_schema.display_name == 'Distributed Image List End'
+    runtime = sys.modules[module.__name__ + '.image_list.runtime']
+    assert [input.id for input in end_schema.inputs] == [
+        'images', 'masks', 'texts', 'context', 'transfer_format', 'transfer_quality'] + list(runtime.VALUE_NAMES)
+    format_input, quality_input = end_schema.inputs[4:6]
+    assert format_input.options == list(runtime.IMAGE_TRANSFER_FORMATS)
+    assert format_input.default == 'exact' and quality_input.default == 90
+    assert format_input.optional and quality_input.optional
+    assert [output.io_type for output in end_schema.outputs] == [
+        'IMAGE', 'MASK', 'STRING', 'DISTRIBUTED_IMAGE_LIST_VALUES']
+    assert end_schema.outputs[3].id == end_schema.outputs[3].display_name == 'values'
+    assert all(output.is_output_list for output in end_schema.outputs)
+    for override in end_schema.inputs[6:]:
+        assert override.optional and override.lazy
+        assert override.get_io_type() == 'IMAGE,MASK,STRING,INT,FLOAT,BOOLEAN'
+    getter = mapping['DistributedImageListGetValue']
+    getter_schema = getter.GET_SCHEMA()
+    assert getter_schema.display_name == 'Distributed Image List Get Value'
+    assert not getter_schema.is_input_list
+    assert getter_schema.outputs[0].id == getter_schema.outputs[0].display_name == 'value'
+    assert getter_schema.outputs[0].io_type == '*'
+    assert getter_schema.inputs[1].options == list(runtime.VALUE_NAMES)
+    assert getter_schema.inputs[1].default == 'value_1'
+    # Real core maps scalar mappings, never arbitrary tensor batches.
+    tensor = torch.ones(3, 2, 2, 3)
+    data, missing, hidden = execution.get_input_data({'value_name': 'value_1'}, getter, 'get-value')
+    data['values'] = [{'value_1': tensor}, {'value_1': 17}, {'value_1': False}]
+    mapped = await execution._async_map_node_over_list('get-value', 'get-value', getter, data,
+                                                       getter.FUNCTION, v3_data=hidden)
+    mapped = await execution.resolve_map_node_over_list_results(mapped)
+    assert len(mapped) == 3 and mapped[0].result[0] is tensor
+    assert mapped[1].result == (17,) and mapped[2].result == (False,)
+    try:
+        getter.execute({}, 'value_1')
+        raise AssertionError('missing Get Value key accepted')
+    except ValueError as exc:
+        assert 'absent' in str(exc)
     texts_input = next(input for input in end_schema.inputs if input.id == 'texts')
     texts_schema = texts_input.as_dict()
     assert texts_schema.get('forceInput') is True, texts_schema
@@ -470,7 +510,6 @@ async def main():
     rows = runtime_mod.normalize_image_list_inputs(prepared['images'], None, seen['values'])
     assert [row['values'] for row in rows] == [{'value_1': 'shared', 'value_3': n} for n in (4, 5, 6)]
     print('IMAGE_LIST_AUTOGROW_OK real parser; value_N slots shared/per-item')
-    assert [out.io_type for out in end_schema.outputs] == ['IMAGE', 'MASK', 'STRING']
     assert all(out.is_output_list for out in end_schema.outputs)
     assert end_schema.is_input_list and end_schema.is_output_node
     print('IMAGE_LIST_SCHEMA_OK exact IDs, names, typed list outputs')

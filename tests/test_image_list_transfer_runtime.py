@@ -147,6 +147,36 @@ def test_compressed_request_combined_budget(monkeypatch):
             rt.decode_result(encoded)
 
 
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_return_formats_preserve_exact_sparse_override_values(fmt):
+    from test_image_list_values import assert_values, values
+
+    source = result()
+    source["values"] = values()
+    source["values"]["value_10"] = source["values"].pop("value_6")
+    encoded = rt.encode_result(source, transfer_format=fmt, transfer_quality=73)
+    assert set(encoded["values"]) == set(source["values"])
+    for name, value in source["values"].items():
+        assert encoded["values"][name] == rt.encode_value(value, rt.value_kind(value, name))
+    decoded = rt.decode_result(json.loads(rt.encode_request_payload(encoded)))
+    assert_values(decoded["values"], source["values"])
+    assert torch.equal(decoded["mask"], source["mask"])
+    assert decoded["text"] == source["text"]
+
+
+def test_compressed_aggregate_budget_includes_override_values(monkeypatch):
+    source = result()
+    encoded_without_values = rt.encode_result(source, transfer_format="png")
+    source["values"] = {"value_10": "x" * 500}
+    encoded = rt.encode_result(source, transfer_format="png")
+    monkeypatch.setattr(rt, "MAX_REQUEST_BYTES", len(rt.encode_request_payload(encoded_without_values)) + 100)
+    with pytest.raises(ValueError, match="request"):
+        rt.encode_result(source, transfer_format="png")
+    with patch.object(image_codec, "decode_image", side_effect=AssertionError("oversize reached codec")):
+        with pytest.raises(ValueError, match="request"):
+            rt.decode_result(encoded)
+
+
 @pytest.fixture
 def dispatch_module(monkeypatch):
     name = "_image_list_transfer_tests"
@@ -223,11 +253,15 @@ def test_capability_endpoint_advertises_shared_formats(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     response = asyncio.run(module.image_list_capabilities_endpoint(None))
-    assert json.loads(response.text)["image_transfer_formats"] == list(FORMATS)
+    caps = json.loads(response.text)
+    assert caps["image_transfer_formats"] == list(FORMATS)
+    assert all(caps[name] is True for name in ("supported", "execution_targets", "value_results"))
+    assert "DistributedImageListGetValue" in caps["node_ids"]
 
 
 @pytest.mark.parametrize("reject_call", [None, 1, 2, 3])
-def test_runtime_initial_and_each_nonexact_assignment_preflight(reject_call):
+@pytest.mark.parametrize("with_values", [False, True])
+def test_runtime_initial_and_each_nonexact_assignment_preflight(reject_call, with_values):
     from test_image_list_runtime_boundaries import RuntimeBoundaryTests
 
     async def exercise():
@@ -237,11 +271,22 @@ def test_runtime_initial_and_each_nonexact_assignment_preflight(reject_call):
             context = fixture.create(2)
             state = fixture.rt.get_master_job(context)
             state.original_prompt[state.end_id]["inputs"].update(transfer_format="png", transfer_quality=87)
+            if with_values:
+                state.original_prompt[state.end_id]["inputs"]["value_10"] = [state.start_id, 2]
+                for item in state.items:
+                    item["values"] = {"value_1": "retained"}
+                original_set = fixture.rt.set_master_result
+
+                def set_with_override(context, index, token, result):
+                    return original_set(context, index, token, {**result, "values": {"value_10": index}})
+
+                fixture.rt.set_master_result = set_with_override
             calls = []
 
             async def preflight(workers, **kwargs):
                 calls.append(kwargs)
                 assert kwargs["required_transfer_formats"] == ("png",)
+                assert kwargs.get("require_value_results", False) is with_values
                 if len(calls) == reject_call:
                     raise RuntimeError("upgrade worker; no work was submitted")
                 return {"worker": True}
@@ -249,13 +294,15 @@ def test_runtime_initial_and_each_nonexact_assignment_preflight(reject_call):
             sys.modules["_image_list_boundaries.api.orchestration.dispatch"].preflight_image_list_workers = preflight
             if reject_call:
                 with pytest.raises(RuntimeError, match="upgrade"):
-                    await fixture.rt.run_image_list_job(context)
+                    await fixture.rt.run_image_list_job(context, include_values=with_values)
                 assert len(fixture.uploads) == max(0, reject_call - 2)
                 assert len(fixture.prompts) == max(0, reject_call - 2)
             else:
-                await fixture.rt.run_image_list_job(context)
+                result_lists = await fixture.rt.run_image_list_job(context, include_values=with_values)
                 assert len(calls) == 3
                 assert len(fixture.uploads) == 2
+                if with_values:
+                    assert result_lists[3] == [{"value_1": "retained", "value_10": index} for index in range(2)]
             assert not fixture.rt._MASTER_JOBS
         finally:
             # Do not call doCleanups(): this borrowed IsolatedAsyncioTestCase has

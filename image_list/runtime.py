@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import math
 import secrets
+import struct
 import threading
 import time
 from dataclasses import dataclass, field
@@ -38,6 +40,7 @@ VALUE_OUT_BASE = 4
 MAX_VALUE_SLOTS = 10
 VALUE_NAMES = tuple(f"value_{i}" for i in range(1, MAX_VALUE_SLOTS + 1))
 VALUES_INPUT = "values"
+END_RESULT_INPUTS = ("images", "masks", "texts") + VALUE_NAMES
 MAX_PAYLOAD_BYTES = 50 * 1024 * 1024
 MAX_REQUEST_BYTES = MAX_PAYLOAD_BYTES * 2 + 1024 * 1024
 MAX_ITEMS = 4096
@@ -188,6 +191,50 @@ def _normalize_values(values: Any, count: int) -> dict[str, list[Any]]:
     return aligned
 
 
+def end_override_names(inputs: dict[str, Any]) -> tuple[str, ...]:
+    """Fixed keys stay stable even when an intermediate socket disconnects."""
+    for name in inputs:
+        if (name.startswith("value_") or name.startswith("values.")) and name not in VALUE_NAMES:
+            raise ValueError(f"Unknown End value slot {name!r}")
+    return tuple(name for name in VALUE_NAMES if name in inputs)
+
+
+def _validate_result_values(values: Any) -> dict[str, Any]:
+    """Validate flat override values; tensors are values, never frame lists."""
+    if not isinstance(values, dict):
+        raise ValueError("End result values must be a mapping of value_N slots")
+    for name, value in values.items():
+        if name not in VALUE_NAMES:
+            raise ValueError(f"Unknown End value slot {name!r}")
+        kind = value_kind(value, name)
+        if kind == "TENSOR":
+            _tensor_dtype_name(value)
+            if not _torch().isfinite(value).all().item():
+                raise ValueError(f"End {name} tensor values must be finite")
+    return values
+
+
+def normalize_value_overrides(values: Any) -> dict[str, Any]:
+    if not isinstance(values, dict):
+        raise ValueError("End overrides must be a mapping of value_N slots")
+    normalized = {}
+    for name, raw in values.items():
+        items = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+        if len(items) != 1:
+            raise ValueError(f"Worker End override {name} expects exactly one value, received {len(items)}")
+        normalized[name] = items[0]
+    return _validate_result_values(normalized)
+
+
+def _checked_overrides(result: dict[str, Any], expected: tuple[str, ...]) -> dict[str, Any]:
+    values = _validate_result_values(result.get("values", {}))
+    missing, extra = set(expected) - values.keys(), values.keys() - set(expected)
+    if missing or extra:
+        raise ValueError(f"End result overrides do not match connected slots: "
+                         f"missing {sorted(missing)}, unexpected {sorted(extra)}")
+    return values
+
+
 def normalize_image_list_inputs(images: Any, mask: Any = None, values: Any = None) -> list[dict[str, Any]]:
     """Split images into items and pair masks/generic values by the 1-or-N rule."""
     frames = _image_frames(images, "images")
@@ -204,6 +251,64 @@ def normalize_image_list_inputs(images: Any, mask: Any = None, values: Any = Non
          "values": {name: column[i] for name, column in aligned.items()}, "index": i}
         for i in range(count)
     ]
+
+
+def is_valid_item_identity(identity: Any) -> bool:
+    return (isinstance(identity, str) and len(identity) == 71
+            and identity.startswith("sha256:")
+            and all(char in "0123456789abcdef" for char in identity[7:]))
+
+
+def item_content_identity(item: dict[str, Any]) -> str:
+    """Hash normalized content, not transport bytes or dispatch metadata.
+
+    Length-framed, typed fields distinguish scalars, absent masks, slot names,
+    shapes and exact tensor bits (including bfloat16). CPU copying changes neither
+    dtype nor values; local items deliberately have no HTTP transport-size limit.
+    """
+    digest = hashlib.sha256(b"distributed-image-list-item-v1\0")
+
+    def field(tag, raw):
+        digest.update(tag.encode("ascii") + b"\0")
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+
+    def value(raw, name):
+        if raw is None:
+            field("NONE", b"")
+            return
+        kind = value_kind(raw, name)
+        if kind == "TENSOR":
+            cpu = raw.detach().to("cpu").contiguous()
+            field("DTYPE", str(cpu.dtype).encode("ascii"))
+            field("SHAPE", json.dumps(list(cpu.shape), separators=(",", ":")).encode("ascii"))
+            field("TENSOR", memoryview(cpu.view(_torch().uint8).numpy()).cast("B"))
+        elif kind == "FLOAT":
+            field(kind, struct.pack("!d", raw))
+        elif kind == "BOOLEAN":
+            field(kind, b"1" if raw else b"0")
+        elif kind == "INT":
+            field(kind, str(raw).encode("ascii"))
+        else:
+            field(kind, raw.encode("utf-8", errors="surrogatepass"))
+
+    index = item["index"]
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError("item.index must be a non-negative integer")
+    field("INDEX", str(index).encode("ascii"))
+    field("IMAGE", b"")
+    value(item["image"], "image")
+    field("MASK", b"")
+    value(item.get("mask"), "mask")
+    values = item.get("values") or {}
+    if not isinstance(values, dict) or any(name not in VALUE_NAMES for name in values):
+        raise ValueError("item.values must be a mapping of value_N slots")
+    # Canonical socket order, not the producer's mapping insertion order.
+    for name in VALUE_NAMES:
+        if name in values:
+            field("SLOT", name.encode("ascii"))
+            value(values[name], name)
+    return "sha256:" + digest.hexdigest()
 
 
 def _tensor_dtype_name(tensor: Any) -> str:
@@ -357,26 +462,64 @@ def _sweep_worker_items() -> None:
                 del _WORKER_ITEMS[token]
 
 
-def store_worker_item(token: str, item: dict[str, Any]) -> None:
+def store_worker_item(token: str, item: dict[str, Any]) -> str:
     if not isinstance(token, str) or len(token) < 32 or len(token) > 128:
         raise ValueError("token must be a 32-128 character capability")
     clean = decode_item(item)
+    # Never trust a master-supplied digest; hash the decoded worker-owned item.
+    identity = item_content_identity(clean)
     _sweep_worker_items()
     with _LOCK:
         if token in _WORKER_ITEMS:
             raise ValueError("duplicate item token")
         _WORKER_ITEMS[token] = (time.monotonic() + _WORKER_ITEM_TTL_SECONDS, clean)
+    return identity
 
 
-def consume_worker_item(token: str) -> dict[str, Any]:
+def _pop_worker_item(token: str) -> tuple[float, dict[str, Any]]:
     if not isinstance(token, str) or not token:
         raise ValueError("worker item token is required")
     _sweep_worker_items()
     with _LOCK:
         entry = _WORKER_ITEMS.pop(token, None)
-    if entry is None:
+    if entry is None or entry[0] <= time.monotonic():
         raise RuntimeError("Image-list item is missing, expired, or already consumed")
-    return entry[1]
+    return entry
+
+
+def _check_worker_item_identity(item: dict[str, Any], identity: str, index: int) -> None:
+    if not is_valid_item_identity(identity):
+        raise ValueError("Invalid worker item identity")
+    actual = item_content_identity(item) if "image" in item else item.get("item_identity")
+    if actual != identity:
+        raise ValueError("Worker item identity does not match the staged item")
+    if isinstance(index, bool) or not isinstance(index, int) or item["index"] != index:
+        raise ValueError("Worker item index does not match the staged item")
+
+
+def consume_worker_item(token: str, *, item_identity: str | None = None,
+                        item_index: int | None = None) -> dict[str, Any]:
+    with _LOCK:
+        expires, item = _pop_worker_item(token)
+        if "image" not in item:
+            raise RuntimeError("Image-list item is already consumed")
+        if item_identity is not None:
+            _check_worker_item_identity(item, item_identity, item_index)
+            if expires <= time.monotonic():
+                raise RuntimeError("Image-list item is expired")
+            # Start misses release staged tensors, but retain a tiny per-token
+            # receipt until End. This is NOT a completed-result/content cache.
+            # Keeping the original deadline prevents cache hits bypassing TTL.
+            _WORKER_ITEMS[token] = (expires, {"item_identity": item_identity, "index": item["index"]})
+    return item
+
+
+def finish_worker_item(token: str, item_identity: str, item_index: int) -> None:
+    """Validate and release this dispatch, whether Start ran or hit native cache."""
+    expires, item = _pop_worker_item(token)
+    _check_worker_item_identity(item, item_identity, item_index)
+    if expires <= time.monotonic():
+        raise RuntimeError("Image-list item is expired")
 
 
 def delete_worker_item(token: str) -> bool:
@@ -555,10 +698,11 @@ def validate_image_list_regions(prompt: dict[str, Any], *, explicit_targets: boo
         if "images" not in prompt[end_id].get("inputs", {}):
             raise ValueError(f"End node {end_id}.images must be connected to the per-item result branch")
         end_inputs = prompt[end_id].get("inputs", {})
-        for name in ("images", "masks", "texts"):
+        end_override_names(end_inputs)
+        for name in END_RESULT_INPUTS:
             if name in end_inputs:
                 _direct_link(end_inputs[name], prompt, end_id, name)
-        region_nodes = _ancestors_for_inputs(prompt, end_id, start_id, ("images", "masks", "texts"))
+        region_nodes = _ancestors_for_inputs(prompt, end_id, start_id, END_RESULT_INPUTS)
         if start_id not in region_nodes:
             raise ValueError(f"Start node {start_id} is not an ancestor of End node {end_id}")
         forbidden = {n for n in region_nodes if n != start_id and n != end_id and
@@ -603,18 +747,28 @@ def validate_image_list_regions(prompt: dict[str, Any], *, explicit_targets: boo
 
 
 def build_worker_prompt(prompt: dict[str, Any], region: dict[str, Any], item_token: str,
-                        context_id: str, item_index: int, callback_url: str) -> dict[str, Any]:
-    """Copy only the per-image branch and its worker-side dependencies."""
+                        context_id: str, item_index: int, callback_url: str, *,
+                        item_identity: str | None = None) -> dict[str, Any]:
+    """Copy the branch; opt into stable ancestry only after a worker handshake."""
     start_id, end_id = region["start_id"], region["end_id"]
     _direct_link(prompt[end_id].get("inputs", {}).get("context"), prompt, end_id, "context")
     kept = {node_id: json.loads(json.dumps(prompt[node_id])) for node_id in region["node_ids"]}
-    start_inputs = kept[start_id].setdefault("inputs", {})
-    # Per-item data reaches workers only through the staged item token.
-    for name in list(start_inputs):
-        if name in ("images", "mask") or name.startswith(VALUES_INPUT + "."):
-            start_inputs.pop(name)
-    start_inputs.update({"worker_item_token": item_token, "worker_context_id": context_id})
     end_inputs = kept[end_id].setdefault("inputs", {})
+    if item_identity is not None:
+        if not is_valid_item_identity(item_identity):
+            raise ValueError("Invalid worker item identity")
+        # Native ancestry signatures include EVERY literal, not just a custom
+        # fingerprint. Remove inherited execution IDs, callbacks and all source
+        # inputs wholesale; transient delivery state belongs downstream at End.
+        kept[start_id]["inputs"] = {"worker_item_identity": item_identity}
+        end_inputs.update(worker_context_id=context_id, worker_item_identity=item_identity)
+    else:
+        # Preserve old raw /prompt and older-worker behavior byte-for-byte.
+        start_inputs = kept[start_id].setdefault("inputs", {})
+        for name in list(start_inputs):
+            if name in ("images", "mask") or name.startswith(VALUES_INPUT + "."):
+                start_inputs.pop(name)
+        start_inputs.update({"worker_item_token": item_token, "worker_context_id": context_id})
     end_inputs.update({"worker_result_token": item_token,
                        "worker_item_index": int(item_index),
                        "master_callback_url": callback_url})
@@ -724,6 +878,7 @@ def set_master_result(context_id: str, item_index: int, token: str, result: dict
             raise ValueError("Image-list result token does not match an assigned item")
         if item_index in state.received_indexes:
             raise ValueError(f"Duplicate image-list result for item {item_index}")
+        _checked_overrides(result, end_override_names(state.original_prompt[state.end_id].get("inputs", {})))
         state.received_indexes.add(item_index)
         state.results[item_index] = result
         event = state.event
@@ -793,10 +948,24 @@ def decode_result(result: Any) -> dict[str, Any]:
     if mask is not None and (mask.ndim != 3 or mask.shape[0] != 1):
         raise ValueError("result.mask must contain exactly one MASK frame")
     text = decode_value(result.get("text"), "STRING")
-    return {"image": image, "mask": mask, "text": text}
+    decoded = {"image": image, "mask": mask, "text": text}
+    if "values" in result:
+        raw_values = result["values"]
+        if not isinstance(raw_values, dict):
+            raise ValueError("result.values must be an object")
+        values = {}
+        for name, encoded in raw_values.items():
+            if name not in VALUE_NAMES:
+                raise ValueError(f"result.values has unknown slot {name!r}")
+            if not isinstance(encoded, dict) or encoded.get("type") not in _VALUE_KINDS:
+                raise ValueError(f"result.values.{name} has an unsupported type")
+            values[name] = decode_value(encoded, encoded["type"])
+        decoded["values"] = _validate_result_values(values)
+    return decoded
 
 
-def normalize_worker_result(images: Any, masks: Any = None, texts: Any = None) -> dict[str, Any]:
+def normalize_worker_result(images: Any, masks: Any = None, texts: Any = None,
+                            values: Any = None) -> dict[str, Any]:
     def one(value, name, kind):
         if value is None:
             return None
@@ -819,7 +988,12 @@ def normalize_worker_result(images: Any, masks: Any = None, texts: Any = None) -
     text = one(texts, "texts", "STRING")
     if text is not None and not isinstance(text, str):
         raise TypeError("Worker End text result must be a string")
-    return {"image": image, "mask": mask, "text": text}
+    result = {"image": image, "mask": mask, "text": text}
+    if values is not None:
+        overrides = normalize_value_overrides(values)
+        if overrides:
+            result["values"] = overrides
+    return result
 
 
 def encode_result(result: dict[str, Any], *, transfer_format=DEFAULT_FORMAT,
@@ -841,12 +1015,18 @@ def encode_result(result: dict[str, Any], *, transfer_format=DEFAULT_FORMAT,
                  "data": base64.b64encode(raw).decode("ascii")}
     encoded = {"image": image, "mask": encode_value(normalized["mask"], "MASK"),
                "text": encode_value(normalized["text"], "STRING")}
+    if "values" in result:
+        values = _validate_result_values(result["values"])
+        if values:
+            encoded["values"] = {name: encode_value(value, value_kind(value, name))
+                                 for name, value in values.items()}
     if fmt != "exact":
         encode_request_payload(encoded)
     return encoded
 
 
-def _collect_output_lists(results: list[dict[str, Any]]) -> tuple[list[Any], list[Any], list[Any]]:
+def _collect_output_lists(results: list[dict[str, Any]], *, state: ImageListJob | None = None,
+                          include_values: bool = False) -> tuple[list[Any], ...]:
     if not results:
         raise RuntimeError("Image-list execution returned no results")
     images, masks, texts = [], [], []
@@ -856,10 +1036,20 @@ def _collect_output_lists(results: list[dict[str, Any]]) -> tuple[list[Any], lis
         images.append(result["image"])
         masks.append(result.get("mask"))
         texts.append(result.get("text"))
-    return images, masks, texts
+    if not include_values:
+        return images, masks, texts
+    if state is None or len(results) != len(state.items):
+        raise RuntimeError("Image-list values require exactly one result per source item")
+    expected = end_override_names(state.original_prompt[state.end_id].get("inputs", {}))
+    # Reconstruct unchanged values from the master source, not worker transport.
+    # Do this before the context is removed, and only after all items succeeded.
+    values = [{**item.get("values", {}), **_checked_overrides(result, expected)}
+              for item, result in zip(state.items, results)]
+    return images, masks, texts, values
 
 
-async def run_image_list_job(context_id: str, *, model_callback=None) -> tuple[list[Any], list[Any], list[Any]]:
+async def run_image_list_job(context_id: str, *, model_callback=None,
+                             include_values: bool = False) -> tuple[list[Any], ...]:
     """Schedule one queue across master, direct peers and bounded cloud slots."""
     state = get_master_job(context_id)
     if state is None:
@@ -873,7 +1063,7 @@ async def run_image_list_job(context_id: str, *, model_callback=None) -> tuple[l
         timer = asyncio.timeout(deadline if deadline > 0 else None)
         try:
             async with timer:
-                return await _run_image_list_job(state)
+                return await _run_image_list_job(state, include_values=include_values)
         except TimeoutError:
             if timer.expired():
                 raise TimeoutError(f"Image-list total deadline exceeded ({deadline:g}s); cleanup attempted") from None
@@ -901,7 +1091,7 @@ def _has_selected_serverless_workers(config, requested_ids):
     )
 
 
-async def _run_image_list_job(state: ImageListJob):
+async def _run_image_list_job(state: ImageListJob, *, include_values: bool = False):
     state.event = asyncio.Event()
     state.event_loop = asyncio.get_running_loop()
     from ..api.orchestration.prompt_transform import _resolve_direct_workers_for_image_list
@@ -919,7 +1109,8 @@ async def _run_image_list_job(state: ImageListJob):
         if _has_selected_serverless_workers(config, state.worker_ids):
             from .serverless import create_serverless_slots
             controller = await create_serverless_slots(state, region, config, state.event)
-        return await _run_image_list_slots(state, config, workers, region, controller)
+        return await _run_image_list_slots(state, config, workers, region, controller,
+                                          include_values=include_values)
     finally:
         # Own cloud jobs even if direct preflight/local setup fails, or dispatch
         # is cancelled before returning an acknowledged handle to the scheduler.
@@ -927,7 +1118,7 @@ async def _run_image_list_job(state: ImageListJob):
             await controller.close()
 
 
-async def _run_image_list_slots(state, config, workers, region, controller):
+async def _run_image_list_slots(state, config, workers, region, controller, *, include_values=False):
     context_id = state.context_id
     from ..api.orchestration.dispatch import (
         preflight_image_list_workers, dispatch_worker_prompt,
@@ -945,14 +1136,20 @@ async def _run_image_list_slots(state, config, workers, region, controller):
     )
     transfer_requirements = ({"required_transfer_formats": (transfer_format,)}
                              if transfer_format != "exact" else {})
+    override_names = end_override_names(end_inputs)
+    value_preflight = {"require_value_results": True} if override_names else {}
     # Direct capability/idle probes must never be sent to a serverless pool.
+    # Busy peers are filtered in either role; they are fatal only when neither
+    # the master nor an explicitly selected cloud slot can process the queue.
     worker_statuses = await preflight_image_list_workers(
-        workers, require_idle=not state.master_participates, **transfer_requirements,
+        workers, require_idle=not state.master_participates and not serverless_slots,
+        **transfer_requirements, **value_preflight,
     ) if workers else {}
     workers = [worker for worker in workers if worker["id"] in worker_statuses]
     if not workers and not serverless_slots and not state.master_participates:
         raise RuntimeError("No reachable, feature-compatible image-list workers are available; master execution is disabled")
     session = await get_client_session() if workers else None
+
     timeout_seconds = max(5.0, float(get_worker_timeout_seconds()))
     use_websocket = bool((config.get("settings", {}) or {}).get("websocket_orchestration", False))
     prepared_worker_prompts: dict[str, dict[str, Any]] = {}
@@ -978,7 +1175,8 @@ async def _run_image_list_slots(state, config, workers, region, controller):
             # /prompt queue, or repeated execution of the original source.
             with _LOCK:
                 _WORKER_ITEMS[token] = (time.monotonic() + _WORKER_ITEM_TTL_SECONDS, state.items[index])
-            prompt = build_worker_prompt(state.original_prompt, region, token, context_id, index, "")
+            prompt = build_worker_prompt(state.original_prompt, region, token, context_id, index, "",
+                                         item_identity=item_content_identity(state.items[index]))
             prompt[state.start_id]["inputs"]["image_list_local_execution"] = True
             prompt[state.end_id]["inputs"]["image_list_local_execution"] = True
             future = local_executor.submit(prompt, f"{context_id}:{index}", state.end_id, state.workflow_meta)
@@ -988,13 +1186,15 @@ async def _run_image_list_slots(state, config, workers, region, controller):
         if worker is None:
             raise RuntimeError(f"Worker {worker_id} was removed before dispatch")
         assert session is not None
-        if transfer_requirements:
-            # Recheck on every compressed assignment, before staging or POSTing.
+        if transfer_requirements or value_preflight:
+            # A peer may restart/downgrade between items. Recheck both return
+            # contracts before staging or POSTing each assignment.
             statuses = await preflight_image_list_workers(
-                [worker], require_idle=True, **transfer_requirements,
+                [worker], require_idle=bool(transfer_requirements),
+                **transfer_requirements, **value_preflight,
             )
             if worker_id not in statuses:
-                raise RuntimeError(f"Image-list worker {worker_id} unavailable before compressed return dispatch")
+                raise RuntimeError(f"Image-list worker {worker_id} unavailable before return dispatch")
         token = create_worker_task_token()
         register_assignment(context_id, index, worker_id, token)
         item_payload = {"context_id": context_id, "item": encode_item(state.items[index])}
@@ -1008,6 +1208,14 @@ async def _run_image_list_slots(state, config, workers, region, controller):
                                 timeout=aiohttp.ClientTimeout(total=60)) as response:
             if response.status >= 400:
                 raise RuntimeError(f"Worker {worker_id} rejected image-list item {index}: HTTP {response.status}")
+            try:
+                stored = await response.json()
+            except (ValueError, aiohttp.ClientError):
+                stored = None
+        # A per-upload acknowledgement gates the new graph. Older workers may
+        # return no identity; do not change global protocol/preflight contracts.
+        identity = stored.get("item_identity") if isinstance(stored, dict) else None
+        identity_options = {"item_identity": identity} if is_valid_item_identity(identity) else {}
         callback_url = build_master_callback_url(worker, config=config)
         if worker_id not in prepared_worker_prompts:
             worker_prompt = build_worker_prompt(state.original_prompt, region, token, context_id,
@@ -1020,9 +1228,11 @@ async def _run_image_list_slots(state, config, workers, region, controller):
             from ..api.orchestration.media_sync import sync_worker_media
             await asyncio.wait_for(sync_worker_media(worker, worker_prompt), timeout=60)
             prepared_worker_prompts[worker_id] = worker_prompt
-        # Reuse media rewrites, never assignment identity or a mutable submitted graph.
+        # Reuse legacy media rewrites, never assignment identity or a mutable
+        # submitted graph. Keeping this template legacy also permits a worker to
+        # downgrade between items without inheriting a previous stable identity.
         worker_prompt = build_worker_prompt(prepared_worker_prompts[worker_id], region, token,
-                                            context_id, index, callback_url)
+                                            context_id, index, callback_url, **identity_options)
         handle["submission_pending"] = True
         prompt_id = await dispatch_worker_prompt(
             worker, worker_prompt, state.workflow_meta,
@@ -1170,7 +1380,7 @@ async def _run_image_list_slots(state, config, workers, region, controller):
                  + [worker["id"] for worker in workers] + serverless_slots)
         results = await dynamic_schedule(len(state.items), slots,
                                          dispatch, wait_next, cleanup, interrupted)
-        return _collect_output_lists(results)
+        return _collect_output_lists(results, state=state, include_values=include_values)
     finally:
         if local_executor is not None:
             # No timeout here: Python cannot safely kill a synchronous node.

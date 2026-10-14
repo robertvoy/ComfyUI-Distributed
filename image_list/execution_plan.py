@@ -6,6 +6,7 @@ import sys
 
 from .runtime import (
     END_CLASS,
+    END_RESULT_INPUTS,
     _ancestors_for_inputs,
     _downstream_until,
     _image_list_pairs,
@@ -49,7 +50,7 @@ def prepare_image_list_execution(prompt: dict) -> tuple[dict, list[str]]:
     required = _reachable(boundaries, upstream)
     discarded = set()
     for start_id, end_id in pairs:
-        region_nodes = _ancestors_for_inputs(prepared, end_id, start_id, ("images", "masks", "texts"))
+        region_nodes = _ancestors_for_inputs(prepared, end_id, start_id, END_RESULT_INPUTS)
         outside = _downstream_until(prepared, start_id, end_id) - region_nodes
         # Preserve bypass joins and their whole chain into post-End computation.
         # They must fail boundary validation, not disappear with debug previews.

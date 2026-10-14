@@ -37,14 +37,14 @@ import aiohttp
 
 torch.set_num_threads(1)
 SOURCE_CALLS, BRANCH_CALLS, CAPTURED, MODEL_CALLS = [], [], [], []
-UTILITY_CALLS, ITEM_EXECUTIONS = [], []
+UTILITY_CALLS, ITEM_EXECUTIONS, VALUE_CAPTURES = [], [], []
 ALLOW_MASTER = False
 COUNT = 7
 
 
 def source_rows():
     return [{'image': torch.full((1, 5 + i, 7, 3 if i % 2 == 0 else 4), i / 16, dtype=torch.float32),
-             'reference_image': torch.full((1, 2, 3, 3), (i + 1) / 16),
+             'reference_image': torch.full((2, 2, 3, 3), (i + 1) / 16),
              'mask': torch.full((1, 5 + i, 7), (i + 1) / 16),
              'text': f'item-{i}', 'strength': (i + 1) / 16, 'seed': 100 + i, 'index': i}
             for i in range(COUNT)]
@@ -92,7 +92,9 @@ def assert_item_execution(prompt, index):
     from comfy_execution.utils import get_executing_context
     context = get_executing_context()
     assert context is not None
-    assert prompt['2']['inputs'].get('worker_item_token'), 'per-item node ran in outer graph'
+    assert prompt['4']['inputs'].get('worker_result_token'), 'per-item node ran in outer graph'
+    assert (prompt['2']['inputs'].get('worker_item_identity')
+            or prompt['2']['inputs'].get('worker_item_token')), 'per-item source binding missing'
     running, _ = server.PromptServer.instance.prompt_queue.get_current_queue_volatile()
     assert len(running) == 1, running
     entry = running[0]
@@ -160,17 +162,32 @@ class TestImageOperation:
         return image + strength, mask * 0.5, f'{text}:seed-{seed}'
 
 
+class TestValueOverride:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {'required': {'text': ('STRING', {'forceInput': True}),
+                             'index': ('INT', {'forceInput': True})}}
+    RETURN_TYPES = ('STRING', 'INT')
+    FUNCTION = 'run'
+    def run(self, text, index):
+        assert WORKER or ALLOW_MASTER, 'override branch executed on delegate-only master'
+        return (text + ':override', 200 + index)
+
+
 class TestCapture:
     @classmethod
     def INPUT_TYPES(cls):
-        return {'required': {'images': ('IMAGE',), 'masks': ('MASK',), 'texts': ('STRING', {'forceInput': True})}}
+        return {'required': {'images': ('IMAGE',), 'masks': ('MASK',), 'texts': ('STRING', {'forceInput': True})},
+                'optional': {'values': ('DISTRIBUTED_IMAGE_LIST_VALUES',),
+                             'picked': ('STRING', {'forceInput': True})}}
     INPUT_IS_LIST = True
     OUTPUT_NODE = True
     RETURN_TYPES = ()
     FUNCTION = 'run'
-    def run(self, images, masks, texts):
+    def run(self, images, masks, texts, values=None, picked=None):
         assert not WORKER, 'post-End capture leaked into a worker prompt'
         CAPTURED.append((images, masks, texts))
+        VALUE_CAPTURES.append((values, picked))
         return ()
 
 
@@ -179,11 +196,19 @@ async def setup():
     ps = server.PromptServer(asyncio.get_running_loop(), assets)
     assert await nodes.load_custom_node(str(ROOT))
     module = sys.modules[str(ROOT).replace('.', '_x_')]
+    boundary = importlib.import_module(module.__name__ + '.nodes.image_list')
+    encode_result = boundary.encode_result
+    def checked_encode(result, **options):
+        encoded = encode_result(result, **options)
+        if 'values' in encoded:
+            assert set(encoded['values']) == {f'value_{n}' for n in (2, 3, 4, 5, 7, 8, 9, 10)}
+        return encoded
+    boundary.encode_result = checked_encode
     nodes.NODE_CLASS_MAPPINGS.update(TestImageSource=TestImageSource,
                                    TestImageOperation=TestImageOperation, TestCapture=TestCapture,
                                    TestCachedModel=TestCachedModel, TestSharedFlag=TestSharedFlag,
                                    TestRequiredOutputUtility=TestRequiredOutputUtility,
-                                   TestDiscardedPreview=TestDiscardedPreview)
+                                   TestDiscardedPreview=TestDiscardedPreview, TestValueOverride=TestValueOverride)
     # Match the CORS-enabled direct-worker launch contract for canvas probes.
     app = web.Application(middlewares=[server.create_cors_middleware('*')])
     # Register the actual feature routes, not test replacements.
@@ -221,7 +246,10 @@ async def worker_main():
             accepted = json.loads(response.body)
             _, pending = ps.prompt_queue.get_current_queue_volatile()
             entry = next(item for item in pending if item[1] == accepted['prompt_id'])
-            submissions.append({'prompt_id': entry[1], 'requested': data.get('partial_execution_targets'),
+            delivery = next(node['inputs'] for node in entry[2].values()
+                            if node['class_type'] == 'DistributedImageListEnd')
+            submissions.append({'prompt_id': entry[1], 'item_index': delivery['worker_item_index'],
+                                'requested': data.get('partial_execution_targets'),
                                 'queued': entry[4], 'node_ids': sorted(entry[2]),
                                 'end_ids': [key for key, node in entry[2].items()
                                             if node['class_type'] == 'DistributedImageListEnd']})
@@ -271,19 +299,43 @@ def graph(callback, worker_ids):
             'images': ['1', 0], 'mask': ['1', 2],
             'values.value_1': ['1', 1], 'values.value_2': ['1', 3],
             'values.value_3': ['1', 4], 'values.value_4': ['1', 5], 'values.value_5': ['7', 0],
+            'values.value_6': ['1', 2],
             'image_list_enabled_worker_ids': json.dumps(worker_ids), 'image_list_master_callback': callback}},
         '3': {'class_type': 'TestImageOperation', 'inputs': {
             key: ['2', index] for key, index in [('image', 0), ('mask', 1), ('index', 2),
                 ('reference_image', 4), ('text', 5), ('strength', 6), ('seed', 7), ('flag', 8)]}
               | {'image': ['8', 0], 'model': ['6', 0]}},
         '4': {'class_type': 'DistributedImageListEnd', 'inputs': {
-            'images': ['3', 0], 'masks': ['3', 1], 'texts': ['3', 2], 'context': ['2', 3]}},
-        '5': {'class_type': 'TestCapture', 'inputs': {'images': ['4', 0], 'masks': ['4', 1], 'texts': ['4', 2]}},
+            'images': ['3', 0], 'masks': ['3', 1], 'texts': ['3', 2], 'context': ['2', 3],
+            'value_2': ['10', 0], 'value_3': ['2', 6], 'value_4': ['2', 7], 'value_5': ['2', 8],
+            'value_7': ['3', 1], 'value_8': ['2', 4], 'value_9': ['2', 9], 'value_10': ['10', 1]}},
+        '5': {'class_type': 'TestCapture', 'inputs': {'images': ['4', 0], 'masks': ['4', 1], 'texts': ['4', 2],
+                                                     'values': ['4', 3], 'picked': ['get', 0]}},
         '6': {'class_type': 'TestCachedModel', 'inputs': {}},
         '7': {'class_type': 'TestSharedFlag', 'inputs': {}},
         '8': {'class_type': 'TestRequiredOutputUtility', 'inputs': {'image': ['2', 0], 'index': ['2', 2]}},
         '9': {'class_type': 'TestDiscardedPreview', 'inputs': {'image': ['8', 0]}},
+        '10': {'class_type': 'TestValueOverride', 'inputs': {'text': ['2', 5], 'index': ['2', 2]}},
+        'get': {'class_type': 'DistributedImageListGetValue', 'inputs': {'values': ['4', 3], 'value_name': 'value_2'}},
     }
+
+
+def check_carried_values():
+    values, picked = VALUE_CAPTURES[-1]
+    assert len(values) == len(picked) == COUNT
+    for index, (actual, source) in enumerate(zip(values, source_rows())):
+        assert set(actual) == {f'value_{n}' for n in range(1, 11)}, actual.keys()
+        assert torch.equal(actual['value_1'], source['reference_image'])
+        assert actual['value_2'] == picked[index] == f'item-{index}:override'
+        assert actual['value_3'] == source['strength']
+        assert actual['value_4'] == source['seed']
+        assert actual['value_5'] is True
+        assert torch.equal(actual['value_6'], source['mask'])
+        assert torch.equal(actual['value_7'], source['mask'] * 0.5)
+        assert torch.equal(actual['value_8'], source['reference_image'])
+        assert actual['value_8'].shape[0] == 2, 'value tensor batch was split'
+        assert torch.equal(actual['value_9'], source['mask'])
+        assert actual['value_10'] == 200 + index
 
 
 async def coordinator():
@@ -403,6 +455,7 @@ async def coordinator():
             assert executor.success, executor.status_messages
             assert len(SOURCE_CALLS) == 1 and not BRANCH_CALLS and not UTILITY_CALLS
             assert len(CAPTURED) == 1
+            check_carried_values()
             images, masks, texts = CAPTURED[0]
             assert len(images) == len(masks) == len(texts) == COUNT
             for i, row in enumerate(source_rows()):
@@ -430,15 +483,20 @@ async def coordinator():
             # left unconnected. Region N+1 must not race the prior worker End.
             chained = {'1': {'class_type': 'EmptyImage', 'inputs': {
                 'height': 8, 'width': 8, 'batch_size': 2, 'color': 0}}}
+            chained['constant'] = {'class_type': 'TestSharedFlag', 'inputs': {}}
             previous = '1'
+            value_source = 'constant'
             for start, end in [('2', '3'), ('4', '5'), ('6', '7')]:
                 chained[start] = {'class_type': 'DistributedImageListStart', 'inputs': {
-                    'images': [previous, 0]}}
+                    'images': [previous, 0], 'values.value_1': [value_source, 0]}}
                 chained[end] = {'class_type': 'DistributedImageListEnd', 'inputs': {
                     'images': [start, 0], 'context': [start, 3]}}
+                value_source = f'get-{end}'
+                chained[value_source] = {'class_type': 'DistributedImageListGetValue', 'inputs': {
+                    'values': [end, 3], 'value_name': 'value_1'}}
                 previous = end
             chained['8'] = {'class_type': 'TestCapture', 'inputs': {
-                'images': ['7', 0], 'masks': ['7', 1], 'texts': ['7', 2]}}
+                'images': ['7', 0], 'masks': ['7', 1], 'texts': ['7', 2], 'values': ['7', 3]}}
             saved_chained = copy.deepcopy(chained)
             with patch.object(config_mod, 'load_config', return_value=config), \
                  patch.object(orchestration, 'load_config', return_value=config), \
@@ -451,6 +509,7 @@ async def coordinator():
             assert len(CAPTURED) == 2 and len(CAPTURED[1][0]) == 2
             assert all(torch.equal(image, torch.zeros((1, 8, 8, 3))) for image in CAPTURED[1][0])
             assert CAPTURED[1][1:] == ([None, None], [None, None])
+            assert VALUE_CAPTURES[1][0] == [{'value_1': True}, {'value_1': True}]
             assert not runtime._MASTER_JOBS
             print('IMAGE_LIST_SEQUENTIAL_OK three regions; one worker; optional outputs omitted')
             # Same public queue path, now with master participation enabled. The
@@ -466,6 +525,8 @@ async def coordinator():
                 if fmt != 'exact':
                     case_prompt['4']['inputs'].update(transfer_format=fmt, transfer_quality=73)
                 saved_case = copy.deepcopy(case_prompt)
+                # Keep cold-run exact-once assertions independent of other modes.
+                importlib.import_module(module.__name__ + '.image_list.local_executor')._RETAINED_OUTPUTS = None
                 executor = execution.PromptExecutor(ps, cache_args={'ram': 0, 'ram_inactive': 0}, asset_manager=assets)
                 before_sources, before_local, before_models = len(SOURCE_CALLS), len(BRANCH_CALLS), len(MODEL_CALLS)
                 before_utilities, before_events = len(UTILITY_CALLS), len(ITEM_EXECUTIONS)
@@ -489,7 +550,7 @@ async def coordinator():
                 assert len({event['prompt_id'] for event in ITEM_EXECUTIONS[before_events:]}) == len(local_calls)
                 assert local_calls, f'{mode}: master did not process any items'
                 assert len(MODEL_CALLS) == before_models + 1, 'local model dependency did not stay cached'
-                remote_calls = []
+                remote_assignments = []
                 async with aiohttp.ClientSession() as session:
                     for worker, before_stats in zip(workers, before_worker_stats):
                         async with session.get(f"http://127.0.0.1:{worker['port']}/test-stats") as response:
@@ -499,33 +560,69 @@ async def coordinator():
                         submissions = current['submissions'][len(before_stats['submissions']):]
                         events = current['item_executions'][len(before_stats['item_executions']):]
                         assert Counter(utilities) == Counter(calls), (mode, current)
-                        assert len(submissions) == len(calls) == len({event['prompt_id'] for event in events})
+                        assigned = [submission['item_index'] for submission in submissions]
+                        # A repeated item can hit native processing cache even
+                        # when End changes return format. Count fresh deliveries,
+                        # not recomputation, for exact-once scheduling evidence.
+                        assert Counter(calls) <= Counter(assigned), (mode, worker['id'], calls, assigned)
+                        assert len(calls) == len({event['prompt_id'] for event in events}), (mode, events)
+                        assert {event['prompt_id'] for event in events} <= {
+                            submission['prompt_id'] for submission in submissions}
                         for submission in submissions:
                             assert submission['requested'] == submission['queued'] == ['4'], submission
                             assert '8' in submission['node_ids'] and '9' not in submission['node_ids']
                             assert '5' not in submission['node_ids']
-                        remote_calls.extend(calls)
+                        remote_assignments.extend(assigned)
                         assert not current['running'] and not current['pending'], current
                 if mode.startswith('mixed'):
-                    assert remote_calls, 'mixed execution failed to use direct workers'
+                    assert remote_assignments, 'mixed execution failed to use direct workers'
                 else:
-                    assert not remote_calls and len(local_calls) == COUNT
-                assert Counter(local_calls + remote_calls) == Counter(range(COUNT)), (local_calls, remote_calls)
+                    assert not remote_assignments and len(local_calls) == COUNT
+                assert Counter(local_calls + remote_assignments) == Counter(range(COUNT)), (local_calls, remote_assignments)
+                check_carried_values()
                 images, masks, texts = CAPTURED[-1]
                 assert len(images) == len(masks) == len(texts) == COUNT
                 for i, row in enumerate(source_rows()):
                     expected = row['image'] + row['strength']
-                    if fmt == 'png' and i in remote_calls:
+                    if fmt == 'png' and i in remote_assignments:
                         expected = expected.clone()
                         expected[..., :3] = (expected[..., :3].clamp(0, 1) * 255).to(torch.uint8).float() / 255
                     assert torch.equal(images[i], expected), (mode, i)
                     assert torch.equal(masks[i], row['mask'] * 0.5), (mode, i)
                     assert texts[i] == f'item-{i}:seed-{100 + i}', (mode, texts)
                 assert not runtime._MASTER_JOBS and not runtime._WORKER_ITEMS
-                participation_counts[mode] = {'master': len(local_calls), 'workers': len(remote_calls)}
+                participation_counts[mode] = {'master': len(local_calls), 'workers': len(remote_assignments)}
+            # Repeat the completed master-only queue with a fresh outer executor.
+            # Every item must be delivered again without recomputing its branch.
+            before_sources, before_local = len(SOURCE_CALLS), len(BRANCH_CALLS)
+            before_models, before_utilities = len(MODEL_CALLS), len(UTILITY_CALLS)
+            before_captures = len(CAPTURED)
+            previous_outputs = CAPTURED[-1]
+            executor = execution.PromptExecutor(ps, cache_args={'ram': 0, 'ram_inactive': 0}, asset_manager=assets)
+            with patch.object(config_mod, 'load_config', return_value=config), \
+                 patch.object(orchestration, 'load_config', return_value=config), \
+                 patch.object(orchestration, 'queue_prompt_payload', enqueue), \
+                 patch.object(config_mod, 'get_worker_timeout_seconds', return_value=15):
+                await asyncio.wait_for(orchestration.orchestrate_distributed_execution(
+                    prompt, None, 'test', []), 45)
+            assert executor.success, executor.status_messages
+            assert len(SOURCE_CALLS) == before_sources + 1
+            assert len(BRANCH_CALLS) == before_local
+            assert len(MODEL_CALLS) == before_models
+            assert len(UTILITY_CALLS) == before_utilities
+            assert len(CAPTURED) == before_captures + 1
+            for before, after in zip(previous_outputs[:2], CAPTURED[-1][:2]):
+                assert len(before) == len(after) == COUNT
+                assert all(torch.equal(a, b) for a, b in zip(before, after))
+            assert previous_outputs[2] == CAPTURED[-1][2]
+            check_carried_values()
+            assert not runtime._MASTER_JOBS and not runtime._WORKER_ITEMS
+            assert prompt == saved_prompt
+            print('IMAGE_LIST_CACHE_REQUEUE_OK unchanged items reused; fresh ordered delivery and cleanup')
             print('IMAGE_LIST_MASTER_OK ' + json.dumps(participation_counts))
-            assert len(outer_executions) == 2 + len(participation_counts) and all(row['captures'] == 1 for row in outer_executions)
+            assert len(outer_executions) == 3 + len(participation_counts) and all(row['captures'] == 1 for row in outer_executions)
             print('IMAGE_LIST_TRANSFER_HTTP_OK mixed-png and master-only-png; masks/text/alpha/local images exact')
+            print('IMAGE_LIST_VALUES_OK passthrough all six types; sparse override/add; Get; sequential Get-to-Start; direct/mixed/master-only')
             print('IMAGE_LIST_TARGETS_OK ' + json.dumps({
                 'modes': ['delegate-only', 'mixed', 'master-only'],
                 'outer_targets': outer_executions[0]['targets'], 'worker_targets': ['4'],
@@ -539,6 +636,12 @@ async def coordinator():
             del direct_prompt['8'], direct_prompt['9']
             direct_prompt['3']['inputs']['image'] = ['2', 0]
             # Real Comfy user-interrupt flag while a real worker executor is active.
+            rows = source_rows()
+            items = runtime.normalize_image_list_inputs(
+                [row['image'] for row in rows], [row['mask'] for row in rows],
+                {f'value_{n}': [row[key] for row in rows]
+                 for n, key in ((1, 'reference_image'), (2, 'text'), (3, 'strength'), (4, 'seed'), (6, 'mask'))}
+                | {'value_5': True})
             slow = workers[1]
             async with aiohttp.ClientSession() as session:
                 async def slow_stats():
@@ -552,11 +655,11 @@ async def coordinator():
                         await asyncio.sleep(0.02)
                     raise AssertionError('worker state transition timed out')
                 before = await until(lambda state: not state['running'] and not state['pending'])
-                context = runtime.create_master_job('2', '4', direct_prompt, source_rows(), ['slow'],
+                context = runtime.create_master_job('2', '4', direct_prompt, items, ['slow'],
                                                   f'http://127.0.0.1:{port}')
                 with patch.object(config_mod, 'load_config', return_value=config), \
                      patch.object(config_mod, 'get_worker_timeout_seconds', return_value=15):
-                    task = asyncio.create_task(runtime.run_image_list_job(context))
+                    task = asyncio.create_task(runtime.run_image_list_job(context, include_values=True))
                     active = await until(lambda state: bool(state['running']))
                     owned_id = active['running'][0]
                     comfy.model_management.interrupt_current_processing(True)
@@ -574,14 +677,14 @@ async def coordinator():
                 assert not runtime._MASTER_JOBS
             print('IMAGE_LIST_CANCEL_OK owned prompt stopped; no further dispatch; context removed')
             # A worker exception before End must fail, not hang or return a partial list.
-            bad_rows = source_rows()
-            bad_rows[0]['seed'] = -1
+            bad_rows = copy.deepcopy(items)
+            bad_rows[0]['values']['value_4'] = -1
             context = runtime.create_master_job('2', '4', direct_prompt, bad_rows, ['fast'],
                                               f'http://127.0.0.1:{port}')
             with patch.object(config_mod, 'load_config', return_value=config), \
                  patch.object(config_mod, 'get_worker_timeout_seconds', return_value=15):
                 try:
-                    await asyncio.wait_for(runtime.run_image_list_job(context), 5)
+                    await asyncio.wait_for(runtime.run_image_list_job(context, include_values=True), 5)
                     raise AssertionError('worker exception was ignored')
                 except RuntimeError as exc:
                     assert 'failed image-list item' in str(exc), str(exc)

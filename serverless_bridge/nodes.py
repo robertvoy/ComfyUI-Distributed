@@ -11,7 +11,7 @@ from .codec import decode_payload, encode_payload
 from .image_transfer import (FORMATS, DEFAULT_FORMAT, DEFAULT_QUALITY,
                              FORMAT_TOOLTIP, QUALITY_TOOLTIP, validate_options)
 from .contract import (
-    MAX_ARTIFACT_BYTES, MAX_ITEMS, MAX_TOTAL_BYTES, SOCKET_KINDS,
+    MAX_ARTIFACT_BYTES, MAX_ITEMS, MAX_TOTAL_BYTES, SOCKET_KINDS, VALUE_SOCKETS, ARTIFACT_KINDS,
     bounded_int, identifier, validate_binding, validate_json,
 )
 
@@ -38,6 +38,9 @@ def _json(text):
 def _cpu(kind, value):
     # Runtime transfer only, never sampling or device discovery. Pure codecs
     # deliberately reject non-CPU storage rather than making hidden transfers.
+    if kind == "VALUE":
+        from .value_codec import value_kind
+        kind = value_kind(value)
     if kind in ("IMAGE", "MASK"):
         return value.detach().cpu()
     if kind == "AUDIO":
@@ -72,6 +75,8 @@ def export_values(request_id, binding, values, *, transfer_format=DEFAULT_FORMAT
         raise ValueError("Image transfer controls apply only to IMAGE exports")
     if not isinstance(values, list) or not 1 <= len(values) <= MAX_ITEMS:
         raise ValueError("Connected media output has no values or exceeds item limit")
+    if binding["socket"] in VALUE_SOCKETS and len(values) != 1:
+        raise ValueError("End override requires exactly one value")
     request_key = hashlib.sha256(request_id.encode()).hexdigest()
     subfolder = f"distributed-media-v1/{request_key}"
     root = Path(folder_paths.get_temp_directory()).resolve()
@@ -114,7 +119,7 @@ def import_value(artifact, filename):
     if not isinstance(artifact, dict) or set(artifact) != fields:
         raise ValueError("Invalid staged media metadata")
     identifier(artifact["id"])
-    if artifact["kind"] not in SOCKET_KINDS.values():
+    if artifact["kind"] not in ARTIFACT_KINDS:
         raise ValueError("Invalid staged media kind")
     size = bounded_int(artifact["byte_length"], MAX_ARTIFACT_BYTES)
     if not isinstance(filename, str):
@@ -138,13 +143,14 @@ class MediaImportV1(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(node_id="MediaImportV1", category="distributed/internal", is_deprecated=True,
             inputs=[io.String.Input("artifact_json"), io.String.Input("filename")],
-            outputs=[io.Image.Output(), io.Audio.Output(), io.Mask.Output(), io.String.Output(), io.Video.Output()])
+            outputs=[io.Image.Output(), io.Audio.Output(), io.Mask.Output(), io.String.Output(), io.Video.Output(),
+                     io.AnyType.Output()])
 
     @classmethod
     def execute(cls, artifact_json, filename):
         artifact = _json(artifact_json)
         value = import_value(artifact, filename)
-        return io.NodeOutput(*(value if kind == artifact["kind"] else None for kind in SOCKET_KINDS.values()))
+        return io.NodeOutput(*(value if kind == artifact["kind"] else None for kind in (*SOCKET_KINDS.values(), "VALUE")))
 
 
 class MediaExportV1(io.ComfyNode):
@@ -155,6 +161,7 @@ class MediaExportV1(io.ComfyNode):
                     io.Image.Input("images", optional=True), io.Audio.Input("audio", optional=True),
                     io.Mask.Input("masks", optional=True), io.String.Input("texts", optional=True, force_input=True),
                     io.Video.Input("video", optional=True),
+                    *[io.AnyType.Input(name, optional=True) for name in VALUE_SOCKETS],
                     io.Combo.Input("transfer_format", options=list(FORMATS), default=DEFAULT_FORMAT,
                                    optional=True, tooltip=FORMAT_TOOLTIP),
                     io.Int.Input("transfer_quality", default=DEFAULT_QUALITY, min=1, max=100,
@@ -163,10 +170,12 @@ class MediaExportV1(io.ComfyNode):
 
     @classmethod
     def execute(cls, request_id, binding_json, images=None, audio=None, masks=None, texts=None, video=None,
-                transfer_format=DEFAULT_FORMAT, transfer_quality=DEFAULT_QUALITY):
+                transfer_format=DEFAULT_FORMAT, transfer_quality=DEFAULT_QUALITY, **overrides):
         binding = _json(_scalar(binding_json))
         validate_binding(binding)
-        provided = dict(images=images, audio=audio, masks=masks, texts=texts, video=video)
+        if set(overrides) - set(VALUE_SOCKETS):
+            raise ValueError("Unknown End value slot")
+        provided = dict(images=images, audio=audio, masks=masks, texts=texts, video=video, **overrides)
         if {name for name, value in provided.items() if value is not None} != {binding["socket"]}:
             raise ValueError("Media export must receive exactly its declared typed socket")
         exported = export_values(_scalar(request_id), binding, provided[binding["socket"]],

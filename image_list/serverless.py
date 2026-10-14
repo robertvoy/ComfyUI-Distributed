@@ -14,7 +14,7 @@ import uuid
 
 from . import runtime
 from ..api.orchestration.runpod_client import serialize_request
-from ..api.orchestration.serverless_media_prompt import compile_media_prompt
+from ..api.orchestration.serverless_media_prompt import compile_export_prompt
 from ..api.orchestration.serverless_runtime import PER_WORKER_JOB_LIMIT, get_manager
 from ..api.orchestration.serverless_typed_inputs import prepare_media_inputs, _artifact_id
 from ..serverless_bridge import codec, contract
@@ -156,11 +156,9 @@ async def prepare_serverless_item(prompt, region, item, worker, *, request_id, j
         end_inputs.get("transfer_quality", DEFAULT_QUALITY))
     if "images" not in end_inputs:
         raise ValueError("Image-list End requires images")
-    graph[end] = {"class_type": "DistributedMediaCollector", "inputs": {
-        **{key: end_inputs[key] for key in ("images", "masks", "texts") if key in end_inputs},
-        "multi_job_id": job_id, "worker_id": worker["id"]}}
-    if transfer_format != DEFAULT_FORMAT:
-        graph[end]["inputs"].update(transfer_format=transfer_format, transfer_quality=transfer_quality)
+    override_names = runtime.end_override_names(end_inputs)
+    graph[end]["inputs"] = {key: end_inputs[key] for key in
+                            ("images", "masks", "texts") + override_names if key in end_inputs}
     del graph[start]
     if type(item.get("index")) is not int or item["index"] < 0:
         raise ValueError("Image-list item index must be a nonnegative integer")
@@ -238,7 +236,27 @@ async def prepare_serverless_item(prompt, region, item, worker, *, request_id, j
         nid = _new_node_id(graph, "text")
         graph[nid] = {"class_type": "PrimitiveString", "inputs": {"value": text}}
         graph[end]["inputs"]["texts"] = [nid, 0]
-    workflow, manifest = compile_media_prompt(graph, request_id)
+    # Literal/scalar overrides also use the exact bridge codec, never numeric
+    # primitive widgets (Comfy may coerce their types). The generic import slot
+    # keeps the export linked until native injection, just like tensor inputs.
+    for name in override_names:
+        value = graph[end]["inputs"][name]
+        if not isinstance(value, list):
+            descriptor, payload = codec.encode_payload("VALUE", value,
+                                                       max_bytes=contract.MAX_ARTIFACT_BYTES)
+            aid = _artifact_id("VALUE", descriptor, payload)
+            artifacts[aid] = contract.artifact_from_payload(aid, "VALUE", descriptor, payload)
+            nid = _new_node_id(graph, name)
+            graph[nid] = {"class_type": "PrimitiveString", "inputs": {"value": ""}}
+            placeholders[nid] = aid
+            graph[end]["inputs"][name] = [nid, 0]
+    outputs = graph.pop(end)["inputs"]
+    specs = [{"collector_id": end, "job_id": job_id, "participant_id": worker["id"],
+              "socket": name, "source": value,
+              "transfer_format": transfer_format if name == "images" else DEFAULT_FORMAT,
+              "transfer_quality": transfer_quality if name == "images" else DEFAULT_QUALITY}
+             for name, value in outputs.items()]
+    workflow, manifest = compile_export_prompt(graph, request_id, specs)
     refs = []
     for nid, node in workflow.items():
         for name, value in node["inputs"].items():
@@ -372,7 +390,11 @@ class ServerlessSlots:
             if any(not isinstance(values, list) or len(values) != 1 or values[0] is None
                    for values in media.values()):
                 raise RuntimeError("Serverless image-list result requires exactly one value per socket")
-            result = runtime.normalize_worker_result(media["images"], media.get("masks"), media.get("texts"))
+            overrides = {name: media[name] for name in runtime.VALUE_NAMES if name in media}
+            result = runtime.normalize_worker_result(media["images"], media.get("masks"), media.get("texts"),
+                                                     values=overrides)
+            runtime._checked_overrides(result, runtime.end_override_names(
+                self.state.original_prompt[self.region["end_id"]].get("inputs", {})))
             if result["mask"] is not None and result["mask"].shape[1:3] != result["image"].shape[1:3]:
                 raise ValueError("Serverless image-list result mask is not paired with the image grid")
             self._remove_queue(handle["job_id"])

@@ -133,6 +133,7 @@ def test_quality_to_crf_mapping():
 
 def test_normalize_format_rejects_unknown_values():
     assert tc.normalize_format(" H264 ") == "h264"
+    assert tc.normalize_format(" EXACT ") == "exact"
     assert tc.normalize_format(None) == tc.DEFAULT_TRANSFER_FORMAT
     with pytest.raises(tc.TransferCodecError):
         tc.normalize_format("gif")
@@ -156,6 +157,22 @@ def test_decode_chunk_validates_envelope_against_payload():
     video_env = {k: v for k, v in video.items() if k != "parts"}
     with pytest.raises(tc.TransferCodecError, match="frames"):
         tc.decode_chunk({**video_env, "count": 5}, video["parts"])
+
+
+def test_exact_is_appended_without_changing_saved_format_defaults():
+    assert tc.TRANSFER_FORMATS == (
+        "legacy_png", "png", "ffv1", "jpeg", "webp", "h264", "h265", "av1", "exact",
+    )
+    assert tc.DEFAULT_TRANSFER_FORMAT == "legacy_png"
+    assert tc.EXACT_FORMAT not in tc.IMAGE_FORMATS + tc.VIDEO_FORMATS
+
+
+def test_exact_does_not_enter_uint8_chunk_codec():
+    frames = tc.tensor_batch_to_uint8(_smooth_frames(count=1))
+    with pytest.raises(tc.TransferCodecError, match="exact"):
+        list(tc.encode_chunks(frames, "exact", 90, 10**9))
+    with pytest.raises(tc.TransferCodecError, match="exact"):
+        tc.decode_chunk({"format": "exact", "count": 1, "width": 91, "height": 67}, [b"raw tensor"])
 
 
 def test_legacy_format_is_not_chunk_encoded():

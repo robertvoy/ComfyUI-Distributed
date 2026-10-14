@@ -6,8 +6,12 @@ executor `execute_media_request`. It does **not** start ComfyUI, provision an
 endpoint, install models, or provide a provider worker/supervisor. The endpoint
 needs this bridge, not the full ComfyUI-Distributed extension.
 
-For collector setup, list ordering, supported native VIDEO states, and PR2
-limitations, see [typed serverless media](../docs/serverless-media.md).
+The bridge's generic contract supports `IMAGE`, `AUDIO`, `MASK`, `STRING`, and
+native ComfyUI `VIDEO`. **Distributed Collector** (`DistributedCollector`) uses
+only the image/audio outputs and combines their returned lists into ordinary
+IMAGE/AUDIO outputs. It has no MASK/STRING/VIDEO outputs, and the separate
+`DistributedMediaCollector` node has been removed. For Collector setup, ordering,
+and limits, see [serverless images and audio](../docs/serverless-media.md).
 
 ## Install in the endpoint image
 
@@ -70,7 +74,8 @@ returning `{"error": ...}` or marking a provider job `FAILED` is not that policy
 
 ## Request and response
 
-A minimal text request builder (no files or model required by this graph):
+A minimal generic bridge text request builder (no files or model required by this
+graph). This illustrates the bridge contract, not a Collector text output:
 
 ```python
 import json
@@ -127,7 +132,7 @@ For typed inputs, `media.artifacts` contains records with exactly:
 
 | Field | Value |
 | --- | --- |
-| `id`, `kind` | Unique artifact ID and one of the five native types |
+| `id`, `kind` | Unique artifact ID and a native media type or internal `VALUE` |
 | `descriptor` | Kind-specific codec metadata; use the shared codec, not pickle |
 | `byte_length`, `sha256` | Exact payload byte count and lowercase SHA-256 hex |
 | `transport` | `{"type": "inline", "data_base64": "..."}` or the URL transport below |
@@ -144,7 +149,7 @@ to owned staging paths. They are not an arbitrary filename-upload interface.
 The returned `media` object has exactly `version`, `profile`, `request_id`,
 `bindings`, `artifacts`, and `items`:
 
-- `bindings`: every declared binding, unchanged, plus `count` (1–64).
+- `bindings`: every declared binding, unchanged, plus `count` (1–64 for media; exactly 1 for End value overrides).
 - `artifacts`: the same artifact schema above with inline or URL transport.
 - `items`: `{ "binding_id": "...", "item_index": 0, "artifact_id": "..." }`
   records covering every index exactly once, ordered by `item_index` when decoded.
@@ -155,20 +160,46 @@ only and must not be returned to the master. The executor reads validated
 `media_exports` history records and bounded `/view` payloads before constructing
 the external envelope. [contract.py](contract.py) is the schema authority.
 
+## Internal image-list values
+
+Image-list End uses sparse `value_1` … `value_10` bindings of kind `VALUE`.
+These are internal exports, not new Collector sockets. `value-v1` descriptors
+preserve BOOLEAN, arbitrary-size INT, finite binary64 FLOAT, STRING, IMAGE and
+MASK distinctly; tensors/text reuse exact native codecs. Each binding returns
+exactly one value. Only explicit End overrides are exported; the master rebuilds
+unchanged values from its source items. Compression of the main IMAGE never
+changes value-tensor fidelity.
+
+Deploy the complete updated bridge, including `value_codec.py`, before using
+End overrides. `MediaImportV1` retains its original five output positions and
+appends the internal wildcard VALUE output at slot 5. Older bridge installations
+do not support these bindings; ordinary provider health checks do not verify
+this support. Request/result size limits still apply.
+
 ## Optional image return encoding
 
 IMAGE `MediaExportV1` nodes may also contain literal `transfer_format` and
-`transfer_quality` controls. Defaults are `exact` and `90`; old exact requests
-omit the controls and retain their original representation. Other media exports
-must not carry image controls. The master compiler supplies them from the typed
-Collector's widgets; callers should not alter binding identity metadata.
+`transfer_quality` controls. The **bridge-level defaults** are `exact` and `90`;
+generic callers that omit the controls retain that representation. Other media
+exports must not carry image controls. Callers should not alter binding identity
+metadata.
 
-Formats: `exact`, `legacy_png`, `png`, `ffv1`, `jpeg`, `webp`, `h264`, `h265`, `av1`.
+The **Collector default is different**: its saved widget value remains
+`legacy_png` with quality `90`. For a `comfy-media-v1` pool, the master compiler
+maps that value to an explicit `png` export, so normal serverless image returns
+use compressed 8-bit PNG. `exact` is opt-in at the Collector. Other selected
+formats are unchanged. Direct workers also support opt-in exact IMAGE transport;
+an older master rejection is an error, not an 8-bit retry. A Collector requesting
+`exact` cannot dispatch to a `legacy-image-v1` pool.
+
+Formats: `exact`, `legacy_png`, `png`, `ffv1`, `jpeg`, `webp`, `h264`,
+`h265` (**experimental**), `av1`.
 `exact` preserves float tensor bits. The image/video codecs quantize RGB/grayscale
 to 8-bit; PNG/FFV1 are lossless at that precision, while the other codecs are
 lossy. Quality is an integer 1–100 and affects only lossy formats. IMAGE batch
 order, shape and channel count are retained, and alpha is not discarded.
-Native VIDEO/MASK/AUDIO/STRING still use their original exact codecs.
+Native VIDEO/MASK/AUDIO/STRING bridge values still use their original exact codecs;
+the image-format controls do not add those sockets to the Collector.
 
 Copy/update the complete bridge directory on both sides, including
 `image_transfer.py` and `image_codec.py`. Pillow and the selected CPU/software
@@ -247,5 +278,5 @@ unidentifiable files are not claimed; directories and all unidentified leftovers
 remain lifecycle-owned. This is not a temp-directory sweep. Independently decoded
 VIDEO objects do not depend on either staging or exporter files.
 
-Verification scope: source and offline tests. No live provider/GPU validation is
-claimed, and this directory is not a tested turnkey provider deployment.
+This guide describes the source contract, not a test result. No live provider/GPU
+validation is claimed, and this directory is not a turnkey provider deployment.

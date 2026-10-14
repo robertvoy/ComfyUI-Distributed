@@ -472,6 +472,25 @@ class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaisesRegex(RuntimeError, "execution_targets.*upgrade"):
                         await dispatch.preflight_image_list_workers([{"id": "worker"}])
 
+    async def test_image_list_value_results_requires_exact_true_only_for_overrides(self):
+        for value in (None, False, 1, "true", [], True):
+            capability = _valid_capability()
+            if value is not None:
+                capability['value_results'] = value
+            session = _FakeSession({('worker', 'capabilities'): (200, capability),
+                                    ('worker', 'queue'): (200, _valid_queue())})
+            async def fake_session():
+                return session
+            with patch.object(dispatch, 'get_client_session', side_effect=fake_session), patch.object(
+                dispatch, 'build_worker_url', side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+            ):
+                self.assertEqual(await dispatch.preflight_image_list_workers([{'id': 'worker'}]), {'worker': True})
+                if value is True:
+                    self.assertEqual(await dispatch.preflight_image_list_workers(
+                        [{'id': 'worker'}], require_value_results=True), {'worker': True})
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'value_results.*upgrade'):
+                        await dispatch.preflight_image_list_workers([{'id': 'worker'}], require_value_results=True)
     async def test_image_list_preflight_fails_closed_for_malformed_capabilities(self):
         malformed = {"supported": True, "protocol_version": 2, "node_ids": None}
         session = _FakeSession({("worker", "capabilities"): (200, malformed)})

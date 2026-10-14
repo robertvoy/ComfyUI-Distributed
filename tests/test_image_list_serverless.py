@@ -345,6 +345,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         index = int(media["request_id"].rsplit(":", 1)[1])
         data = item(index)
         values = {"images": data["image"], "masks": data["mask"], "texts": str(index)}
+        values.update(getattr(self, "override_values", {}))
         for n, binding in enumerate(media["outputs"]):
             descriptor, payload = codec.encode_payload(binding["kind"], values[binding["socket"]])
             aid = f"result:{n}"
@@ -670,6 +671,50 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         assert not self.manager.ledger.all()
         assert not self.server.distributed_pending_jobs
         self.api.submit.assert_not_awaited()
+
+    async def test_sparse_overrides_overlay_master_values_without_forwarding(self):
+        from test_image_list_serverless_values import assert_exact
+        self.override_values = {"value_2": 2**63 + 333, "value_10": False}
+        self.state.original_prompt["ns/end"]["inputs"].update(
+            value_2=["process", 2], value_10=["process", 3])
+        slot, handle = await self.dispatch()
+        await self.finish(handle)
+        result = self.controller.poll({slot: handle})[2]
+        assert set(result["values"]) == set(self.override_values)
+        for name, expected in self.override_values.items():
+            assert_exact(result["values"][name], expected)
+        state = copy.copy(self.state)
+        state.items = [self.state.items[0]]
+        columns = runtime._collect_output_lists([result], state=state, include_values=True)
+        assert columns[3][0] == {**state.items[0]["values"], **self.override_values}
+        assert self.state.items[0]["values"]["value_2"] == 123
+
+    async def test_override_missing_extra_wrong_nonfinite_multiple_results_fail(self):
+        self.override_values = {"value_2": 42}
+        self.state.original_prompt["ns/end"]["inputs"]["value_2"] = ["process", 2]
+        for index, bad in enumerate(("missing", "extra", "wrong", "nonfinite", "multiple", "none")):
+            slot, handle = await self.dispatch(index)
+            await self.finish(handle)
+            queue = self.server.distributed_pending_jobs[handle["job_id"]]
+            message = queue.get_nowait()
+            media = message["media"]
+            if bad == "missing":
+                media.pop("value_2")
+            elif bad == "extra":
+                media["value_3"] = [1]
+            else:
+                media["value_2"] = {"wrong": [{}], "nonfinite": [float("nan")],
+                                    "multiple": [1, 2], "none": [None]}[bad]
+            queue.put_nowait(message)
+            with pytest.raises((ValueError, TypeError, RuntimeError)):
+                self.controller.poll({slot: handle})
+
+    async def test_no_override_results_preserve_original_return_shape(self):
+        slot, handle = await self.dispatch()
+        await self.finish(handle)
+        result = self.controller.poll({slot: handle})[2]
+        assert set(result) == {"image", "mask", "text"}
+        assert not any(binding["kind"] == "VALUE" for binding in self.jobs["provider-0"]["media"]["outputs"])
 
     async def test_duplicate_index_and_mismatched_handle_fail(self):
         slot, handle = await self.dispatch()

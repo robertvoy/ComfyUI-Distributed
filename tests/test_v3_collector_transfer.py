@@ -69,8 +69,8 @@ def v3(monkeypatch):
     module(f"{PKG}.nodes.utilities")
     module(f"{PKG}.nodes.distributed_upscale", UltimateSDUpscaleDistributed=object)
     module(f"{PKG}.nodes.collector", DistributedCollectorNode=CollectorRuntime)
-    module(f"{PKG}.nodes.image_list", DistributedImageListStart=object, DistributedImageListEnd=object)
-    module(f"{PKG}.nodes.media_collector", DistributedMediaCollector=object)
+    module(f"{PKG}.nodes.image_list", DistributedImageListStart=object, DistributedImageListEnd=object,
+           DistributedImageListGetValue=object)
     module("comfy", __path__=[])
     module("comfy.samplers", KSampler=types.SimpleNamespace(SAMPLERS=["euler"], SCHEDULERS=["normal"]))
     module("comfy_api", __path__=[])
@@ -98,6 +98,7 @@ def test_registered_collector_schema_exposes_optional_transfer_inputs(v3):
     fmt = inputs["transfer_format"]
     assert fmt.kind == "Combo"
     assert fmt.kwargs["options"] == list(codec.TRANSFER_FORMATS)
+    assert fmt.kwargs["options"][-1] == "exact"
     assert fmt.kwargs["default"] == "legacy_png"
     assert fmt.kwargs["optional"] is True
     quality = inputs["transfer_quality"]
@@ -107,13 +108,14 @@ def test_registered_collector_schema_exposes_optional_transfer_inputs(v3):
     assert schema.is_input_list is True
 
 
-def test_registered_collector_forwards_transfer_options(v3):
+@pytest.mark.parametrize("fmt", ["av1", "exact"])
+def test_registered_collector_forwards_transfer_options(v3, fmt):
     mod, _, calls = v3
 
-    mod.DistributedCollector.execute(images=["img"], audio=[None], transfer_format=["av1"], transfer_quality=[70],
+    mod.DistributedCollector.execute(images=["img"], audio=[None], transfer_format=[fmt], transfer_quality=[70],
                                      multi_job_id=["job"], is_worker=[True])
 
-    assert calls[-1]["transfer_format"] == ["av1"]
+    assert calls[-1]["transfer_format"] == [fmt]
     assert calls[-1]["transfer_quality"] == [70]
     assert calls[-1]["multi_job_id"] == ["job"]
 

@@ -401,20 +401,6 @@ def prune_prompt_for_worker(prompt_obj, use_worker_sink=False):
 
 def prepare_delegate_master_prompt(prompt_obj, collector_ids):
     """Prune master prompt so it only executes post-collector nodes in delegate mode."""
-    # Typed collectors need no fabricated IMAGE placeholder. Sever all media
-    # links, including STRING scalar branches, before retained-config analysis.
-    # Their expected_media control was frozen by participant overrides.
-    if any((prompt_obj.get(cid) or {}).get("class_type") == "DistributedMediaCollector"
-           for cid in collector_ids):
-        from ...serverless_bridge.contract import SOCKET_KINDS
-        prompt_obj = json.loads(json.dumps(prompt_obj))
-        for cid in collector_ids:
-            node = prompt_obj.get(cid) or {}
-            if node.get("class_type") == "DistributedMediaCollector":
-                inputs = node.setdefault("inputs", {})
-                inputs.setdefault("expected_media", json.dumps([name for name in SOCKET_KINDS if name in inputs]))
-                for name in SOCKET_KINDS:
-                    inputs.pop(name, None)
     downstream = _find_downstream_nodes(prompt_obj, collector_ids)
     nodes_to_keep = set(collector_ids)
     nodes_to_keep.update(downstream)
@@ -519,7 +505,6 @@ def generate_job_id_map(prompt_index, prefix):
     job_map = {}
     distributed_nodes = (
         prompt_index.nodes_for_class("DistributedCollector")
-        + prompt_index.nodes_for_class("DistributedMediaCollector")
         + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
         + prompt_index.nodes_for_class("DistributedImageListStart")
     )
@@ -552,10 +537,8 @@ def _override_collector_nodes(
     enabled_json,
     delegate_master,
 ):
-    """Configure legacy and typed collectors without changing their media."""
-    collector_ids = (prompt_index.nodes_for_class("DistributedCollector")
-                     + prompt_index.nodes_for_class("DistributedMediaCollector"))
-    for node_id in collector_ids:
+    """Configure DistributedCollector nodes for master or worker role."""
+    for node_id in prompt_index.nodes_for_class("DistributedCollector"):
         node = prompt_copy.get(node_id)
         if not isinstance(node, dict):
             continue
@@ -568,9 +551,6 @@ def _override_collector_nodes(
         inputs["multi_job_id"] = job_id_map.get(node_id, node_id)
         inputs["is_worker"] = not is_master
         inputs["enabled_worker_ids"] = enabled_json
-        if node.get("class_type") == "DistributedMediaCollector":
-            from ...serverless_bridge.contract import SOCKET_KINDS
-            inputs["expected_media"] = json.dumps([socket for socket in SOCKET_KINDS if socket in inputs])
         if is_master:
             inputs["delegate_only"] = bool(delegate_master)
             inputs.pop("master_url", None)
