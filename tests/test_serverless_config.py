@@ -60,6 +60,29 @@ class ValidateServerlessWorkerTests(unittest.TestCase):
         self.assertIsNot(result, worker)
         self.assertEqual(worker, {"id": "worker-1", "endpoint_id": "ep_123-abc", "name": "GPU"})
 
+    def test_omitted_media_profile_remains_absent_and_means_legacy(self):
+        result = serverless_config.validate_serverless_worker(
+            {"id": "worker-1", "endpoint_id": "ep-123"}
+        )
+        self.assertNotIn("media_profile", result)
+        self.assertEqual(result.get("media_profile", "legacy-image-v1"), "legacy-image-v1")
+
+    def test_explicit_media_profiles_are_retained(self):
+        for profile in ("legacy-image-v1", "comfy-media-v1"):
+            with self.subTest(profile=profile):
+                result = serverless_config.validate_serverless_worker(
+                    {"id": "worker-1", "endpoint_id": "ep-123", "media_profile": profile}
+                )
+                self.assertEqual(result["media_profile"], profile)
+
+    def test_media_profile_rejects_unknown_nonstring_and_null_values(self):
+        for profile in ("", "auto", "comfy-media-v2", " comfy-media-v1", "COMFY-MEDIA-V1", None, True, 1, [], {}):
+            with self.subTest(profile=profile):
+                with self.assertRaisesRegex(ValueError, "media_profile"):
+                    serverless_config.validate_serverless_worker(
+                        {"id": "worker-1", "endpoint_id": "ep-123", "media_profile": profile}
+                    )
+
     def test_accepts_inclusive_numeric_bounds(self):
         for jobs, timeout in ((1, 30), (16, 86400)):
             with self.subTest(jobs=jobs, timeout=timeout):
@@ -307,6 +330,7 @@ class PublicConfigTests(unittest.TestCase):
                         "type": "serverless",
                         "provider": "runpod",
                         "endpoint_id": "ep-123",
+                        "media_profile": "comfy-media-v1",
                         "api_key": "inline-secret",
                         "clear_api_key": "another-secret",
                         "credential": "credential-secret",
@@ -334,6 +358,8 @@ class PublicConfigTests(unittest.TestCase):
         self.assertNotIn("api_key", local)
         self.assertNotIn("credentials_note", result["settings"])
         self.assertEqual(first["name"], "remote GPU")
+        self.assertEqual(first["media_profile"], "comfy-media-v1")
+        self.assertNotIn("media_profile", second)
         self.assertEqual(config, original)
         self.assertIsNot(result, config)
         self.assertIsNot(result["workers"], config["workers"])

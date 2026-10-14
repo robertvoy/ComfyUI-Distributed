@@ -18,7 +18,7 @@ class AmbiguousSubmission(RunpodError):
     """Submission may have been accepted: never retry it automatically."""
 
 
-def serialize_request(workflow, images, timeout_seconds):
+def serialize_request(workflow, images, timeout_seconds, *, media=None):
     """Serialize and size-check the exact JSON body used by Runpod ``/run``."""
     payload = {
         "input": {"workflow": workflow, "images": images},
@@ -27,6 +27,10 @@ def serialize_request(workflow, images, timeout_seconds):
             "ttl": timeout_seconds * 1000,
         },
     }
+    if media is not None:
+        from ...serverless_bridge.handler import _validate_request
+        payload["input"]["media"] = media
+        _validate_request(payload["input"])
     body = json.dumps(
         payload,
         allow_nan=False,
@@ -108,8 +112,8 @@ class RunpodClient:
     async def health(self):
         return await self._request("GET", "health")
 
-    async def submit(self, workflow, images, timeout_seconds):
-        body = serialize_request(workflow, images, timeout_seconds)
+    async def submit(self, workflow, images, timeout_seconds, *, media=None):
+        body = serialize_request(workflow, images, timeout_seconds, media=media)
         result = await self._request("POST", "run", request_body=body)
         try:
             return checked_id(result.get("id"))

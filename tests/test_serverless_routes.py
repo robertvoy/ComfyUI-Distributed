@@ -217,6 +217,78 @@ class ServerlessConfigRouteTests(_ConfigRouteFixture):
             self.assertNotIn(obsolete, saved)
         self.assertEqual(self.secrets.get("pool-1"), secret)
 
+    async def test_media_profile_persists_and_is_public_without_changing_credentials(self):
+        for profile in ("legacy-image-v1", "comfy-media-v1"):
+            with self.subTest(profile=profile):
+                response = await config_routes.update_worker_endpoint(_FakeRequest({
+                    "worker_id": "pool-1", "type": "serverless", "endpoint_id": "ep-123",
+                    "media_profile": profile, "api_key": "saved-key", "enabled": False,
+                }))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(self.read_config_file()["workers"][0]["media_profile"], profile)
+                config_module.invalidate_config_cache()
+                public = await config_routes.get_config_endpoint(_FakeRequest())
+                self.assertEqual(public.status, 200)
+                self.assertEqual(public.payload["workers"][0]["media_profile"], profile)
+                self.assertTrue(public.payload["workers"][0]["api_key_configured"])
+                self.assertNotIn("saved-key", json.dumps(public.payload))
+                self.assertEqual(self.secrets.get("pool-1"), "saved-key")
+
+    async def test_old_clients_omit_media_profile_without_downgrading_saved_profile(self):
+        for stored in ({}, {"media_profile": "comfy-media-v1"}):
+            with self.subTest(stored=stored):
+                worker = {"id": "pool-1", "type": "serverless", "endpoint_id": "ep-123", **stored}
+                self.config["workers"] = [worker]
+                self.assertTrue(config_module.save_config(self.config))
+                response = await config_routes.update_worker_endpoint(_FakeRequest({
+                    "worker_id": "pool-1", "name": "Old client save", "jobs_per_run": 2,
+                }))
+                self.assertEqual(response.status, 200)
+                saved = self.read_config_file()["workers"][0]
+                self.assertEqual({k: v for k, v in saved.items() if k == "media_profile"}, stored)
+                # The bulk route is also used by older clients with no profile field.
+                response = await config_routes.update_config_endpoint(_FakeRequest({"workers": [{
+                    "id": "pool-1", "type": "serverless", "endpoint_id": "ep-123", "jobs_per_run": 3,
+                }]}))
+                self.assertEqual(response.status, 200)
+                saved = self.read_config_file()["workers"][0]
+                self.assertEqual({k: v for k, v in saved.items() if k == "media_profile"}, stored)
+
+    async def test_invalid_media_profile_is_rejected_by_worker_and_bulk_routes(self):
+        for profile in ("auto", "comfy-media-v2", None, False, 1, [], {}):
+            with self.subTest(profile=profile):
+                response = await config_routes.update_worker_endpoint(_FakeRequest({
+                    "worker_id": "pool-1", "type": "serverless", "endpoint_id": "ep-123",
+                    "media_profile": profile, "api_key": "never-save",
+                }))
+                self.assertEqual(response.status, 400)
+                response = await config_routes.update_config_endpoint(_FakeRequest({"workers": [{
+                    "id": "pool-1", "type": "serverless", "endpoint_id": "ep-123", "media_profile": profile,
+                }]}))
+                self.assertEqual(response.status, 400)
+                self.assertEqual(self.read_config_file()["workers"], [])
+                self.assertIsNone(self.secrets.get("pool-1"))
+
+    async def test_active_pool_blocks_media_profile_changes_in_both_directions(self):
+        for old_profile, new_profile in ((None, "comfy-media-v1"), ("comfy-media-v1", "legacy-image-v1")):
+            with self.subTest(old_profile=old_profile):
+                worker = {"id": "pool-1", "type": "serverless", "endpoint_id": "ep-123"}
+                if old_profile is not None:
+                    worker["media_profile"] = old_profile
+                self.config["workers"] = [worker]
+                self.assertTrue(config_module.save_config(self.config))
+                original = self.read_config_file()
+                with patch.object(config_routes, "_serverless_pool_is_active", return_value=True):
+                    response = await config_routes.update_worker_endpoint(_FakeRequest({
+                        "worker_id": "pool-1", "media_profile": new_profile,
+                    }))
+                    self.assertEqual(response.status, 409)
+                    response = await config_routes.update_config_endpoint(_FakeRequest({
+                        "workers": [dict(worker, media_profile=new_profile)],
+                    }))
+                    self.assertEqual(response.status, 409)
+                self.assertEqual(self.read_config_file(), original)
+
     async def test_enable_only_update_preserves_serverless_settings_and_saved_key(self):
         self.secrets.set("pool-1", "saved-secret")
         self.config["workers"] = [{
@@ -302,13 +374,14 @@ class ServerlessConfigRouteTests(_ConfigRouteFixture):
             "workers": [{
                 "id": "pool-1", "type": "local", "port": 8188,
                 "provider": "runpod", "endpoint_id": "legacy-ep", "api_key_configured": True,
+                "media_profile": "comfy-media-v1",
             }]
         }))
 
         self.assertEqual(response.status, 200)
         self.assertIsNone(self.secrets.get("pool-1"))
         saved = self.read_config_file()["workers"][0]
-        for field in ("provider", "endpoint_id", "api_key_configured"):
+        for field in ("provider", "endpoint_id", "api_key_configured", "media_profile"):
             self.assertNotIn(field, saved)
 
     async def test_bulk_invalid_serverless_record_does_not_replace_configuration(self):
@@ -341,6 +414,7 @@ class ServerlessConfigRouteTests(_ConfigRouteFixture):
         self.config["workers"] = [{
             "id": "pool-1", "name": "Pool", "type": "serverless", "provider": "runpod",
             "endpoint_id": "ep-123", "jobs_per_run": 2, "concurrency": 2, "timeout_seconds": 600,
+            "media_profile": "comfy-media-v1",
         }]
         self.assertTrue(config_module.save_config(self.config))
 
@@ -353,7 +427,7 @@ class ServerlessConfigRouteTests(_ConfigRouteFixture):
         self.assertIsNone(self.secrets.get("pool-1"))
         worker = self.read_config_file()["workers"][0]
         self.assertEqual(worker["type"], "local")
-        for serverless_field in ("provider", "endpoint_id", "jobs_per_run", "concurrency", "timeout_seconds"):
+        for serverless_field in ("provider", "endpoint_id", "jobs_per_run", "concurrency", "timeout_seconds", "media_profile"):
             self.assertNotIn(serverless_field, worker)
 
     async def test_enabled_toggle_allowed_during_active_run_but_endpoint_change_is_rejected(self):
@@ -575,17 +649,39 @@ class PersistedPoolGuardTests(_ConfigRouteFixture):
                         runtime_module.manager = self.manager
                     else:
                         self.manager.tasks["retained"] = types.SimpleNamespace(done=lambda: True)
-                    for fields in ({"api_key": "new-key"}, {"clear_api_key": True}, {"endpoint_id": "ep-other"}, {"type": "local", "port": 8188}):
+                    for fields in ({"api_key": "new-key"}, {"clear_api_key": True}, {"endpoint_id": "ep-other"}, {"type": "local", "port": 8188}, {"media_profile": "comfy-media-v1"}):
                         response = await config_routes.update_worker_endpoint(_FakeRequest(dict(fields, worker_id="pool-1")))
                         self.assertEqual(response.status, 409, fields)
                     response = await config_routes.delete_worker_endpoint(_FakeRequest({"worker_id": "pool-1"}))
                     self.assertEqual(response.status, 409)
                     worker = original["workers"][0]
-                    for workers in ([], [dict(worker, type="local")], [dict(worker, endpoint_id="ep-other")]):
+                    for workers in ([], [dict(worker, type="local")], [dict(worker, endpoint_id="ep-other")], [dict(worker, media_profile="comfy-media-v1")]):
                         response = await config_routes.update_config_endpoint(_FakeRequest({"workers": workers}))
                         self.assertEqual(response.status, 409, workers)
                     self.assertEqual(self.read_config_file(), original)
                     self.assertEqual(self.secrets.get("pool-1"), "saved-key")
+        self.session_factory.assert_not_awaited()
+
+    async def test_retained_jobs_allow_same_or_omitted_media_profile(self):
+        self.manager.ledger.update("retained", worker_id="pool-1", endpoint_id="ep-123", status="UNKNOWN")
+        for profile in ("legacy-image-v1", "comfy-media-v1"):
+            with self.subTest(profile=profile):
+                worker = {"id": "pool-1", "type": "serverless", "endpoint_id": "ep-123"}
+                # An absent legacy field and an explicit legacy selection are equivalent.
+                if profile != "legacy-image-v1":
+                    worker["media_profile"] = profile
+                self.config["workers"] = [worker]
+                self.assertTrue(config_module.save_config(self.config))
+                for fields in ({"media_profile": profile}, {}):
+                    response = await config_routes.update_worker_endpoint(_FakeRequest({
+                        "worker_id": "pool-1", "name": "Same profile", **fields,
+                    }))
+                    self.assertEqual(response.status, 200)
+                    response = await config_routes.update_config_endpoint(_FakeRequest({"workers": [{
+                        "id": "pool-1", "type": "serverless", "endpoint_id": "ep-123", **fields,
+                    }]}))
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(self.read_config_file()["workers"][0]["media_profile"], profile)
         self.session_factory.assert_not_awaited()
 
     async def test_retained_jobs_allow_images_per_run_and_legacy_concurrency_saves(self):

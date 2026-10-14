@@ -36,7 +36,7 @@ BASELINE = json.loads((ROOT / 'tests/fixtures/v1_node_contracts.json').read_text
 ADDED_OPTIONAL_INPUTS = {
     'DistributedCollector': {
         'transfer_format': [
-            ['legacy_png', 'png', 'ffv1', 'jpeg', 'webp', 'h264', 'h265', 'av1'],
+            ['legacy_png', 'png', 'ffv1', 'jpeg', 'webp', 'h264', 'h265', 'av1', 'exact'],
             {'default': 'legacy_png'},
         ],
         'transfer_quality': ['INT', {'default': 90, 'min': 1, 'max': 100, 'step': 1}],
@@ -372,6 +372,12 @@ async def main():
     assert set(mapping) == set(BASELINE) | ADDED_NODES
     for node_id in ADDED_NODES:
         assert nodes.NODE_CLASS_MAPPINGS[node_id] is mapping[node_id]
+    assert 'DistributedMediaCollector' not in mapping
+    collector_info = mapping['DistributedCollector'].GET_NODE_INFO_V1()
+    assert collector_info['output'] == ['IMAGE', 'AUDIO'], collector_info
+    assert not any(collector_info['output_is_list']), collector_info
+    assert list(collector_info['input']['optional']) == [
+        'images', 'audio', 'transfer_format', 'transfer_quality']
     sink_info = mapping['DistributedWorkerSink'].GET_NODE_INFO_V1()
     assert sink_info['output_node'] and sink_info['dev_only'], sink_info
     for node_id, cls in mapping.items():

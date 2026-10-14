@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import time
 import uuid
 
@@ -86,6 +87,10 @@ def _resolve_enabled_workers(config, requested_ids=None):
         if worker.get("type") == "serverless":
             from ..utils.serverless_config import validate_serverless_worker
             pool = validate_serverless_worker(worker)
+            if pool.get("media_profile") == "comfy-media-v1":
+                from ..serverless_bridge.contract import identifier
+                # Do not repair malformed media identities by stripping them.
+                identifier(pool["id"])
             for slot in range(pool["jobs_per_run"]):
                 workers.append(dict(pool, pool_id=worker_id, id=f"serverless:{worker_id}:{slot + 1}",
                                     name=f"{pool.get('name', worker_id)} / job {slot + 1}"))
@@ -155,6 +160,32 @@ def _prompt_requests_load_balance(prompt_index):
     return False
 
 
+def _validate_media_workers(workers, prompt_index=None):
+    """Reject unknown serverless media profiles before probing or dispatching.
+
+    A Distributed Collector accepts direct workers, legacy-image-v1 pools and
+    comfy-media-v1 pools in the same run; each pool's profile selects its
+    endpoint contract. Unknown profiles fail rather than guessing a contract.
+    legacy-image-v1 endpoints return 8-bit files, so a Collector set to exact
+    cannot use them.
+    """
+    exact = prompt_index is not None and any(
+        str(prompt_index.inputs_by_node.get(node_id, {}).get("transfer_format", "")).strip().lower() == "exact"
+        for node_id in prompt_index.nodes_for_class("DistributedCollector")
+    )
+    for worker in workers:
+        if worker.get("type") != "serverless":
+            continue
+        profile = worker.get("media_profile", "legacy-image-v1")
+        if profile not in ("legacy-image-v1", "comfy-media-v1"):
+            raise ValueError("Unsupported serverless media_profile")
+        if exact and profile == "legacy-image-v1":
+            raise ValueError(
+                "transfer_format exact requires comfy-media-v1 serverless pools; "
+                "legacy-image-v1 endpoints return 8-bit images"
+            )
+
+
 async def _prepare_worker_payload(
     worker,
     prompt_index,
@@ -170,11 +201,33 @@ async def _prepare_worker_payload(
 ):
     """Prepare one worker prompt payload with bounded concurrency and media-sync timeout."""
     async with worker_prep_semaphore:
+        _validate_media_workers([worker], prompt_index)
         worker_prompt = prompt_index.copy_prompt()
         if worker.get("type") == "serverless":
+            from .orchestration.runpod_client import serialize_request
+            if worker.get("media_profile", "legacy-image-v1") == "comfy-media-v1":
+                from ..serverless_bridge.contract import PROFILE, VERSION
+                from .orchestration.serverless_media_prompt import compile_media_prompt
+                from .orchestration.serverless_typed_inputs import prepare_media_inputs
+                # The typed compiler validates the complete private graph and
+                # prunes it itself, retaining every connected Collector branch.
+                worker_prompt = apply_participant_overrides(
+                    worker_prompt, worker["id"], enabled_ids, job_id_map,
+                    "", delegate_master, prompt_index,
+                )
+                request_id = str(uuid.uuid4())
+                workflow, manifest = compile_media_prompt(worker_prompt, request_id)
+                images, artifacts, refs = await prepare_media_inputs(workflow)
+                media = {
+                    "version": VERSION, "profile": PROFILE, "request_id": request_id,
+                    "artifacts": artifacts, "inputs": refs, "outputs": copy.deepcopy(manifest),
+                }
+                serialize_request(workflow, images, worker["timeout_seconds"], media=media)
+                return worker, {"worker": worker, "workflow": workflow, "manifest": manifest,
+                                "images": images, "media": media}
+
             from .orchestration.serverless_prompt import compile_serverless_prompt
             from .orchestration.serverless_media import prepare_images
-            from .orchestration.runpod_client import serialize_request
             worker_prompt = apply_participant_overrides(
                 prune_prompt_for_worker(worker_prompt), worker["id"], enabled_ids,
                 job_id_map, "", delegate_master, prompt_index,
@@ -270,22 +323,22 @@ async def orchestrate_distributed_execution(
                           for node in prompt_obj.values())
     target_kwargs = {}
     if image_list_mode:
+        # Check the source graph before execution-root pruning can remove an
+        # incompatible mode (or mask it with an unrelated boundary error).
+        if any(isinstance(node, dict) and node.get("class_type") in (
+                "DistributedCollector", "UltimateSDUpscaleDistributed") for node in prompt_obj.values()):
+            raise ValueError(
+                "Distributed Image List v1 cannot be mixed with Distributed Collector or "
+                "Ultimate SD Upscale nodes in one prompt"
+            )
         prompt_obj, outer_targets = prepare_image_list_execution(prompt_obj)
         target_kwargs["partial_execution_targets"] = outer_targets
     prompt_index = PromptIndex(prompt_obj)
     if image_list_mode:
         # Validate before probing or queueing anything so malformed boundaries and
         # old worker releases fail before any upstream image is materialized.
+
         validate_image_list_regions(prompt_obj, explicit_targets=True)
-        other_distributed = (
-            prompt_index.nodes_for_class("DistributedCollector")
-            + prompt_index.nodes_for_class("UltimateSDUpscaleDistributed")
-        )
-        if other_distributed:
-            raise ValueError(
-                "Distributed Image List v1 cannot be mixed with Distributed Collector or "
-                "Ultimate SD Upscale nodes in one prompt"
-            )
         configured_serverless = [
             str(worker.get("id")) for worker in config.get("workers", [])
             if worker.get("enabled", False)
@@ -306,6 +359,13 @@ async def orchestrate_distributed_execution(
             )
     else:
         workers = _resolve_enabled_workers(config, requested_ids)
+        _validate_media_workers(workers, prompt_index)
+        if any(worker.get("media_profile") == "comfy-media-v1" for worker in workers):
+            from ..serverless_bridge.contract import identifier
+            # Validate the source, not PromptIndex's JSON copy (which coerces
+            # integer keys to strings), before probing or dispatching workers.
+            for node_id in prompt_obj:
+                identifier(node_id)
     load_balance_requested = _prompt_requests_load_balance(prompt_index)
     trace_debug(
         execution_trace_id,
@@ -488,6 +548,15 @@ async def orchestrate_distributed_execution(
     manager = None
     if serverless_jobs:
         from .orchestration.serverless_runtime import get_manager
+        # Repeat the manager's whole-batch identity/profile preflight *before*
+        # any direct dispatch, master queueing or collector queue allocation.
+        # Pure legacy jobs are a no-op in that validator; keep their path free
+        # of typed imports (and compatible with existing legacy media adapters).
+        for prepared in serverless_jobs:
+            if (prepared["worker"].get("media_profile", "legacy-image-v1") != "legacy-image-v1"
+                    or prepared.get("media") is not None):
+                from .orchestration.serverless_typed_results import validate_prepared_job
+                validate_prepared_job(prepared)
         manager = get_manager()
         manager.ensure_capacity(len(serverless_jobs))
 
@@ -534,8 +603,10 @@ async def orchestrate_distributed_execution(
             await manager.cancel(execution_id=execution_trace_id)
             async with prompt_server.distributed_jobs_lock:
                 for prepared in serverless_jobs:
-                    for binding in prepared["manifest"]:
-                        q = prompt_server.distributed_pending_jobs.get(binding["job_id"])
+                    # Typed manifests have several sockets per collector, but
+                    # each participant gets only one terminal collector event.
+                    for job_id in {binding["job_id"] for binding in prepared["manifest"]}:
+                        q = prompt_server.distributed_pending_jobs.get(job_id)
                         if q is not None:
                             q.put_nowait({"worker_id": prepared["worker"]["id"], "is_last": True,
                                           "serverless_error": "Serverless job setup failed; no automatic retry was attempted"})

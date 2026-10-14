@@ -7,7 +7,7 @@ import { createWorkerSettingsForm } from "../ui/settingsForm.js";
 import { DistributedUI } from "../ui.js";
 import { checkWorkerStatus, formatServerlessStatus, getWorkerUrl, launchWorker, stopWorker, viewWorkerLog } from "../workerLifecycle.js";
 import { handleClearMemory, handleInterruptWorkers } from "../workerUtils.js";
-import { isRemoteWorker, normalizeRunpodEndpointId, saveWorkerSettings, testServerlessWorker } from "../workerSettings.js";
+import { cancelWorkerSettings, isRemoteWorker, normalizeRunpodEndpointId, saveWorkerSettings, testServerlessWorker } from "../workerSettings.js";
 import { performPreflightCheck } from "../executionUtils.js";
 
 function createDocumentMock() {
@@ -44,6 +44,7 @@ function createDocumentMock() {
         document: {
             createElement: makeElement,
             getElementById: (id) => elements.get(id) || null,
+            querySelector: () => null,
         },
     };
 }
@@ -125,17 +126,92 @@ describe("Runpod serverless worker panel", () => {
             expect(elements.get(`${field}-group-saved`).style.display).toBe("none");
         }
         expect(elements.get("runpod-text-saved").style.display).toBe("none");
-        for (const field of ["endpoint-id", "api-key", "clear-api-key", "jobs-per-run", "timeout-seconds", "serverless-test"]) {
+        for (const field of ["endpoint-id", "media-profile", "api-key", "clear-api-key", "jobs-per-run", "timeout-seconds", "serverless-test"]) {
             expect(elements.get(`${field}-group-saved`).style.display).toBe("flex");
         }
         // The separate concurrency setting was removed; a legacy value is ignored.
         expect(elements.has("concurrency-saved")).toBe(false);
         expect(elements.has("concurrency-group-saved")).toBe(false);
         expect(elements.get("endpoint-id-saved").value).toBe("ep_123");
+        expect(elements.get("media-profile-saved").value).toBe("legacy-image-v1");
         expect(elements.get("jobs-per-run-saved").value).toBe("2");
         expect(elements.get("timeout-seconds-saved").value).toBe("900");
         expect(elements.get("api-key-saved").value).toBe("");
         expect(elements.get("api-key-saved").placeholder).toMatch(/leave blank/i);
+    });
+
+    it("renders explicit endpoint profiles with installation and no-auto-detection guidance", () => {
+        createWorkerSettingsForm(createFormUi(), {}, {
+            id: "profile", name: "Runpod", type: "serverless", media_profile: "comfy-media-v1",
+        });
+        const select = elements.get("media-profile-profile");
+        const group = elements.get("media-profile-group-profile");
+        expect(group.children[0].textContent).toBe("Endpoint media profile");
+        expect(group.children[0].htmlFor).toBe(select.id);
+        expect(select.children.map((option) => [option.value, option.textContent])).toEqual([
+            ["legacy-image-v1", "Legacy images (existing handler)"],
+            ["comfy-media-v1", "Typed media v1 (requires endpoint bridge)"],
+        ]);
+        expect(select.value).toBe("comfy-media-v1");
+        expect(select.title).toMatch(/after installing.*endpoint bridge/i);
+        expect(select.title).toMatch(/health checks do not auto-detect/i);
+        expect(select.title).toMatch(/schema.*formats and limits are fixed/i);
+        const type = elements.get("worker-type-profile");
+        type.value = "remote";
+        type.dispatchEvent();
+        expect(group.style.display).toBe("none");
+        type.value = "serverless";
+        type.dispatchEvent();
+        expect(group.style.display).toBe("flex");
+        expect(select.value).toBe("comfy-media-v1");
+    });
+
+    it.each(["legacy-image-v1", "comfy-media-v1"])("round-trips an explicit %s selection through the save payload and reload", async (profile) => {
+        const worker = { id: "roundtrip", name: "Runpod", type: "serverless", endpoint_id: "ep_123", enabled: false };
+        let persisted;
+        const extension = makeSaveExtension(worker, vi.fn(async (id, payload) => {
+            persisted = JSON.parse(JSON.stringify({ id, ...payload }));
+            return {};
+        }));
+        const ui = createFormUi();
+        const form = createWorkerSettingsForm(ui, extension, worker);
+        elements.get("media-profile-roundtrip").value = profile;
+        const saveButton = form.children.at(-1).children.find((button) => button.textContent === "Save");
+        await saveButton.onclick();
+        expect(persisted.media_profile).toBe(profile);
+        expect(worker.media_profile).toBe(profile);
+        expect(persisted).not.toHaveProperty("api_key");
+        expect(persisted).not.toHaveProperty("concurrency");
+        createWorkerSettingsForm(ui, extension, persisted);
+        expect(elements.get("media-profile-roundtrip").value).toBe(profile);
+    });
+
+    it.each([undefined, "comfy-media-v1"])("restores the saved profile on cancel (%s)", (profile) => {
+        const worker = { id: "cancel", name: "Runpod", type: "serverless", media_profile: profile };
+        const extension = makeSaveExtension(worker);
+        createWorkerSettingsForm(createFormUi(), extension, worker);
+        elements.get("media-profile-cancel").value = profile ? "legacy-image-v1" : "comfy-media-v1";
+        cancelWorkerSettings(extension, worker.id);
+        expect(elements.get("media-profile-cancel").value).toBe(profile ?? "legacy-image-v1");
+        expect(extension.api.updateWorker).not.toHaveBeenCalled();
+    });
+
+    it("keeps the saved profile after a busy-guard error and rejects invalid selections", async () => {
+        const worker = { id: "busy", name: "Runpod", type: "serverless", endpoint_id: "ep_123", media_profile: "comfy-media-v1" };
+        const extension = makeSaveExtension(worker, vi.fn().mockRejectedValue(new Error("Finish or reconcile unresolved serverless jobs")));
+        createWorkerSettingsForm(createFormUi(), extension, worker);
+        elements.get("media-profile-busy").value = "legacy-image-v1";
+        await saveWorkerSettings(extension, worker.id);
+        expect(worker.media_profile).toBe("comfy-media-v1");
+        expect(extension.app.extensionManager.toast.add).toHaveBeenLastCalledWith(
+            expect.objectContaining({ summary: "Save Failed", detail: expect.stringMatching(/unresolved/) }),
+        );
+        elements.get("media-profile-busy").value = "auto";
+        await saveWorkerSettings(extension, worker.id);
+        expect(extension.api.updateWorker).toHaveBeenCalledTimes(1);
+        expect(extension.app.extensionManager.toast.add).toHaveBeenLastCalledWith(
+            expect.objectContaining({ summary: "Validation Error", detail: expect.stringMatching(/media profile/) }),
+        );
     });
 
     it("preserves a saved cloud port on first render and applies defaults only on type changes", () => {
@@ -218,6 +294,7 @@ describe("Runpod serverless worker panel", () => {
         elements.set("name-w2", { value: "Runpod worker" });
         elements.set("worker-type-w2", { value: "serverless" });
         elements.set("endpoint-id-w2", { value: "ep_123" });
+        elements.set("media-profile-w2", { value: "legacy-image-v1" });
         elements.set("api-key-w2", { value: "secret-token" });
         elements.set("clear-api-key-w2", { checked: false });
         elements.set("jobs-per-run-w2", { value: "4" });
@@ -227,6 +304,7 @@ describe("Runpod serverless worker panel", () => {
 
         expect(extension.api.updateWorker).toHaveBeenCalledWith("w2", {
             name: "Runpod worker", type: "serverless", provider: "runpod", endpoint_id: "ep_123",
+            media_profile: "legacy-image-v1",
             api_key: "secret-token", jobs_per_run: 4, timeout_seconds: 2400, enabled: false,
         });
         expect(worker).toMatchObject({ type: "serverless", provider: "runpod", enabled: false, api_key_configured: true });
@@ -244,6 +322,7 @@ describe("Runpod serverless worker panel", () => {
         elements.set("name-legacy", { value: "Runpod" });
         elements.set("worker-type-legacy", { value: "serverless" });
         elements.set("endpoint-id-legacy", { value: "ep_123" });
+        elements.set("media-profile-legacy", { value: "legacy-image-v1" });
         elements.set("api-key-legacy", { value: "" });
         elements.set("clear-api-key-legacy", { checked: false });
         elements.set("jobs-per-run-legacy", { value: "2" });
@@ -278,6 +357,7 @@ describe("Runpod serverless worker panel", () => {
         elements.set("name-url", { value: "Runpod" });
         elements.set("worker-type-url", { value: "serverless" });
         elements.set("endpoint-id-url", { value: "https://api.runpod.ai/v2/abc123xyz/runsync" });
+        elements.set("media-profile-url", { value: "legacy-image-v1" });
         elements.set("api-key-url", { value: "" });
         elements.set("clear-api-key-url", { checked: false });
         elements.set("jobs-per-run-url", { value: "1" });
@@ -294,7 +374,7 @@ describe("Runpod serverless worker panel", () => {
     });
 
     it("asks before a type change deletes the saved API key, and cancels cleanly", async () => {
-        const worker = { id: "conv", name: "Runpod", type: "serverless", provider: "runpod", enabled: false, api_key_configured: true };
+        const worker = { id: "conv", name: "Runpod", type: "serverless", provider: "runpod", enabled: false, api_key_configured: true, media_profile: "comfy-media-v1" };
         const extension = makeSaveExtension(worker);
         elements.set("name-conv", { value: "Runpod" });
         elements.set("worker-type-conv", { value: "remote" });
@@ -307,11 +387,13 @@ describe("Runpod serverless worker panel", () => {
             expect(confirmSpy).toHaveBeenCalledWith(expect.stringMatching(/saved Runpod API key will be deleted/));
             expect(extension.api.updateWorker).not.toHaveBeenCalled();
             expect(worker.type).toBe("serverless");
+            expect(worker.media_profile).toBe("comfy-media-v1");
 
             confirmSpy.mockReturnValue(true);
             await saveWorkerSettings(extension, "conv");
             expect(extension.api.updateWorker).toHaveBeenCalledTimes(1);
             expect(extension.api.updateWorker.mock.calls[0][1].type).toBe("remote");
+            expect(worker).not.toHaveProperty("media_profile");
         } finally {
             delete globalThis.confirm;
         }
@@ -341,6 +423,7 @@ describe("Runpod serverless worker panel", () => {
         elements.set("name-w-blank", { value: "Runpod" });
         elements.set("worker-type-w-blank", { value: "serverless" });
         elements.set("endpoint-id-w-blank", { value: "ep_123" });
+        elements.set("media-profile-w-blank", { value: "legacy-image-v1" });
         elements.set("api-key-w-blank", { value: "" });
         elements.set("clear-api-key-w-blank", { checked: false });
         elements.set("jobs-per-run-w-blank", { value: "1" });
@@ -361,6 +444,7 @@ describe("Runpod serverless worker panel", () => {
         elements.set("name-w3", { value: "Runpod" });
         elements.set("worker-type-w3", { value: "serverless" });
         elements.set("endpoint-id-w3", { value: "ep_123" });
+        elements.set("media-profile-w3", { value: "legacy-image-v1" });
         elements.set("api-key-w3", { value: "" });
         elements.set("clear-api-key-w3", { checked: true });
         elements.set("jobs-per-run-w3", { value: "1" });
@@ -370,6 +454,7 @@ describe("Runpod serverless worker panel", () => {
 
         expect(extension.api.updateWorker).toHaveBeenCalledWith("w3", {
             name: "Runpod", type: "serverless", provider: "runpod", endpoint_id: "ep_123",
+            media_profile: "legacy-image-v1",
             clear_api_key: true, jobs_per_run: 1, timeout_seconds: 1800, enabled: true,
         });
         expect(worker.api_key_configured).toBe(false);
@@ -527,9 +612,6 @@ describe("Runpod serverless worker panel", () => {
     });
 
     it("tests only the saved Runpod endpoint and reports the backend message", async () => {
-        const button = document.createElement("button");
-        button.id = "test-serverless-w6";
-        button.textContent = "Test Saved Endpoint";
         const extension = {
             api: {
                 testServerlessWorker: vi.fn().mockResolvedValue({ ok: true, message: "Endpoint reachable" }),
@@ -537,9 +619,15 @@ describe("Runpod serverless worker panel", () => {
             },
             app: { extensionManager: { toast: { add: vi.fn() } } },
         };
+        const worker = { id: "w6", name: "Runpod", type: "serverless" };
+        extension.config = { workers: [worker] };
+        createWorkerSettingsForm(createFormUi(), extension, worker);
+        const button = elements.get("test-serverless-w6");
 
         await expect(testServerlessWorker(extension, "w6")).resolves.toEqual({ ok: true, message: "Endpoint reachable" });
 
+        expect(worker).not.toHaveProperty("media_profile");
+        expect(elements.get("media-profile-w6").value).toBe("legacy-image-v1");
         expect(extension.api.testServerlessWorker).toHaveBeenCalledWith("w6");
         expect(extension.api.queueDistributed).not.toHaveBeenCalled();
         expect(extension.app.extensionManager.toast.add).toHaveBeenCalledWith(expect.objectContaining({
