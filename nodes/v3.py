@@ -10,7 +10,7 @@ from . import utilities as _utilities
 from .collector import DistributedCollectorNode as _CollectorRuntime
 from ..utils import transfer_codec as _transfer_codec
 from .distributed_upscale import UltimateSDUpscaleDistributed as _UpscaleRuntime
-from .image_list import DistributedImageListEnd, DistributedImageListStart
+from .image_list import DistributedImageListEnd, DistributedImageListStart, DistributedImageListGetValue
 
 
 class DistributedSeed(io.ComfyNode):
@@ -212,4 +212,4 @@ class DistributedWorkerSink(io.ComfyNode):
 
 NODES = [DistributedCollector, DistributedSeed, DistributedModelName, DistributedValue,
          ImageBatchDivider, AudioBatchDivider, DistributedEmptyImage, UltimateSDUpscaleDistributed,
-         DistributedWorkerSink, DistributedImageListStart, DistributedImageListEnd]
+         DistributedWorkerSink, DistributedImageListStart, DistributedImageListEnd, DistributedImageListGetValue]

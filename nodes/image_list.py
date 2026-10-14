@@ -10,6 +10,7 @@ from ..image_list.runtime import (
     MAX_VALUE_SLOTS,
     VALUE_NAMES,
     VALUES_INPUT,
+    end_override_names,
     create_master_job,
     normalize_image_list_inputs,
     normalize_worker_result,
@@ -149,17 +150,23 @@ class DistributedImageListEnd(io.ComfyNode):
             node_id="DistributedImageListEnd",
             display_name="Distributed Image List End",
             category="image/distributed",
-            description="Closes a paired image-list region and returns ordered image, mask, and text lists.",
+            description=("Closes a paired image-list region and returns ordered image, mask, text and values lists. "
+                         "Start values are retained; connected value_N inputs replace or add that key per item."),
             inputs=[
                 io.Image.Input("images", lazy=True),
                 io.Mask.Input("masks", optional=True, lazy=True),
                 io.String.Input("texts", optional=True, lazy=True, force_input=True),
                 io.Custom("DISTRIBUTED_IMAGE_LIST_CONTEXT").Input("context"),
+                *[io.MultiType.Input(name, types=_VALUE_TYPES, optional=True, lazy=True,
+                                     tooltip="Replace or add this value for each item; exactly one value per item.")
+                  for name in VALUE_NAMES],
             ],
             outputs=[
                 io.Image.Output(display_name="image_list", is_output_list=True),
                 io.Mask.Output(display_name="masks", is_output_list=True),
                 io.String.Output(display_name="texts", is_output_list=True),
+                io.Custom("DISTRIBUTED_IMAGE_LIST_VALUES").Output(
+                    id="values", display_name="values", is_output_list=True),
             ],
             is_input_list=True,
             is_output_node=True,
@@ -181,7 +188,8 @@ class DistributedImageListEnd(io.ComfyNode):
                                and node.get("class_type") == "DistributedImageListEnd"
                                and node.get("inputs", {}).get("worker_result_token") == worker_result_token), {})
             required = []
-            for name, value in (("images", images), ("masks", masks), ("texts", texts)):
+            for name, value in (("images", images), ("masks", masks), ("texts", texts),
+                                *((name, kwargs.get(name)) for name in end_override_names(end_inputs))):
                 connected = name == "images" or name in end_inputs
                 missing = value is None or (isinstance(value, (list, tuple)) and all(v is None for v in value))
                 if connected and missing:
@@ -195,7 +203,7 @@ class DistributedImageListEnd(io.ComfyNode):
     @classmethod
     def execute(cls, images=None, masks=None, texts=None, context=None,
                 worker_result_token="", worker_item_index=-1, master_callback_url="",
-                image_list_local_execution=False):
+                image_list_local_execution=False, **values):
         worker_result_token = unwrap_single(worker_result_token)
         master_callback_url = unwrap_single(master_callback_url)
         if worker_result_token:
@@ -203,7 +211,16 @@ class DistributedImageListEnd(io.ComfyNode):
                               if isinstance(item, str) and item]
             if not context_values or len(set(context_values)) != 1:
                 raise RuntimeError("Worker Image List End is missing its paired context")
-            result = normalize_worker_result(images, masks, texts)
+            prompt = getattr(cls.hidden, "prompt", {}) or {}
+            end_inputs = next((node.get("inputs", {}) for node in prompt.values()
+                               if isinstance(node, dict) and node.get("class_type") == "DistributedImageListEnd"
+                               and node.get("inputs", {}).get("worker_result_token") == worker_result_token), {})
+            expected = end_override_names(end_inputs)
+            # Missing connected lazy values must fail instead of becoming an
+            # implicit fallback to the original Start value.
+            supplied = {name: values.get(name) for name in expected}
+            supplied.update(values)
+            result = normalize_worker_result(images, masks, texts, supplied)
             if unwrap_single(image_list_local_execution):
                 from ..image_list.runtime import set_master_result
                 set_master_result(context_values[0], int(unwrap_single(worker_item_index)),
@@ -214,7 +231,8 @@ class DistributedImageListEnd(io.ComfyNode):
                     submit_worker_result(str(master_callback_url), str(worker_result_token),
                                          context_values[0], int(unwrap_single(worker_item_index)), payload), timeout=60,
                 )
-            return io.NodeOutput([result["image"]], [result.get("mask")], [result.get("text")])
+            return io.NodeOutput([result["image"]], [result.get("mask")], [result.get("text")],
+                                 [result.get("values", {})])
 
         context_values = [item for item in (context if isinstance(context, (list, tuple)) else [context])
                           if isinstance(item, str) and item]
@@ -229,14 +247,40 @@ class DistributedImageListEnd(io.ComfyNode):
             # Add them to its existing tracker; never start/end another tracker
             # that could unpin a model still needed by the parent.
             model_callback = getattr(execution_list, "output_link_callback", None)
-            result_lists = run_async_in_server_loop(run_image_list_job(context_id, model_callback=model_callback))
+            result_lists = run_async_in_server_loop(run_image_list_job(
+                context_id, model_callback=model_callback, include_values=True))
         except ImageListCancelledError:
             import comfy.model_management
             raise comfy.model_management.InterruptProcessingException()
-        images_out, masks_out, texts_out = result_lists
-        if len(images_out) != len(masks_out) or len(images_out) != len(texts_out):
-            raise RuntimeError("Image-list collector received mismatched image, mask, or text result counts")
-        return io.NodeOutput(images_out, masks_out, texts_out)
+        images_out, masks_out, texts_out, values_out = result_lists
+        if len({len(output) for output in result_lists}) != 1:
+            raise RuntimeError("Image-list collector received mismatched image, mask, text or values result counts")
+        return io.NodeOutput(images_out, masks_out, texts_out, values_out)
+
+
+class DistributedImageListGetValue(io.ComfyNode):
+    """Ordinary scalar execution lets core map over End's ordered values list."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="DistributedImageListGetValue",
+            display_name="Distributed Image List Get Value",
+            category="image/distributed",
+            inputs=[io.Custom("DISTRIBUTED_IMAGE_LIST_VALUES").Input("values"),
+                    io.Combo.Input("value_name", options=list(VALUE_NAMES), default="value_1")],
+            outputs=[io.AnyType.Output(id="value", display_name="value")],
+        )
+
+    @classmethod
+    def execute(cls, values, value_name="value_1"):
+        if value_name not in VALUE_NAMES:
+            raise ValueError(f"Unknown image-list value slot {value_name!r}")
+        if not isinstance(values, dict):
+            raise TypeError("Image List Get Value expects one values mapping from Image List End")
+        if value_name not in values:
+            raise ValueError(f"Image List Get Value: {value_name} is absent from this item's values")
+        return io.NodeOutput(values[value_name])
 
 
 async def submit_worker_result(callback_url, item_token, context_id, item_index, result):

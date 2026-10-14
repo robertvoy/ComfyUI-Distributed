@@ -343,7 +343,12 @@ async def orchestrate_distributed_execution(
             raise RuntimeError(
                 "No selected direct worker is reachable for Distributed Image List in orchestrator-only mode"
             )
-        idle_ids = (await preflight_image_list_workers(active_workers, require_idle=delegate_master)
+        from ..image_list.runtime import END_CLASS, end_override_names
+        requires_values = any(end_override_names(node.get("inputs", {}))
+                              for node in prompt_obj.values() if node.get("class_type") == END_CLASS)
+        value_preflight = {"require_value_results": True} if requires_values else {}
+        idle_ids = (await preflight_image_list_workers(active_workers, require_idle=delegate_master,
+                                                       **value_preflight)
                     if active_workers else {})
         active_workers = [worker for worker in active_workers if worker["id"] in idle_ids]
         if not active_workers and delegate_master:

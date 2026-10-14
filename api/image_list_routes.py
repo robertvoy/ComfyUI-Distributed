@@ -36,8 +36,9 @@ async def image_list_capabilities_endpoint(_request):
     return web.json_response({
         "supported": True,
         "execution_targets": True,
+        "value_results": True,
         "protocol_version": PROTOCOL_VERSION,
-        "node_ids": ["DistributedImageListStart", "DistributedImageListEnd"],
+        "node_ids": ["DistributedImageListStart", "DistributedImageListEnd", "DistributedImageListGetValue"],
         "transport": "typed-float-tensor-json-v1",
     })
 

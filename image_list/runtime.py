@@ -29,6 +29,7 @@ VALUE_OUT_BASE = 4
 MAX_VALUE_SLOTS = 10
 VALUE_NAMES = tuple(f"value_{i}" for i in range(1, MAX_VALUE_SLOTS + 1))
 VALUES_INPUT = "values"
+END_RESULT_INPUTS = ("images", "masks", "texts") + VALUE_NAMES
 MAX_PAYLOAD_BYTES = 50 * 1024 * 1024
 MAX_REQUEST_BYTES = MAX_PAYLOAD_BYTES * 2 + 1024 * 1024
 MAX_ITEMS = 4096
@@ -177,6 +178,50 @@ def _normalize_values(values: Any, count: int) -> dict[str, list[Any]]:
             value_kind(item, name)
         aligned[name] = _align(items, count, name)
     return aligned
+
+
+def end_override_names(inputs: dict[str, Any]) -> tuple[str, ...]:
+    """Fixed keys stay stable even when an intermediate socket disconnects."""
+    for name in inputs:
+        if (name.startswith("value_") or name.startswith("values.")) and name not in VALUE_NAMES:
+            raise ValueError(f"Unknown End value slot {name!r}")
+    return tuple(name for name in VALUE_NAMES if name in inputs)
+
+
+def _validate_result_values(values: Any) -> dict[str, Any]:
+    """Validate flat override values; tensors are values, never frame lists."""
+    if not isinstance(values, dict):
+        raise ValueError("End result values must be a mapping of value_N slots")
+    for name, value in values.items():
+        if name not in VALUE_NAMES:
+            raise ValueError(f"Unknown End value slot {name!r}")
+        kind = value_kind(value, name)
+        if kind == "TENSOR":
+            _tensor_dtype_name(value)
+            if not _torch().isfinite(value).all().item():
+                raise ValueError(f"End {name} tensor values must be finite")
+    return values
+
+
+def normalize_value_overrides(values: Any) -> dict[str, Any]:
+    if not isinstance(values, dict):
+        raise ValueError("End overrides must be a mapping of value_N slots")
+    normalized = {}
+    for name, raw in values.items():
+        items = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+        if len(items) != 1:
+            raise ValueError(f"Worker End override {name} expects exactly one value, received {len(items)}")
+        normalized[name] = items[0]
+    return _validate_result_values(normalized)
+
+
+def _checked_overrides(result: dict[str, Any], expected: tuple[str, ...]) -> dict[str, Any]:
+    values = _validate_result_values(result.get("values", {}))
+    missing, extra = set(expected) - values.keys(), values.keys() - set(expected)
+    if missing or extra:
+        raise ValueError(f"End result overrides do not match connected slots: "
+                         f"missing {sorted(missing)}, unexpected {sorted(extra)}")
+    return values
 
 
 def normalize_image_list_inputs(images: Any, mask: Any = None, values: Any = None) -> list[dict[str, Any]]:
@@ -544,10 +589,11 @@ def validate_image_list_regions(prompt: dict[str, Any], *, explicit_targets: boo
         if "images" not in prompt[end_id].get("inputs", {}):
             raise ValueError(f"End node {end_id}.images must be connected to the per-item result branch")
         end_inputs = prompt[end_id].get("inputs", {})
-        for name in ("images", "masks", "texts"):
+        end_override_names(end_inputs)
+        for name in END_RESULT_INPUTS:
             if name in end_inputs:
                 _direct_link(end_inputs[name], prompt, end_id, name)
-        region_nodes = _ancestors_for_inputs(prompt, end_id, start_id, ("images", "masks", "texts"))
+        region_nodes = _ancestors_for_inputs(prompt, end_id, start_id, END_RESULT_INPUTS)
         if start_id not in region_nodes:
             raise ValueError(f"Start node {start_id} is not an ancestor of End node {end_id}")
         forbidden = {n for n in region_nodes if n != start_id and n != end_id and
@@ -713,6 +759,7 @@ def set_master_result(context_id: str, item_index: int, token: str, result: dict
             raise ValueError("Image-list result token does not match an assigned item")
         if item_index in state.received_indexes:
             raise ValueError(f"Duplicate image-list result for item {item_index}")
+        _checked_overrides(result, end_override_names(state.original_prompt[state.end_id].get("inputs", {})))
         state.received_indexes.add(item_index)
         state.results[item_index] = result
         event = state.event
@@ -744,10 +791,24 @@ def decode_result(result: Any) -> dict[str, Any]:
     if mask is not None and (mask.ndim != 3 or mask.shape[0] != 1):
         raise ValueError("result.mask must contain exactly one MASK frame")
     text = decode_value(result.get("text"), "STRING")
-    return {"image": image, "mask": mask, "text": text}
+    decoded = {"image": image, "mask": mask, "text": text}
+    if "values" in result:
+        raw_values = result["values"]
+        if not isinstance(raw_values, dict):
+            raise ValueError("result.values must be an object")
+        values = {}
+        for name, encoded in raw_values.items():
+            if name not in VALUE_NAMES:
+                raise ValueError(f"result.values has unknown slot {name!r}")
+            if not isinstance(encoded, dict) or encoded.get("type") not in _VALUE_KINDS:
+                raise ValueError(f"result.values.{name} has an unsupported type")
+            values[name] = decode_value(encoded, encoded["type"])
+        decoded["values"] = _validate_result_values(values)
+    return decoded
 
 
-def normalize_worker_result(images: Any, masks: Any = None, texts: Any = None) -> dict[str, Any]:
+def normalize_worker_result(images: Any, masks: Any = None, texts: Any = None,
+                            values: Any = None) -> dict[str, Any]:
     def one(value, name, kind):
         if value is None:
             return None
@@ -770,17 +831,29 @@ def normalize_worker_result(images: Any, masks: Any = None, texts: Any = None) -
     text = one(texts, "texts", "STRING")
     if text is not None and not isinstance(text, str):
         raise TypeError("Worker End text result must be a string")
-    return {"image": image, "mask": mask, "text": text}
+    result = {"image": image, "mask": mask, "text": text}
+    if values is not None:
+        overrides = normalize_value_overrides(values)
+        if overrides:
+            result["values"] = overrides
+    return result
 
 
 def encode_result(result: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_worker_result(result.get("image"), result.get("mask"), result.get("text"))
-    return {"image": encode_value(normalized["image"], "IMAGE"),
-            "mask": encode_value(normalized["mask"], "MASK"),
-            "text": encode_value(normalized["text"], "STRING")}
+    encoded = {"image": encode_value(normalized["image"], "IMAGE"),
+               "mask": encode_value(normalized["mask"], "MASK"),
+               "text": encode_value(normalized["text"], "STRING")}
+    if "values" in result:
+        values = _validate_result_values(result["values"])
+        if values:
+            encoded["values"] = {name: encode_value(value, value_kind(value, name))
+                                 for name, value in values.items()}
+    return encoded
 
 
-def _collect_output_lists(results: list[dict[str, Any]]) -> tuple[list[Any], list[Any], list[Any]]:
+def _collect_output_lists(results: list[dict[str, Any]], *, state: ImageListJob | None = None,
+                          include_values: bool = False) -> tuple[list[Any], ...]:
     if not results:
         raise RuntimeError("Image-list execution returned no results")
     images, masks, texts = [], [], []
@@ -790,10 +863,20 @@ def _collect_output_lists(results: list[dict[str, Any]]) -> tuple[list[Any], lis
         images.append(result["image"])
         masks.append(result.get("mask"))
         texts.append(result.get("text"))
-    return images, masks, texts
+    if not include_values:
+        return images, masks, texts
+    if state is None or len(results) != len(state.items):
+        raise RuntimeError("Image-list values require exactly one result per source item")
+    expected = end_override_names(state.original_prompt[state.end_id].get("inputs", {}))
+    # Reconstruct unchanged values from the master source, not worker transport.
+    # Do this before the context is removed, and only after all items succeeded.
+    values = [{**item.get("values", {}), **_checked_overrides(result, expected)}
+              for item, result in zip(state.items, results)]
+    return images, masks, texts, values
 
 
-async def run_image_list_job(context_id: str, *, model_callback=None) -> tuple[list[Any], list[Any], list[Any]]:
+async def run_image_list_job(context_id: str, *, model_callback=None,
+                             include_values: bool = False) -> tuple[list[Any], ...]:
     """Schedule a shared queue across the optional master and direct workers."""
     state = get_master_job(context_id)
     if state is None:
@@ -807,7 +890,7 @@ async def run_image_list_job(context_id: str, *, model_callback=None) -> tuple[l
         timer = asyncio.timeout(deadline if deadline > 0 else None)
         try:
             async with timer:
-                return await _run_image_list_job(state)
+                return await _run_image_list_job(state, include_values=include_values)
         except TimeoutError:
             if timer.expired():
                 raise TimeoutError(f"Image-list total deadline exceeded ({deadline:g}s); cleanup attempted") from None
@@ -820,7 +903,7 @@ async def run_image_list_job(context_id: str, *, model_callback=None) -> tuple[l
         remove_master_job(context_id)
 
 
-async def _run_image_list_job(state: ImageListJob):
+async def _run_image_list_job(state: ImageListJob, *, include_values: bool = False):
     context_id = state.context_id
     state.event = asyncio.Event()
     state.event_loop = asyncio.get_running_loop()
@@ -838,7 +921,10 @@ async def _run_image_list_job(state: ImageListJob):
     if not workers and not state.master_participates:
         raise RuntimeError("Distributed Image List requires enabled direct workers; serverless pools are unsupported")
     # Recheck worker capability and idle state immediately before the first item.
-    worker_statuses = await preflight_image_list_workers(workers, require_idle=not state.master_participates) if workers else {}
+    override_names = end_override_names(state.original_prompt[state.end_id].get("inputs", {}))
+    value_preflight = {"require_value_results": True} if override_names else {}
+    worker_statuses = (await preflight_image_list_workers(
+        workers, require_idle=not state.master_participates, **value_preflight) if workers else {})
     workers = [worker for worker in workers if worker["id"] in worker_statuses]
     if not workers and not state.master_participates:
         raise RuntimeError("No free, reachable, feature-compatible direct workers are available; master execution is disabled")
@@ -881,6 +967,13 @@ async def _run_image_list_job(state: ImageListJob):
         if worker is None:
             raise RuntimeError(f"Worker {worker_id} was removed before dispatch")
         assert session is not None
+        if override_names:
+            # A worker can restart/downgrade between items. Check before upload,
+            # not merely once at queue preparation or at the start of the run.
+            ready = await preflight_image_list_workers([worker], require_idle=False,
+                                                       require_value_results=True)
+            if worker_id not in ready:
+                raise RuntimeError(f"Image-list worker {worker_id} is unavailable for value overrides")
         token = create_worker_task_token()
         register_assignment(context_id, index, worker_id, token)
         item_payload = {"context_id": context_id, "item": encode_item(state.items[index])}
@@ -1041,7 +1134,7 @@ async def _run_image_list_job(state: ImageListJob):
         slots = ([master_slot] if local_executor is not None else []) + [worker["id"] for worker in workers]
         results = await dynamic_schedule(len(state.items), slots,
                                          dispatch, wait_next, cleanup, interrupted)
-        return _collect_output_lists(results)
+        return _collect_output_lists(results, state=state, include_values=include_values)
     finally:
         if local_executor is not None:
             # No timeout here: Python cannot safely kill a synchronous node.

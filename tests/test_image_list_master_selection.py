@@ -62,6 +62,16 @@ class MasterSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.q.dispatch_worker_prompt.assert_not_awaited()
         self.assertEqual(self.ps.distributed_pending_jobs, {})
 
+    async def test_end_overrides_require_value_capability_before_master_queue(self):
+        self.prompt['3']['inputs']['value_10'] = ['2', 2]
+        await self.queue()
+        self.assertIs(self.preflight.call_args.kwargs['require_value_results'], True)
+        self.q.queue_prompt_payload.reset_mock()
+        self.preflight.side_effect = RuntimeError('value_results unsupported')
+        with self.assertRaisesRegex(RuntimeError, 'value_results'):
+            await self.queue()
+        self.q.queue_prompt_payload.assert_not_awaited()
+
     async def test_orchestrator_setting_excludes_master_processing(self):
         self.config["settings"]["master_delegate_only"] = True
         await self.queue()

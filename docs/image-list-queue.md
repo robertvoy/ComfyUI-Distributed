@@ -52,7 +52,31 @@ Start outputs, in order: `image`, `mask`, `item_index` (zero-based), `context`, 
 
 Values that cannot be transported exactly (models, latents, conditioning and other objects) are rejected. Load models inside the region from a loader connected directly to the processing nodes, as described below.
 
-End accepts `images`, optional `masks` / `texts`, and `context`. It returns `image_list`, `masks`, and `texts` in original item order. Each job must produce exactly one image, at most one mask, and at most one text value. Unconnected optional outputs contain `None` entries.
+End accepts `images`, optional `masks` / `texts`, and `context`. Its first three outputs remain `image_list`, `masks`, and `texts` in original item order. Each job must produce exactly one image, at most one mask, and at most one text value. Unconnected optional mask/text outputs contain `None` entries.
+
+### Keep values through End without extra wires
+
+Start's existing **context** connection now also lets End recover each item's original `value_1` … `value_10`. You do not need to wire those values individually into End. Context remains a lightweight execution reference, not a general-purpose data pipe.
+
+End appends a **values** output (`DISTRIBUTED_IMAGE_LIST_VALUES`): one value bundle per image, in the same source order. Connect it to **Distributed Image List Get Value**, then choose `value_name` to extract the field you need. The getter preserves its type and ComfyUI maps it across the bundles, producing a list aligned with End's images. Missing fields fail clearly instead of producing empty placeholders.
+
+For example, to preserve filenames:
+
+```text
+filenames → Start.value_1
+                 Start.context ─────────────→ End.context
+                 Start.image → processing → End.images
+                                               ├─ image_list → Save.images
+                                               └─ values → Get Value [value_1] → Save.filename_prefix
+```
+
+**New or changed per-item values:** connect the calculated result to End's optional `value_N` input. It replaces the original field with that number, or adds it if Start did not supply it. Every connected override must produce exactly one supported value for each item. A tensor batch remains one value, just as it does at Start. Image, mask, string, integer, float and boolean values are supported; arbitrary objects/models/latents and non-finite numbers are not.
+
+End shows override inputs progressively. Use **Add value override** to expose a later slot without connecting the earlier ones. Disconnecting an override never renumbers the other End fields: `value_3` always means `value_3`. Unlike Start's native Autogrow inputs, End overrides must keep these identities stable. Existing image/mask/text/context sockets and output indices are unchanged. If the frontend extension is unavailable, Python still declares all optional override inputs and the values output.
+
+Original values are retained on the master; workers only return explicitly connected overrides, avoiding a redundant return trip for unchanged reference images or other values. Overrides use the existing exact value transport and size limits. Selected workers must advertise `value_results: true` when overrides are requested, checked before execution and again at dispatch. Original-value passthrough alone does not require that additional capability.
+
+Values leaving the region must come from **End**, not directly from Start. To chain regions, extract an End value and connect it to the next Start's corresponding input. Values remain available downstream after End cleans up the execution context; they do not depend on a later lookup of expired job state.
 
 Models are loaded and cached on each processing participant, not serialized between machines. Connect loader outputs directly to the processing nodes. The master needs the region's model files when participating, as does each selected worker. The master still validates the prompt: it needs the relevant node definitions and any model-name/file availability required by their validation (including combo lists). This is not a model-free-master guarantee.
 
