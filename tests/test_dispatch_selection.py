@@ -491,7 +491,6 @@ class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     with self.assertRaisesRegex(RuntimeError, 'value_results.*upgrade'):
                         await dispatch.preflight_image_list_workers([{'id': 'worker'}], require_value_results=True)
-
     async def test_image_list_preflight_fails_closed_for_malformed_capabilities(self):
         malformed = {"supported": True, "protocol_version": 2, "node_ids": None}
         session = _FakeSession({("worker", "capabilities"): (200, malformed)})

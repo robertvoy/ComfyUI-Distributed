@@ -198,8 +198,8 @@ async def setup():
     module = sys.modules[str(ROOT).replace('.', '_x_')]
     boundary = importlib.import_module(module.__name__ + '.nodes.image_list')
     encode_result = boundary.encode_result
-    def checked_encode(result):
-        encoded = encode_result(result)
+    def checked_encode(result, **options):
+        encoded = encode_result(result, **options)
         if 'values' in encoded:
             assert set(encoded['values']) == {f'value_{n}' for n in (2, 3, 4, 5, 7, 8, 9, 10)}
         return encoded
@@ -246,7 +246,10 @@ async def worker_main():
             accepted = json.loads(response.body)
             _, pending = ps.prompt_queue.get_current_queue_volatile()
             entry = next(item for item in pending if item[1] == accepted['prompt_id'])
-            submissions.append({'prompt_id': entry[1], 'requested': data.get('partial_execution_targets'),
+            delivery = next(node['inputs'] for node in entry[2].values()
+                            if node['class_type'] == 'DistributedImageListEnd')
+            submissions.append({'prompt_id': entry[1], 'item_index': delivery['worker_item_index'],
+                                'requested': data.get('partial_execution_targets'),
                                 'queued': entry[4], 'node_ids': sorted(entry[2]),
                                 'end_ids': [key for key, node in entry[2].items()
                                             if node['class_type'] == 'DistributedImageListEnd']})
@@ -514,7 +517,14 @@ async def coordinator():
             ALLOW_MASTER = True
             config['settings']['master_delegate_only'] = False
             participation_counts = {}
-            for mode, selected in [('mixed', [w['id'] for w in workers]), ('master-only', [])]:
+            for mode, selected, fmt in [('mixed', [w['id'] for w in workers], 'exact'),
+                                         ('master-only', [], 'exact'),
+                                         ('mixed-png', [w['id'] for w in workers], 'png'),
+                                         ('master-only-png', [], 'png')]:
+                case_prompt = copy.deepcopy(prompt)
+                if fmt != 'exact':
+                    case_prompt['4']['inputs'].update(transfer_format=fmt, transfer_quality=73)
+                saved_case = copy.deepcopy(case_prompt)
                 # Keep cold-run exact-once assertions independent of other modes.
                 importlib.import_module(module.__name__ + '.image_list.local_executor')._RETAINED_OUTPUTS = None
                 executor = execution.PromptExecutor(ps, cache_args={'ram': 0, 'ram_inactive': 0}, asset_manager=assets)
@@ -530,8 +540,8 @@ async def coordinator():
                      patch.object(orchestration, 'queue_prompt_payload', enqueue), \
                      patch.object(config_mod, 'get_worker_timeout_seconds', return_value=15):
                     queued = await asyncio.wait_for(orchestration.orchestrate_distributed_execution(
-                        prompt, None, 'test', selected), 45)
-                assert prompt == saved_prompt, (mode, 'saved/source graph changed')
+                        case_prompt, None, 'test', selected), 45)
+                assert case_prompt == saved_case and prompt == saved_prompt, (mode, 'saved/source graph changed')
                 assert executor.success, (mode, executor.status_messages)
                 assert queued[2] == len(selected)
                 assert len(SOURCE_CALLS) == before_sources + 1, 'source was reevaluated per local item'
@@ -540,7 +550,7 @@ async def coordinator():
                 assert len({event['prompt_id'] for event in ITEM_EXECUTIONS[before_events:]}) == len(local_calls)
                 assert local_calls, f'{mode}: master did not process any items'
                 assert len(MODEL_CALLS) == before_models + 1, 'local model dependency did not stay cached'
-                remote_calls = []
+                remote_assignments = []
                 async with aiohttp.ClientSession() as session:
                     for worker, before_stats in zip(workers, before_worker_stats):
                         async with session.get(f"http://127.0.0.1:{worker['port']}/test-stats") as response:
@@ -550,27 +560,38 @@ async def coordinator():
                         submissions = current['submissions'][len(before_stats['submissions']):]
                         events = current['item_executions'][len(before_stats['item_executions']):]
                         assert Counter(utilities) == Counter(calls), (mode, current)
-                        assert len(submissions) == len(calls) == len({event['prompt_id'] for event in events})
+                        assigned = [submission['item_index'] for submission in submissions]
+                        # A repeated item can hit native processing cache even
+                        # when End changes return format. Count fresh deliveries,
+                        # not recomputation, for exact-once scheduling evidence.
+                        assert Counter(calls) <= Counter(assigned), (mode, worker['id'], calls, assigned)
+                        assert len(calls) == len({event['prompt_id'] for event in events}), (mode, events)
+                        assert {event['prompt_id'] for event in events} <= {
+                            submission['prompt_id'] for submission in submissions}
                         for submission in submissions:
                             assert submission['requested'] == submission['queued'] == ['4'], submission
                             assert '8' in submission['node_ids'] and '9' not in submission['node_ids']
                             assert '5' not in submission['node_ids']
-                        remote_calls.extend(calls)
+                        remote_assignments.extend(assigned)
                         assert not current['running'] and not current['pending'], current
-                if mode == 'mixed':
-                    assert remote_calls, 'mixed execution failed to use direct workers'
+                if mode.startswith('mixed'):
+                    assert remote_assignments, 'mixed execution failed to use direct workers'
                 else:
-                    assert not remote_calls and len(local_calls) == COUNT
-                assert Counter(local_calls + remote_calls) == Counter(range(COUNT)), (local_calls, remote_calls)
+                    assert not remote_assignments and len(local_calls) == COUNT
+                assert Counter(local_calls + remote_assignments) == Counter(range(COUNT)), (local_calls, remote_assignments)
                 check_carried_values()
                 images, masks, texts = CAPTURED[-1]
                 assert len(images) == len(masks) == len(texts) == COUNT
                 for i, row in enumerate(source_rows()):
-                    assert torch.equal(images[i], row['image'] + row['strength']), (mode, i)
+                    expected = row['image'] + row['strength']
+                    if fmt == 'png' and i in remote_assignments:
+                        expected = expected.clone()
+                        expected[..., :3] = (expected[..., :3].clamp(0, 1) * 255).to(torch.uint8).float() / 255
+                    assert torch.equal(images[i], expected), (mode, i)
                     assert torch.equal(masks[i], row['mask'] * 0.5), (mode, i)
                     assert texts[i] == f'item-{i}:seed-{100 + i}', (mode, texts)
                 assert not runtime._MASTER_JOBS and not runtime._WORKER_ITEMS
-                participation_counts[mode] = {'master': len(local_calls), 'workers': len(remote_calls)}
+                participation_counts[mode] = {'master': len(local_calls), 'workers': len(remote_assignments)}
             # Repeat the completed master-only queue with a fresh outer executor.
             # Every item must be delivered again without recomputing its branch.
             before_sources, before_local = len(SOURCE_CALLS), len(BRANCH_CALLS)
@@ -599,8 +620,9 @@ async def coordinator():
             assert prompt == saved_prompt
             print('IMAGE_LIST_CACHE_REQUEUE_OK unchanged items reused; fresh ordered delivery and cleanup')
             print('IMAGE_LIST_MASTER_OK ' + json.dumps(participation_counts))
+            assert len(outer_executions) == 3 + len(participation_counts) and all(row['captures'] == 1 for row in outer_executions)
+            print('IMAGE_LIST_TRANSFER_HTTP_OK mixed-png and master-only-png; masks/text/alpha/local images exact')
             print('IMAGE_LIST_VALUES_OK passthrough all six types; sparse override/add; Get; sequential Get-to-Start; direct/mixed/master-only')
-            assert len(outer_executions) == 5 and all(row['captures'] == 1 for row in outer_executions)
             print('IMAGE_LIST_TARGETS_OK ' + json.dumps({
                 'modes': ['delegate-only', 'mixed', 'master-only'],
                 'outer_targets': outer_executions[0]['targets'], 'worker_targets': ['4'],

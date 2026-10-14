@@ -6,6 +6,8 @@ import json
 from comfy_api.v0_0_2 import io
 
 from ..utils.async_helpers import run_async_in_server_loop
+from ..serverless_bridge.image_transfer import (FORMATS, DEFAULT_FORMAT, DEFAULT_QUALITY,
+                                               FORMAT_TOOLTIP, QUALITY_TOOLTIP, validate_options)
 from ..image_list.runtime import (
     MAX_VALUE_SLOTS,
     VALUE_NAMES,
@@ -204,6 +206,10 @@ class DistributedImageListEnd(io.ComfyNode):
                 io.Mask.Input("masks", optional=True, lazy=True),
                 io.String.Input("texts", optional=True, lazy=True, force_input=True),
                 io.Custom("DISTRIBUTED_IMAGE_LIST_CONTEXT").Input("context"),
+                io.Combo.Input("transfer_format", options=list(FORMATS), default=DEFAULT_FORMAT,
+                               optional=True, tooltip=FORMAT_TOOLTIP),
+                io.Int.Input("transfer_quality", default=DEFAULT_QUALITY, min=1, max=100,
+                             optional=True, tooltip=QUALITY_TOOLTIP),
                 *[io.MultiType.Input(name, types=_VALUE_TYPES, optional=True, lazy=True,
                                      tooltip="Replace or add this value for each item; exactly one value per item.")
                   for name in VALUE_NAMES],
@@ -251,7 +257,10 @@ class DistributedImageListEnd(io.ComfyNode):
     def execute(cls, images=None, masks=None, texts=None, context=None,
                 worker_result_token="", worker_item_index=-1, master_callback_url="",
                 image_list_local_execution=False, worker_context_id="",
-                worker_item_identity=None, **values):
+                worker_item_identity=None, transfer_format=DEFAULT_FORMAT,
+                transfer_quality=DEFAULT_QUALITY, **values):
+        transfer_format, transfer_quality = validate_options(unwrap_single(transfer_format),
+                                                              unwrap_single(transfer_quality))
         worker_result_token = unwrap_single(worker_result_token)
         master_callback_url = unwrap_single(master_callback_url)
         worker_context_id = unwrap_single(worker_context_id)
@@ -300,7 +309,8 @@ class DistributedImageListEnd(io.ComfyNode):
                 set_master_result(context_id, int(unwrap_single(worker_item_index)),
                                   str(worker_result_token), result)
             else:
-                payload = encode_result(result)
+                payload = encode_result(result, transfer_format=transfer_format,
+                                        transfer_quality=transfer_quality)
                 run_async_in_server_loop(
                     submit_worker_result(str(master_callback_url), str(worker_result_token),
                                          context_id, int(unwrap_single(worker_item_index)), payload), timeout=60,

@@ -188,7 +188,8 @@ async def dispatch_worker_prompt(
         return prompt_id if return_prompt_id else None
 
 
-async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0, *, require_value_results=False):
+async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0, *,
+                                       required_transfer_formats=(), require_value_results=False):
     """Require protocol/node support and report which direct workers are idle.
 
     This performs read-only GETs only; it never submits a prompt or contacts a
@@ -196,6 +197,14 @@ async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0, 
     """
     if not workers:
         raise RuntimeError("Distributed Image List requires at least one selected direct worker")
+    if (not isinstance(required_transfer_formats, (list, tuple, set, frozenset))
+            or any(type(fmt) is not str for fmt in required_transfer_formats)):
+        raise ValueError("required_transfer_formats must contain image transfer format names")
+    required_formats = set(required_transfer_formats) - {"exact"}
+    if required_formats:
+        from ...serverless_bridge.image_transfer import validate_options
+        for fmt in required_formats:
+            validate_options(fmt)
     session = await get_client_session()
     required_nodes = {"DistributedImageListStart", "DistributedImageListEnd"}
     semaphore = asyncio.Semaphore(8)
@@ -242,6 +251,16 @@ async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0, 
                         "upgrade that worker before running this feature; no work was submitted"
                     )
 
+                if required_formats:
+                    advertised = capability.get("image_transfer_formats")
+                    if (not isinstance(advertised, list)
+                            or any(type(fmt) is not str for fmt in advertised)
+                            or not required_formats.issubset(advertised)):
+                        raise RuntimeError(
+                            f"Image-list worker {worker_id} lacks required image_transfer_formats "
+                            f"{sorted(required_formats)}; upgrade that worker before compressed IMAGE returns; "
+                            "no work was submitted"
+                        )
                 if require_value_results and capability.get("value_results") is not True:
                     raise RuntimeError(
                         f"Image-list worker {worker_id} lacks explicit value_results support; "

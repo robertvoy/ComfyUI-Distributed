@@ -191,6 +191,50 @@ class MasterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[2], [str(i) for i in range(9)])
         self.preflight.assert_awaited_once_with(self.workers, require_idle=False)
 
+    async def test_busy_direct_peer_does_not_block_selected_cloud_slots(self):
+        self.workers.append({'id': 'worker', 'type': 'remote'})
+        context = self.create(participates=False, count=3)
+        self.config['workers'] = self.workers + [{'id': 'pool', 'type': 'serverless'}]
+        self.state.worker_ids.append('pool')
+        self.state.original_prompt['end']['inputs']['value_10'] = ['start', 2]
+        fixture = self
+        cloud_calls = []
+
+        async def busy_preflight(workers, **kwargs):
+            if kwargs['require_idle']:
+                raise RuntimeError('No selected feature-compatible direct worker is idle')
+            return {}
+
+        self.preflight.side_effect = busy_preflight
+
+        class Controller:
+            slots = [('serverless', 'pool', 0)]
+            close = AsyncMock()
+
+            async def dispatch(self, slot, index):
+                cloud_calls.append(index)
+                return {'index': index}
+
+            def poll(self, inflight):
+                slot = self.slots[0]
+                if slot in inflight:
+                    index = inflight[slot]['index']
+                    return slot, index, {'image': fixture.items[index]['image'],
+                                         'values': {'value_10': index}}
+                return None
+
+        controller = Controller()
+        create_slots = AsyncMock(return_value=controller)
+        with patch.dict(sys.modules, {'_master_slot_tests.image_list.serverless':
+                types.SimpleNamespace(create_serverless_slots=create_slots)}):
+            result = await self.rt.run_image_list_job(context, include_values=True)
+        self.assertEqual(cloud_calls, [0, 1, 2])
+        self.assertEqual(result[3], [{'value_1': str(i), 'value_10': i} for i in range(3)])
+        self.preflight.assert_awaited_once_with(self.workers, require_idle=False, require_value_results=True)
+        self.network.get_client_session.assert_not_awaited()
+        controller.close.assert_awaited_once()
+        self.assertFalse(self.local_calls or self.dispatched or self.rt._MASTER_JOBS)
+
     async def test_orchestrator_mode_never_instantiates_local_slot(self):
         self.workers.append({'id': 'worker', 'type': 'remote'})
         await self.rt.run_image_list_job(self.create(participates=False))

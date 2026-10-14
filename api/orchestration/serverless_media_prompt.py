@@ -13,7 +13,7 @@ import hashlib
 import json
 from graphlib import CycleError, TopologicalSorter
 
-from ...serverless_bridge.contract import SOCKET_KINDS, identifier, validate_bindings
+from ...serverless_bridge.contract import SOCKET_KINDS, VALUE_SOCKETS, identifier, validate_bindings
 from ...serverless_bridge.image_transfer import DEFAULT_FORMAT, validate_options
 from .serverless_prompt import (
     _PRIMITIVE_NODES,
@@ -54,7 +54,7 @@ def _validate_identifier(value, context):
         raise ValueError(f"{context} must be a valid nonempty media identifier") from None
 
 
-def _validate_prompt(prepared_prompt):
+def _validate_prompt(prepared_prompt, *, require_collectors=True):
     """Validate the entire source graph, including branches later discarded."""
     if not isinstance(prepared_prompt, dict) or not prepared_prompt:
         raise ValueError("prepared prompt must be a nonempty API graph mapping")
@@ -77,7 +77,7 @@ def _validate_prompt(prepared_prompt):
         if any(not isinstance(name, str) or not name for name in inputs):
             raise ValueError(f"prompt node {node_id!r} input names must be nonempty strings")
 
-    if not collectors:
+    if require_collectors and not collectors:
         raise ValueError("prepared prompt contains no DistributedCollector nodes")
 
     dependencies = {}
@@ -140,52 +140,74 @@ def _validate_prompt(prepared_prompt):
     return sorted(collectors)
 
 
-def _build_exports(source_nodes, collector_ids, request_id):
-    bindings = []
-    exports = {}
+def _build_explicit_exports(source_nodes, specs, request_id):
+    bindings, exports = [], {}
     reserved = set(source_nodes)
+    for spec in specs:
+        if not isinstance(spec, dict) or set(spec) != {
+                "collector_id", "job_id", "participant_id", "socket", "source",
+                "transfer_format", "transfer_quality"}:
+            raise ValueError("Invalid explicit media export specification")
+        collector_id, socket = spec["collector_id"], spec["socket"]
+        kind = "VALUE" if socket in VALUE_SOCKETS else SOCKET_KINDS.get(socket)
+        if kind is None:
+            raise ValueError("Unsupported explicit media export socket")
+        link = spec["source"]
+        if (not _is_link(link) or link[0] not in source_nodes
+                or type(link[1]) is not int or link[1] < 0):
+            raise ValueError("Explicit media export requires a valid source link")
+        fmt, quality = validate_options(spec["transfer_format"], spec["transfer_quality"])
+        if kind != "IMAGE" and fmt != DEFAULT_FORMAT:
+            raise ValueError("Image transfer controls apply only to IMAGE exports")
+        # Same stable identities as Collector compilation, including collisions.
+        identity = json.dumps([collector_id, socket], separators=(",", ":"))
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        base_id = f"serverless:media:{digest}"
+        node_id, suffix = base_id, 0
+        while node_id in reserved:
+            suffix += 1
+            node_id = f"{base_id}:{suffix}"
+        reserved.add(node_id)
+        binding = {"binding_id": f"b:{digest}", "collector_id": collector_id,
+                   "job_id": spec["job_id"], "participant_id": spec["participant_id"],
+                   "node_id": node_id, "socket": socket, "kind": kind}
+        bindings.append(binding)
+        exports[node_id] = {"class_type": "MediaExportV1", "inputs": {
+            "request_id": request_id, "binding_json": json.dumps(binding),
+            socket: copy.deepcopy(link)}}
+        if fmt != DEFAULT_FORMAT:
+            exports[node_id]["inputs"].update(transfer_format=fmt, transfer_quality=quality)
+    validate_bindings(bindings)
+    return bindings, exports
+
+
+def _build_exports(source_nodes, collector_ids, request_id):
+    specs = []
     for collector_id in collector_ids:
         inputs = source_nodes[collector_id].get("inputs", {})
         for socket in COLLECTOR_SOCKETS:
-            kind = SOCKET_KINDS[socket]
             if socket not in inputs:
                 continue
-            # Hashing avoids separator ambiguity and keeps long valid source
-            # identities within the bridge's identifier length bound. Identity
-            # is stable across request IDs and dictionary insertion orders.
-            identity = json.dumps([collector_id, socket], separators=(",", ":"))
-            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
-            base_id = f"serverless:media:{digest}"
-            node_id = base_id
-            suffix = 0
-            while node_id in reserved:
-                suffix += 1
-                node_id = f"{base_id}:{suffix}"
-            reserved.add(node_id)
-            binding = {
-                "binding_id": f"b:{digest}",
-                "collector_id": collector_id,
-                "job_id": inputs["multi_job_id"],
-                "participant_id": inputs["worker_id"],
-                "node_id": node_id,
-                "socket": socket,
-                "kind": kind,
-            }
-            bindings.append(binding)
-            exports[node_id] = {
-                "class_type": "MediaExportV1",
-                "inputs": {
-                    "request_id": request_id,
-                    "binding_json": json.dumps(binding),
-                    socket: copy.deepcopy(inputs[socket]),
-                },
-            }
-            if kind == "IMAGE":
-                fmt, quality = collector_image_policy(inputs)
-                if fmt != DEFAULT_FORMAT:
-                    exports[node_id]["inputs"].update(transfer_format=fmt, transfer_quality=quality)
-    validate_bindings(bindings)
-    return bindings, exports
+            fmt, quality = collector_image_policy(inputs) if socket == "images" else (DEFAULT_FORMAT, 90)
+            specs.append({"collector_id": collector_id, "job_id": inputs["multi_job_id"],
+                          "participant_id": inputs["worker_id"], "socket": socket,
+                          "source": inputs[socket], "transfer_format": fmt, "transfer_quality": quality})
+    return _build_explicit_exports(source_nodes, specs, request_id)
+
+
+def compile_export_prompt(prepared_prompt, request_id, specs):
+    """Compile explicit internal exports, without fabricating a Collector node.
+
+    Callers supply linked source sockets and literal binding identities; only
+    exporters and required ancestors survive. This does not add Collector
+    sockets: its public compiler remains images/audio only.
+    """
+    _validate_identifier(request_id, "request_id")
+    if _validate_prompt(prepared_prompt, require_collectors=False):
+        raise ValueError("Explicit exports cannot contain Collector nodes")
+    bindings, exports = _build_explicit_exports(prepared_prompt, specs, request_id)
+    compiled = _prune_graph(prepared_prompt, bindings, exports, _make_scalar_resolver(prepared_prompt))
+    return {node_id: compiled[node_id] for node_id in sorted(compiled)}, bindings
 
 
 def compile_media_prompt(prepared_prompt: dict, request_id: str) -> tuple[dict, list[dict]]:

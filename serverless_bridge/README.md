@@ -132,7 +132,7 @@ For typed inputs, `media.artifacts` contains records with exactly:
 
 | Field | Value |
 | --- | --- |
-| `id`, `kind` | Unique artifact ID and one of the five native types |
+| `id`, `kind` | Unique artifact ID and a native media type or internal `VALUE` |
 | `descriptor` | Kind-specific codec metadata; use the shared codec, not pickle |
 | `byte_length`, `sha256` | Exact payload byte count and lowercase SHA-256 hex |
 | `transport` | `{"type": "inline", "data_base64": "..."}` or the URL transport below |
@@ -149,7 +149,7 @@ to owned staging paths. They are not an arbitrary filename-upload interface.
 The returned `media` object has exactly `version`, `profile`, `request_id`,
 `bindings`, `artifacts`, and `items`:
 
-- `bindings`: every declared binding, unchanged, plus `count` (1–64).
+- `bindings`: every declared binding, unchanged, plus `count` (1–64 for media; exactly 1 for End value overrides).
 - `artifacts`: the same artifact schema above with inline or URL transport.
 - `items`: `{ "binding_id": "...", "item_index": 0, "artifact_id": "..." }`
   records covering every index exactly once, ordered by `item_index` when decoded.
@@ -159,6 +159,22 @@ consume a partial result. The internal history transport `comfy-file` is local
 only and must not be returned to the master. The executor reads validated
 `media_exports` history records and bounded `/view` payloads before constructing
 the external envelope. [contract.py](contract.py) is the schema authority.
+
+## Internal image-list values
+
+Image-list End uses sparse `value_1` … `value_10` bindings of kind `VALUE`.
+These are internal exports, not new Collector sockets. `value-v1` descriptors
+preserve BOOLEAN, arbitrary-size INT, finite binary64 FLOAT, STRING, IMAGE and
+MASK distinctly; tensors/text reuse exact native codecs. Each binding returns
+exactly one value. Only explicit End overrides are exported; the master rebuilds
+unchanged values from its source items. Compression of the main IMAGE never
+changes value-tensor fidelity.
+
+Deploy the complete updated bridge, including `value_codec.py`, before using
+End overrides. `MediaImportV1` retains its original five output positions and
+appends the internal wildcard VALUE output at slot 5. Older bridge installations
+do not support these bindings; ordinary provider health checks do not verify
+this support. Request/result size limits still apply.
 
 ## Optional image return encoding
 

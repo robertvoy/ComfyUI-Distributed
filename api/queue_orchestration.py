@@ -38,7 +38,7 @@ from .orchestration.prompt_transform import (
     WORKER_SINK_CLASS,
     _resolve_direct_workers_for_image_list,
 )
-from ..image_list.runtime import validate_image_list_regions
+from ..image_list.runtime import validate_image_list_regions, _has_selected_serverless_workers
 from ..image_list.execution_plan import prepare_image_list_execution
 
 
@@ -337,25 +337,25 @@ async def orchestrate_distributed_execution(
     if image_list_mode:
         # Validate before probing or queueing anything so malformed boundaries and
         # old worker releases fail before any upstream image is materialized.
-
         validate_image_list_regions(prompt_obj, explicit_targets=True)
-        configured_serverless = [
-            str(worker.get("id")) for worker in config.get("workers", [])
-            if worker.get("enabled", False)
-            and str(worker.get("type") or "local").lower() == "serverless"
-            and (requested_ids is None or str(worker.get("id")) in {str(x) for x in requested_ids})
-        ]
-        if configured_serverless:
-            trace_debug(
-                execution_trace_id,
-                "Image List v1 explicitly excludes unsupported serverless pools: "
-                + ", ".join(configured_serverless),
-            )
+        from ..serverless_bridge.image_transfer import DEFAULT_FORMAT, DEFAULT_QUALITY, validate_options
+        required_transfer_formats = set()
+        for end_id in prompt_index.nodes_for_class("DistributedImageListEnd"):
+            end_inputs = prompt_obj[end_id].get("inputs", {})
+            fmt, _ = validate_options(end_inputs.get("transfer_format", DEFAULT_FORMAT),
+                                      end_inputs.get("transfer_quality", DEFAULT_QUALITY))
+            if fmt != DEFAULT_FORMAT:
+                required_transfer_formats.add(fmt)
         workers = _resolve_direct_workers_for_image_list(config, requested_ids)
+        if _has_selected_serverless_workers(config, requested_ids):
+            from ..image_list.serverless import resolve_serverless_workers
+            # Pool identity is retained once, never expanded by Images per run.
+            # Validate profiles before reachability can hide an invalid selection.
+            workers += resolve_serverless_workers(config, requested_ids)
         if not workers and delegate_master:
             raise RuntimeError(
-                "Distributed Image List in orchestrator-only mode requires a selected direct worker; "
-                "serverless pools are unsupported"
+                "Distributed Image List in orchestrator-only mode requires a selected direct worker "
+                "or comfy-media-v1 serverless pool"
             )
     else:
         workers = _resolve_enabled_workers(config, requested_ids)
@@ -401,18 +401,20 @@ async def orchestrate_distributed_execution(
         from .orchestration.dispatch import preflight_image_list_workers
         if not active_workers and delegate_master:
             raise RuntimeError(
-                "No selected direct worker is reachable for Distributed Image List in orchestrator-only mode"
+                "No selected worker is reachable for Distributed Image List in orchestrator-only mode"
             )
         from ..image_list.runtime import END_CLASS, end_override_names
         requires_values = any(end_override_names(node.get("inputs", {}))
                               for node in prompt_obj.values() if node.get("class_type") == END_CLASS)
-        value_preflight = {"require_value_results": True} if requires_values else {}
-        # Persist candidates, not this submission-time idle snapshot: a preceding
-        # master prompt may still be using them. The image-list runtime rechecks
-        # capability and availability before assigning the first item.
-        if active_workers:
-            await preflight_image_list_workers(active_workers, require_idle=False,
-                                               **value_preflight)
+        direct_workers = [worker for worker in active_workers if worker.get("type") != "serverless"]
+        preflight_kwargs = ({"required_transfer_formats": sorted(required_transfer_formats)}
+                            if required_transfer_formats else {})
+        if requires_values:
+            preflight_kwargs["require_value_results"] = True
+        # Preserve busy direct candidates for queued runs; runtime rechecks idle
+        # availability before assignment. Never direct-probe serverless pools.
+        if direct_workers:
+            await preflight_image_list_workers(direct_workers, require_idle=False, **preflight_kwargs)
     else:
         delegate_master = selected_delegate_master
 

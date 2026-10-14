@@ -24,7 +24,7 @@ _LAYOUTS = {"IMAGE": "BHWC", "MASK": "BHW", "AUDIO": "BCT"}
 
 
 def _validate_kind(kind):
-    if type(kind) is not str or kind not in ("IMAGE", "MASK", "STRING", "AUDIO"):
+    if type(kind) is not str or kind not in ("IMAGE", "MASK", "STRING", "AUDIO", "VALUE"):
         raise ValueError("Unsupported payload kind")
 
 
@@ -92,6 +92,9 @@ def encode_payload(kind: str, value, *, max_bytes: int = MAX_PAYLOAD_BYTES) -> t
     """
     _validate_kind(kind)
     limit = _byte_limit(max_bytes)
+    if kind == "VALUE":
+        from .value_codec import encode_value
+        return encode_value(value, max_bytes=limit)
     if kind == "STRING":
         return _encode_string(value, limit)
 
@@ -146,6 +149,9 @@ def decode_payload(kind: str, descriptor: dict, payload: bytes, *, max_bytes: in
         raise ValueError("Payload must be bytes")
     if len(payload) > limit:
         raise ValueError("Payload exceeds byte limit")
+    if kind == "VALUE":
+        from .value_codec import decode_value
+        return decode_value(descriptor, payload, max_bytes=limit)
     if kind == "IMAGE" and descriptor.get("encoding") == "image-transfer-v1":
         # Lazy and IMAGE-only: exact tensors and other kinds stay unchanged.
         from .image_codec import decode_image

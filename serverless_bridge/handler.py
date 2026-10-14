@@ -40,7 +40,7 @@ DRAIN_GRACE_SECONDS = 10.0
 HTTP_TIMEOUT_SECONDS = 15.0
 _UNCERTAIN_WORK = set()
 GET_ATTEMPTS = 3
-_IMPORT_SLOTS = {"IMAGE": 0, "AUDIO": 1, "MASK": 2, "STRING": 3, "VIDEO": 4}
+_IMPORT_SLOTS = {"IMAGE": 0, "AUDIO": 1, "MASK": 2, "STRING": 3, "VIDEO": 4, "VALUE": 5}
 # Used ONLY to run the shared manifest validator before /view. Never fetched.
 _VALIDATION_TRANSPORT = {"type": "url", "url": "https://media-validation.invalid/artifact",
                          "expires_at": "9999-01-01T00:00:00Z"}
@@ -194,8 +194,12 @@ def _validate_request(input_data):
                 or aid not in indexed or (node_id, name) in destinations):
             raise ValueError("Unknown or duplicate media input reference")
         binding = exporters.get(node_id)
-        if binding is not None and (name != binding["socket"] or indexed[aid]["kind"] != binding["kind"]):
-            raise ValueError("Exporter input must match its declared media socket and kind")
+        if binding is not None:
+            # VALUE exports accept the six explicit runtime types. IMAGE/MASK
+            # imports can feed both native consumers and a sparse override.
+            allowed = {"VALUE", "IMAGE", "MASK", "STRING"} if binding["kind"] == "VALUE" else {binding["kind"]}
+            if name != binding["socket"] or indexed[aid]["kind"] not in allowed:
+                raise ValueError("Exporter input must match its declared media socket and kind")
         destinations.add((node_id, name))
         used.add(aid)
     if used != set(indexed):

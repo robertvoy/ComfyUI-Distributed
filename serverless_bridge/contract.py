@@ -19,6 +19,9 @@ MAX_ARTIFACTS = 128
 MAX_ITEMS = 64
 MAX_DESCRIPTOR_BYTES = 128 * 1024
 SOCKET_KINDS = {"images": "IMAGE", "audio": "AUDIO", "masks": "MASK", "texts": "STRING", "video": "VIDEO"}
+# Internal End slots do not extend the public Collector or legacy media sockets.
+VALUE_SOCKETS = tuple(f"value_{i}" for i in range(1, 11))
+ARTIFACT_KINDS = frozenset(SOCKET_KINDS.values()) | {"VALUE"}
 BINDING_FIELDS = {"binding_id", "collector_id", "job_id", "participant_id", "node_id", "socket", "kind"}
 _ID = re.compile(r"[A-Za-z0-9_.:/-]{1,200}\Z")
 _HASH = re.compile(r"[a-f0-9]{64}\Z")
@@ -68,7 +71,8 @@ def validate_binding(binding):
         raise ValueError("Invalid media binding")
     for field in BINDING_FIELDS - {"socket", "kind"}:
         identifier(binding[field])
-    if SOCKET_KINDS.get(binding["socket"]) != binding["kind"]:
+    kind = "VALUE" if binding["socket"] in VALUE_SOCKETS else SOCKET_KINDS.get(binding["socket"])
+    if kind is None or kind != binding["kind"]:
         raise ValueError("Media socket/type mismatch")
     return binding
 
@@ -113,7 +117,7 @@ def validate_artifact(artifact, *, max_bytes=MAX_ARTIFACT_BYTES):
     if not isinstance(artifact, dict) or set(artifact) != fields:
         raise ValueError("Invalid media artifact")
     identifier(artifact["id"])
-    if artifact["kind"] not in SOCKET_KINDS.values():
+    if artifact["kind"] not in ARTIFACT_KINDS:
         raise ValueError("Unsupported media kind")
     if not isinstance(artifact["descriptor"], dict):
         raise ValueError("Invalid media descriptor")
@@ -191,7 +195,8 @@ def validate_response(response, *, request_id, bindings, max_total_bytes=MAX_TOT
         if bid in counts or expected.get(bid) != binding:
             raise ValueError("Media binding identity mismatch")
         # Connected outputs must produce at least one value. Empty STRING is a value.
-        counts[bid] = bounded_int(row["count"], MAX_ITEMS, minimum=1)
+        maximum = 1 if binding["socket"] in VALUE_SOCKETS else MAX_ITEMS
+        counts[bid] = bounded_int(row["count"], maximum, minimum=1)
     artifacts = response["artifacts"]
     if not isinstance(artifacts, list) or not 1 <= len(artifacts) <= MAX_ARTIFACTS:
         raise ValueError("Invalid media artifacts count")

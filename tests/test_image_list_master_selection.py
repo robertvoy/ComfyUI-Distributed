@@ -272,12 +272,28 @@ class MasterSelectionTests(unittest.IsolatedAsyncioTestCase):
             await self.queue()
         self.q.queue_prompt_payload.assert_not_awaited()
 
-    async def test_serverless_only_uses_master_without_provider_dispatch(self):
-        self.config["workers"] = [{"id": "pool", "type": "serverless", "enabled": True}]
+    async def test_serverless_pool_is_retained_with_participating_master(self):
+        self.config["workers"] = [{
+            "id": "pool", "name": "Cloud", "type": "serverless", "enabled": True,
+            "endpoint_id": "endpoint", "media_profile": "comfy-media-v1",
+        }]
         result = await self.queue()
         self.assertIs(self.prepared_inputs()["image_list_master_participates"], True)
-        self.assertEqual(result[2], 0)
+        self.assertEqual(json.loads(self.prepared_inputs()["image_list_enabled_worker_ids"]), ["pool"])
+        self.assertEqual(result[2], 1)
+        self.preflight.assert_not_awaited()
         self.q.dispatch_worker_prompt.assert_not_awaited()
+        self.assertEqual(self.ps.distributed_pending_jobs, {})
+
+    async def test_legacy_serverless_pool_is_rejected_not_silently_ignored(self):
+        self.config["workers"] = [{
+            "id": "pool", "name": "Cloud", "type": "serverless", "enabled": True,
+            "endpoint_id": "endpoint",
+        }]
+        with self.assertRaisesRegex(ValueError, "comfy-media-v1"):
+            await self.queue()
+        self.q.queue_prompt_payload.assert_not_awaited()
+        self.preflight.assert_not_awaited()
 
     async def test_incompatible_worker_is_not_silently_hidden_by_master(self):
         self.preflight.side_effect = RuntimeError("upgrade worker")

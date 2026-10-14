@@ -432,12 +432,17 @@ async def main():
     assert end_schema.node_id == 'DistributedImageListEnd'
     assert end_schema.display_name == 'Distributed Image List End'
     runtime = sys.modules[module.__name__ + '.image_list.runtime']
-    assert [input.id for input in end_schema.inputs] == ['images', 'masks', 'texts', 'context'] + list(runtime.VALUE_NAMES)
+    assert [input.id for input in end_schema.inputs] == [
+        'images', 'masks', 'texts', 'context', 'transfer_format', 'transfer_quality'] + list(runtime.VALUE_NAMES)
+    format_input, quality_input = end_schema.inputs[4:6]
+    assert format_input.options == list(runtime.IMAGE_TRANSFER_FORMATS)
+    assert format_input.default == 'exact' and quality_input.default == 90
+    assert format_input.optional and quality_input.optional
     assert [output.io_type for output in end_schema.outputs] == [
         'IMAGE', 'MASK', 'STRING', 'DISTRIBUTED_IMAGE_LIST_VALUES']
     assert end_schema.outputs[3].id == end_schema.outputs[3].display_name == 'values'
     assert all(output.is_output_list for output in end_schema.outputs)
-    for override in end_schema.inputs[4:]:
+    for override in end_schema.inputs[6:]:
         assert override.optional and override.lazy
         assert override.get_io_type() == 'IMAGE,MASK,STRING,INT,FLOAT,BOOLEAN'
     getter = mapping['DistributedImageListGetValue']

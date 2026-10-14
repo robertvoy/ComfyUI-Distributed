@@ -94,7 +94,7 @@ async def check():
     assert await extension.get_node_list() == [MediaImportV1, MediaExportV1]
     imp = MediaImportV1.GET_NODE_INFO_V1()
     exp = MediaExportV1.GET_NODE_INFO_V1()
-    assert imp['output'] == ['IMAGE','AUDIO','MASK','STRING','VIDEO'], imp
+    assert imp['output'] == ['IMAGE','AUDIO','MASK','STRING','VIDEO','*'], imp
     assert exp['output_node'] and MediaExportV1.define_schema().is_input_list, exp
     with tempfile.TemporaryDirectory(prefix='typed-media-', dir=os.environ.get('TMPDIR')) as scratch:
         base = Path(scratch)
@@ -152,7 +152,7 @@ async def check():
                 mapped, missing, hidden = execution.get_input_data({'artifact_json':json.dumps(artifact),'filename':filename},MediaImportV1,'import')
                 got = await execution._async_map_node_over_list('probe','import',MediaImportV1,mapped,MediaImportV1.FUNCTION,v3_data=hidden)
                 got = await execution.resolve_map_node_over_list_results(got)
-                assert len(got[0].result) == 5
+                assert len(got[0].result) == 6
                 assert all(x is None for n,x in enumerate(got[0].result) if n != list(SOCKET_KINDS).index(socket))
                 bad = dict(artifact,sha256='0'*64)
                 try: import_value(bad,filename)

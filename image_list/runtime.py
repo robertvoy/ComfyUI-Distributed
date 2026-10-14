@@ -17,6 +17,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+try:
+    from ..serverless_bridge.image_transfer import (
+        FORMATS as IMAGE_TRANSFER_FORMATS, DEFAULT_FORMAT, DEFAULT_QUALITY, validate_options,
+    )
+except ImportError:  # Standalone image_list.runtime (without extension bootstrap).
+    from serverless_bridge.image_transfer import (
+        FORMATS as IMAGE_TRANSFER_FORMATS, DEFAULT_FORMAT, DEFAULT_QUALITY, validate_options,
+    )
+
 # v2: Start carries generic value_N slots instead of fixed reference/text/strength/seed fields.
 PROTOCOL_VERSION = 2
 START_CLASS = "DistributedImageListStart"
@@ -362,6 +371,8 @@ def decode_value(data: Any, expected_kind: str) -> Any:
         return None
     if not isinstance(data, dict) or data.get("type") != expected_kind:
         raise ValueError(f"Expected {expected_kind} transport value")
+    if "encoding" in data or "descriptor" in data:
+        raise ValueError("Compressed transport is supported only for the returned IMAGE")
     if expected_kind in ("IMAGE", "MASK", "TENSOR"):
         torch = _torch()
         dtype_name = data.get("dtype")
@@ -526,7 +537,7 @@ def create_master_job(start_id: str, end_id: str, prompt: dict[str, Any], items:
     if not isinstance(master_participates, bool):
         raise ValueError("master_participates must be a boolean")
     if not worker_ids and not master_participates:
-        raise RuntimeError("Distributed Image List requires at least one preflighted direct worker; master fallback is disabled")
+        raise RuntimeError("Distributed Image List requires at least one selected worker; master fallback is disabled")
     # Only the target-controlled Start caller may relax the outer prompt guard.
     regions = validate_image_list_regions(prompt, explicit_targets=explicit_targets is True)
     if not any(region["start_id"] == str(start_id) and region["end_id"] == str(end_id)
@@ -889,10 +900,48 @@ def register_assignment(context_id: str, item_index: int, worker_id: str, token:
         state.expected_workers[item_index] = worker_id
 
 
+def _image_codec():
+    # Exact returns and inputs must not import optional media codec dependencies.
+    if __package__ == "image_list":
+        from serverless_bridge import image_codec
+    else:
+        from ..serverless_bridge import image_codec
+    return image_codec
+
+
+def _decode_return_image(data: Any) -> Any:
+    if (not isinstance(data, dict) or set(data) != {"type", "encoding", "descriptor", "data"}
+            or data["type"] != "IMAGE" or data["encoding"] != "image-transfer-v1"):
+        raise ValueError("Invalid compressed IMAGE envelope")
+    descriptor = data["descriptor"]
+    if not isinstance(descriptor, dict) or descriptor.get("encoding") != "image-transfer-v1":
+        raise ValueError("Invalid compressed IMAGE descriptor")
+    shape = descriptor.get("shape")
+    if (not isinstance(shape, list) or len(shape) != 4
+            or any(type(dim) is not int or dim < 1 for dim in shape)
+            or shape[0] != 1 or shape[-1] not in (3, 4)):
+        raise ValueError("Compressed IMAGE must have shape [1,H,W,3|4]")
+    encoded = data["data"]
+    if not isinstance(encoded, str) or len(encoded) > ((MAX_PAYLOAD_BYTES + 2) // 3) * 4:
+        raise ValueError("Compressed IMAGE data is missing or exceeds the transport limit")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Compressed IMAGE data must be valid base64") from exc
+    if len(raw) > MAX_PAYLOAD_BYTES:
+        raise ValueError("Compressed IMAGE exceeds the transport limit")
+    return _image_codec().decode_image(descriptor, raw, max_bytes=MAX_PAYLOAD_BYTES)
+
+
 def decode_result(result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ValueError("result must be an object")
-    image = decode_value(result.get("image"), "IMAGE")
+    image_data = result.get("image")
+    if isinstance(image_data, dict) and ("encoding" in image_data or "descriptor" in image_data):
+        encode_request_payload(result)  # Bound combined JSON/base64 before codec allocation.
+        image = _decode_return_image(image_data)
+    else:
+        image = decode_value(image_data, "IMAGE")
     if image is None or image.ndim != 4 or image.shape[0] != 1 or image.shape[-1] not in (3, 4):
         raise ValueError("result.image must contain exactly one RGB/RGBA image")
     mask = decode_value(result.get("mask"), "MASK")
@@ -947,16 +996,32 @@ def normalize_worker_result(images: Any, masks: Any = None, texts: Any = None,
     return result
 
 
-def encode_result(result: dict[str, Any]) -> dict[str, Any]:
+def encode_result(result: dict[str, Any], *, transfer_format=DEFAULT_FORMAT,
+                  transfer_quality=DEFAULT_QUALITY) -> dict[str, Any]:
+    fmt, quality = validate_options(transfer_format, transfer_quality)
     normalized = normalize_worker_result(result.get("image"), result.get("mask"), result.get("text"))
-    encoded = {"image": encode_value(normalized["image"], "IMAGE"),
-               "mask": encode_value(normalized["mask"], "MASK"),
+    if fmt == "exact":
+        image = encode_value(normalized["image"], "IMAGE")
+    else:
+        value = normalized["image"]
+        # Reject before moving/copying a potentially oversized device tensor.
+        if value.numel() * value.element_size() > MAX_PAYLOAD_BYTES:
+            raise ValueError("IMAGE item exceeds the image-list transport limit")
+        descriptor, raw = _image_codec().encode_image(
+            value.detach().to("cpu").contiguous(), transfer_format=fmt,
+            transfer_quality=quality, max_bytes=MAX_PAYLOAD_BYTES,
+        )
+        image = {"type": "IMAGE", "encoding": "image-transfer-v1", "descriptor": descriptor,
+                 "data": base64.b64encode(raw).decode("ascii")}
+    encoded = {"image": image, "mask": encode_value(normalized["mask"], "MASK"),
                "text": encode_value(normalized["text"], "STRING")}
     if "values" in result:
         values = _validate_result_values(result["values"])
         if values:
             encoded["values"] = {name: encode_value(value, value_kind(value, name))
                                  for name, value in values.items()}
+    if fmt != "exact":
+        encode_request_payload(encoded)
     return encoded
 
 
@@ -985,7 +1050,7 @@ def _collect_output_lists(results: list[dict[str, Any]], *, state: ImageListJob 
 
 async def run_image_list_job(context_id: str, *, model_callback=None,
                              include_values: bool = False) -> tuple[list[Any], ...]:
-    """Schedule a shared queue across the optional master and direct workers."""
+    """Schedule one queue across master, direct peers and bounded cloud slots."""
     state = get_master_job(context_id)
     if state is None:
         raise RuntimeError("Distributed Image List context is missing or expired")
@@ -1011,37 +1076,80 @@ async def run_image_list_job(context_id: str, *, model_callback=None,
         remove_master_job(context_id)
 
 
+def _has_selected_serverless_workers(config, requested_ids):
+    """Keep direct/master-only execution free of optional cloud adapter imports.
+
+    This is only an import guard, not validation. The adapter validates original
+    pool IDs/configuration without repairing them, before any cloud work starts.
+    """
+    requested = None if requested_ids is None else {str(value) for value in requested_ids}
+    return any(
+        str(worker.get("type") or "local").strip().lower() == "serverless"
+        and (worker.get("enabled", False) if requested is None
+             else str(worker.get("id") or "").strip() in requested)
+        for worker in config.get("workers", [])
+    )
+
+
 async def _run_image_list_job(state: ImageListJob, *, include_values: bool = False):
-    context_id = state.context_id
     state.event = asyncio.Event()
     state.event_loop = asyncio.get_running_loop()
-    from ..api.orchestration.dispatch import (
-        preflight_image_list_workers, dispatch_worker_prompt,
-    )
     from ..api.orchestration.prompt_transform import _resolve_direct_workers_for_image_list
-    from ..utils.config import load_config, get_worker_timeout_seconds
-    from ..utils.network import build_master_callback_url, build_worker_url, get_client_session
-    from ..utils.logging import log
-    import aiohttp
+    from ..utils.config import load_config
 
     config = load_config()
     workers = _resolve_direct_workers_for_image_list(config, state.worker_ids)
-    if not workers and not state.master_participates:
-        raise RuntimeError("Distributed Image List requires enabled direct workers; serverless pools are unsupported")
-    # Recheck worker capability and idle state immediately before the first item.
-    override_names = end_override_names(state.original_prompt[state.end_id].get("inputs", {}))
-    value_preflight = {"require_value_results": True} if override_names else {}
-    worker_statuses = (await preflight_image_list_workers(
-        workers, require_idle=not state.master_participates, **value_preflight) if workers else {})
-    workers = [worker for worker in workers if worker["id"] in worker_statuses]
-    if not workers and not state.master_participates:
-        raise RuntimeError("No free, reachable, feature-compatible direct workers are available; master execution is disabled")
-    session = await get_client_session() if workers else None
-    # Both item paths below select End explicitly, never all OUTPUT_NODE roots.
+    # Every item path selects End explicitly, never all OUTPUT_NODE roots.
     regions = validate_image_list_regions(state.original_prompt, explicit_targets=True)
     region = next((entry for entry in regions if entry["start_id"] == state.start_id and entry["end_id"] == state.end_id), None)
     if region is None:
         raise RuntimeError("Image-list region no longer matches the submitted prompt")
+    controller = None
+    try:
+        if _has_selected_serverless_workers(config, state.worker_ids):
+            from .serverless import create_serverless_slots
+            controller = await create_serverless_slots(state, region, config, state.event)
+        return await _run_image_list_slots(state, config, workers, region, controller,
+                                          include_values=include_values)
+    finally:
+        # Own cloud jobs even if direct preflight/local setup fails, or dispatch
+        # is cancelled before returning an acknowledged handle to the scheduler.
+        if controller is not None:
+            await controller.close()
+
+
+async def _run_image_list_slots(state, config, workers, region, controller, *, include_values=False):
+    context_id = state.context_id
+    from ..api.orchestration.dispatch import (
+        preflight_image_list_workers, dispatch_worker_prompt,
+    )
+    from ..utils.config import get_worker_timeout_seconds
+    from ..utils.network import build_master_callback_url, build_worker_url, get_client_session
+    from ..utils.logging import log
+    import aiohttp
+
+    serverless_slots = list(controller.slots) if controller is not None else []
+    end_inputs = state.original_prompt[state.end_id]["inputs"]
+    transfer_format, _ = validate_options(
+        end_inputs.get("transfer_format", DEFAULT_FORMAT),
+        end_inputs.get("transfer_quality", DEFAULT_QUALITY),
+    )
+    transfer_requirements = ({"required_transfer_formats": (transfer_format,)}
+                             if transfer_format != "exact" else {})
+    override_names = end_override_names(end_inputs)
+    value_preflight = {"require_value_results": True} if override_names else {}
+    # Direct capability/idle probes must never be sent to a serverless pool.
+    # Busy peers are filtered in either role; they are fatal only when neither
+    # the master nor an explicitly selected cloud slot can process the queue.
+    worker_statuses = await preflight_image_list_workers(
+        workers, require_idle=not state.master_participates and not serverless_slots,
+        **transfer_requirements, **value_preflight,
+    ) if workers else {}
+    workers = [worker for worker in workers if worker["id"] in worker_statuses]
+    if not workers and not serverless_slots and not state.master_participates:
+        raise RuntimeError("No reachable, feature-compatible image-list workers are available; master execution is disabled")
+    session = await get_client_session() if workers else None
+
     timeout_seconds = max(5.0, float(get_worker_timeout_seconds()))
     use_websocket = bool((config.get("settings", {}) or {}).get("websocket_orchestration", False))
     prepared_worker_prompts: dict[str, dict[str, Any]] = {}
@@ -1056,6 +1164,8 @@ async def _run_image_list_job(state: ImageListJob, *, include_values: bool = Fal
         local_executor = LocalExecutionSlot(model_callback=state.local_model_callback)
 
     async def dispatch(worker_id: Any, index: int) -> dict[str, Any]:
+        if worker_id in serverless_slots:
+            return await controller.dispatch(worker_id, index)
         if worker_id is master_slot:
             assert local_executor is not None
             token = create_worker_task_token()
@@ -1076,13 +1186,15 @@ async def _run_image_list_job(state: ImageListJob, *, include_values: bool = Fal
         if worker is None:
             raise RuntimeError(f"Worker {worker_id} was removed before dispatch")
         assert session is not None
-        if override_names:
-            # A worker can restart/downgrade between items. Check before upload,
-            # not merely once at queue preparation or at the start of the run.
-            ready = await preflight_image_list_workers([worker], require_idle=False,
-                                                       require_value_results=True)
-            if worker_id not in ready:
-                raise RuntimeError(f"Image-list worker {worker_id} is unavailable for value overrides")
+        if transfer_requirements or value_preflight:
+            # A peer may restart/downgrade between items. Recheck both return
+            # contracts before staging or POSTing each assignment.
+            statuses = await preflight_image_list_workers(
+                [worker], require_idle=bool(transfer_requirements),
+                **transfer_requirements, **value_preflight,
+            )
+            if worker_id not in statuses:
+                raise RuntimeError(f"Image-list worker {worker_id} unavailable before return dispatch")
         token = create_worker_task_token()
         register_assignment(context_id, index, worker_id, token)
         item_payload = {"context_id": context_id, "item": encode_item(state.items[index])}
@@ -1138,6 +1250,10 @@ async def _run_image_list_job(state: ImageListJob, *, include_values: bool = Fal
             state.event.clear()
             if state.failed:
                 raise RuntimeError(state.failed)
+            if controller is not None:
+                completed = controller.poll(inflight)
+                if completed is not None:
+                    return completed
             local = inflight.get(master_slot)
             if local is not None and local["future"].done():
                 # A posted result does not release this slot until execution has
@@ -1187,10 +1303,15 @@ async def _run_image_list_job(state: ImageListJob, *, include_values: bool = Fal
                     return None
                 return None
             errors = await asyncio.gather(*(history_status(wid, handle) for wid, handle in inflight.items()
-                                            if wid is not master_slot))
+                                            if wid is not master_slot and wid not in serverless_slots))
             failure = next((error for error in errors if isinstance(error, str)), None)
             if failure:
                 raise RuntimeError(failure)
+            # A cloud manager task may finish during direct HTTP history waits.
+            if controller is not None:
+                completed = controller.poll(inflight)
+                if completed is not None:
+                    return completed
             completed = next((entry for entry in errors if isinstance(entry, tuple)), None)
             if completed is not None:
                 # The callback precedes the worker prompt finishing. Wait for its
@@ -1201,7 +1322,8 @@ async def _run_image_list_job(state: ImageListJob, *, include_values: bool = Fal
                 return completed
             now = time.monotonic()
             expired = [f"{wid}/item {handle['index']}" for wid, handle in inflight.items()
-                       if wid is not master_slot and now - handle["last_seen"] > timeout_seconds]
+                       if wid is not master_slot and wid not in serverless_slots
+                       and now - handle["last_seen"] > timeout_seconds]
             if expired:
                 raise TimeoutError(f"Image-list owned-prompt liveness timeout after {timeout_seconds:.1f}s: {', '.join(expired)}")
             try:
@@ -1210,6 +1332,10 @@ async def _run_image_list_job(state: ImageListJob, *, include_values: bool = Fal
                 pass
 
     async def cleanup(worker_id: Any, handle: dict[str, Any]) -> None:
+        if worker_id in serverless_slots:
+            # The controller owns exact manager records, including dispatches
+            # that never returned a handle. Close it once in the outer finally.
+            return
         if worker_id is master_slot:
             # The outer finally owns the non-abandonable stop/join. The generic
             # scheduler's bounded remote cleanup must never detach local work.
@@ -1250,7 +1376,8 @@ async def _run_image_list_job(state: ImageListJob, *, include_values: bool = Fal
             return False
 
     try:
-        slots = ([master_slot] if local_executor is not None else []) + [worker["id"] for worker in workers]
+        slots = (([master_slot] if local_executor is not None else [])
+                 + [worker["id"] for worker in workers] + serverless_slots)
         results = await dynamic_schedule(len(state.items), slots,
                                          dispatch, wait_next, cleanup, interrupted)
         return _collect_output_lists(results, state=state, include_values=include_values)

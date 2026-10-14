@@ -291,16 +291,25 @@ def test_legacy_worker_path_still_consumes_and_delivers_job_context(boundaries):
     assert rt.get_master_job(context).received_indexes == {0}
 
 
-def test_remote_cache_hit_submits_fresh_callback_metadata(boundaries, monkeypatch):
+@pytest.mark.parametrize('fmt', ['exact', 'png'])
+def test_remote_cache_hit_submits_fresh_callback_metadata(boundaries, monkeypatch, fmt):
     data = item()
     token = stage(data)
     prompt = worker_prompt(token, 'fresh-context', data, local=False)
+    prompt['end']['inputs'].update(transfer_format=fmt, transfer_quality=73)
     submit = AsyncMock()
     monkeypatch.setattr(boundaries, 'submit_worker_result', submit)
     cached = ([data['image']], [data['mask']], [0], [rt.item_content_identity(data)])
-    end(boundaries, prompt, cached)
+    result = end(boundaries, prompt, cached)
+    assert len(result) == 4
     assert submit.await_args.args[:4] == ('http://master', token, 'fresh-context', 0)
     assert submit.await_args.args[4]['values']['value_3'] == {'type': 'INT', 'value': 0}
+    payload = submit.await_args.args[4]
+    if fmt == 'png':
+        assert payload['image']['descriptor']['format'] == fmt
+        assert payload['image']['descriptor']['quality'] == 73
+    else:
+        assert 'encoding' not in payload['image']
     assert token not in rt._WORKER_ITEMS
 
 
