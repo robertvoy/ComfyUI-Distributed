@@ -11,6 +11,83 @@ from aiohttp import web
 from image_list import lifecycle, runtime
 
 
+class ExecutionTargetProofTests(unittest.TestCase):
+    def setUp(self):
+        from test_image_list_master_runtime import graph
+        self.prompt = graph()
+        self.registry = SimpleNamespace(NODE_CLASS_MAPPINGS={
+            'Operation': type('Flagged', (), {'OUTPUT_NODE': True})})
+        self.modules = patch.dict('sys.modules', {'nodes': self.registry})
+        self.modules.start()
+        self.addCleanup(self.modules.stop)
+
+    def server(self, roots, *, prompt=None, running=True):
+        item = (0, 'owned', self.prompt if prompt is None else prompt, {}, roots, {})
+        return SimpleNamespace(prompt_queue=SimpleNamespace(
+            get_current_queue_volatile=lambda: ([item], []) if running else ([], [item])))
+
+    def test_outer_roots_in_running_queue_are_authoritative(self):
+        self.assertTrue(lifecycle.has_safe_execution_targets(self.server(['end']), 'owned', self.prompt))
+        for roots in (['op', 'end'], [], ['end', 'end'], None, [True]):
+            with self.subTest(roots=roots):
+                self.assertFalse(lifecycle.has_safe_execution_targets(self.server(roots), 'owned', self.prompt))
+        self.assertFalse(lifecycle.has_safe_execution_targets(self.server(['end']), 'other', self.prompt))
+        self.assertFalse(lifecycle.has_safe_execution_targets(self.server(['end'], running=False), 'owned', self.prompt))
+        self.assertFalse(lifecycle.has_safe_execution_targets(self.server(['end'], prompt={}), 'owned', self.prompt))
+
+    def test_prompt_marker_is_not_an_execution_guarantee(self):
+        self.prompt['start']['inputs']['image_list_explicit_targets'] = True
+        self.assertFalse(lifecycle.has_safe_execution_targets(self.server(['op', 'end']), 'owned', self.prompt))
+        with self.assertRaisesRegex(ValueError, 'must be placed after'):
+            runtime.create_master_job('start', 'end', self.prompt, [], [], '', master_participates=True)
+        self.assertEqual(runtime._MASTER_JOBS, {})
+
+    def test_start_node_uses_running_queue_proof(self):
+        import importlib.util
+        import sys
+        from pathlib import Path
+        from types import ModuleType
+        import torch
+
+        root = Path(__file__).resolve().parents[1]
+        package = '_image_list_start_targets'
+        modules = {}
+        for suffix in ('', '.nodes', '.image_list', '.utils'):
+            module = ModuleType(package + suffix)
+            module.__path__ = [str(root / suffix.lstrip('.'))]
+            modules[package + suffix] = module
+        modules[package + '.image_list.runtime'] = runtime
+        modules[package + '.image_list.lifecycle'] = lifecycle
+        modules[package + '.utils.async_helpers'] = SimpleNamespace(run_async_in_server_loop=None)
+        io = SimpleNamespace(ComfyNode=type('ComfyNode', (), {}), NodeOutput=lambda *args: args,
+                             **{name: object() for name in ('Image', 'Mask', 'String', 'Int', 'Float', 'Boolean')})
+        modules['comfy_api.v0_0_2'] = SimpleNamespace(io=io)
+        modules['comfy_execution.utils'] = SimpleNamespace(
+            get_executing_context=lambda: SimpleNamespace(prompt_id='owned'))
+        server = SimpleNamespace(PromptServer=SimpleNamespace(instance=self.server(['end'])))
+        modules['server'] = server
+        spec = importlib.util.spec_from_file_location(package + '.nodes.image_list', root / 'nodes/image_list.py')
+        node_module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, modules):
+            spec.loader.exec_module(node_module)
+            start = node_module.DistributedImageListStart
+            start.hidden = SimpleNamespace(prompt=self.prompt, unique_id='start')
+            result = start.execute(images=torch.zeros((1, 2, 2, 3)), image_list_master_participates=True)
+            context = result[3][0]
+            self.assertIsNotNone(runtime.get_master_job(context))
+            runtime.remove_master_job(context)
+            server.PromptServer.instance = self.server(['op', 'end'])
+            with self.assertRaisesRegex(ValueError, 'must be placed after'):
+                start.execute(images=torch.zeros((1, 2, 2, 3)), image_list_master_participates=True)
+        self.assertEqual(runtime._MASTER_JOBS, {})
+
+    def test_owned_target_controlled_start_can_create_job(self):
+        context = runtime.create_master_job('start', 'end', self.prompt, [], [], '',
+                                            master_participates=True, explicit_targets=True)
+        self.addCleanup(runtime.remove_master_job, context)
+        self.assertIsNotNone(runtime.get_master_job(context))
+
+
 class ImageListLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         with runtime._LOCK:

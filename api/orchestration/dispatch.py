@@ -77,6 +77,8 @@ async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
         "workflow": payload.get("workflow"),
         "client_id": client_id,
     }
+    if "partial_execution_targets" in payload:
+        ws_payload["partial_execution_targets"] = payload["partial_execution_targets"]
     ws_url = worker_url.replace("http://", "ws://").replace("https://", "wss://")
     ws_url = f"{ws_url}/distributed/worker_ws"
     session = await get_client_session()
@@ -128,11 +130,17 @@ async def dispatch_worker_prompt(
     use_websocket=False,
     trace_execution_id=None,
     return_prompt_id=False,
+    *,
+    partial_execution_targets=None,
 ):
     """Send the prepared prompt to a worker ComfyUI instance."""
     worker_url = build_worker_url(worker)
     url = build_worker_url(worker, "/prompt")
     payload = {"prompt": prompt_obj}
+    target_payload = {}
+    if partial_execution_targets is not None:
+        target_payload["partial_execution_targets"] = list(partial_execution_targets)
+        payload.update(target_payload)
     extra_data = {}
     if workflow_meta:
         extra_data.setdefault("extra_pnginfo", {})["workflow"] = workflow_meta
@@ -146,6 +154,7 @@ async def dispatch_worker_prompt(
                 {
                     "prompt": prompt_obj,
                     "workflow": workflow_meta,
+                    **target_payload,
                 },
                 client_id,
             )
@@ -179,7 +188,7 @@ async def dispatch_worker_prompt(
         return prompt_id if return_prompt_id else None
 
 
-async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0):
+async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0, *, require_value_results=False):
     """Require protocol/node support and report which direct workers are idle.
 
     This performs read-only GETs only; it never submits a prompt or contacts a
@@ -225,6 +234,18 @@ async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0):
                         f"Image-list worker {worker_id} is incompatible: requires protocol "
                         f"v{IMAGE_LIST_PROTOCOL_VERSION} and nodes "
                         f"{sorted(required_nodes)}; no work was submitted"
+                    )
+
+                if capability.get("execution_targets") is not True:
+                    raise RuntimeError(
+                        f"Image-list worker {worker_id} lacks explicit execution_targets support; "
+                        "upgrade that worker before running this feature; no work was submitted"
+                    )
+
+                if require_value_results and capability.get("value_results") is not True:
+                    raise RuntimeError(
+                        f"Image-list worker {worker_id} lacks explicit value_results support; "
+                        "upgrade that worker before using End overrides; no work was submitted"
                     )
 
                 check = "queue"

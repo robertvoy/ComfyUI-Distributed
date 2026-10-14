@@ -271,6 +271,74 @@ def _load_worker_routes_module():
 worker_routes = _load_worker_routes_module()
 
 
+class WebsocketExecutionTargetTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from test_async_helpers import _load_async_helpers_module
+        self.modules = patch.dict(sys.modules)
+        self.modules.start()
+        self.addCleanup(self.modules.stop)
+        self.helper, self.server = _load_async_helpers_module()
+        sys.modules['dist_api_worker_testpkg.utils.async_helpers'] = self.helper
+        self.prompt = {'9': {'class_type': 'Output'}, '10': {'class_type': 'Output'}}
+
+    async def receive(self, payload):
+        import json
+        sent = []
+        class Socket:
+            async def prepare(self, request):
+                pass
+            async def send_json(self, value):
+                sent.append(value)
+            def __aiter__(self):
+                async def messages():
+                    yield types.SimpleNamespace(type=worker_routes.aiohttp.WSMsgType.TEXT,
+                                                data=json.dumps(payload))
+                return messages()
+        with patch.object(worker_routes, 'web', types.SimpleNamespace(WebSocketResponse=lambda **kw: Socket())), \
+             patch.object(worker_routes, 'queue_prompt_payload', self.helper.queue_prompt_payload), \
+             patch.object(worker_routes, 'PromptValidationError', self.helper.PromptValidationError):
+            await worker_routes.worker_ws_endpoint(_FakeRequest())
+        return sent[0]
+
+    def payload(self, targets):
+        return {'type': 'dispatch_prompt', 'request_id': 'req', 'prompt': self.prompt,
+                'partial_execution_targets': targets}
+
+    async def test_explicit_targets_reach_queue_and_acknowledgement(self):
+        ack = await self.receive(self.payload(['9']))
+        self.assertTrue(ack['ok'], ack)
+        self.assertEqual(ack['request_id'], 'req')
+        self.assertEqual(self.server.prompt_queue.items[0][4], ['9'])
+
+    async def test_malformed_targets_and_messages_are_rejected(self):
+        for targets in (None, [], '9', [True], [9], ['absent'], ['9', '9']):
+            with self.subTest(targets=targets):
+                ack = await self.receive(self.payload(targets))
+                self.assertFalse(ack['ok'])
+                self.assertIn('partial_execution_targets', ack['error'])
+        self.assertFalse((await self.receive([]))['ok'])
+        self.assertEqual(self.server.prompt_queue.items, [])
+
+    async def test_validation_cannot_silently_queue_a_partial_subset(self):
+        ack = await self.receive(self.payload(['9', '10']))
+        self.assertFalse(ack['ok'])
+        self.assertEqual(ack['validation_error']['type'], 'partial_execution_targets_failed_validation')
+        self.assertEqual(self.server.prompt_queue.items, [])
+
+    async def test_missing_target_field_keeps_legacy_queue_call(self):
+        from unittest.mock import AsyncMock
+        queued = AsyncMock(return_value='legacy')
+        original = self.helper.queue_prompt_payload
+        self.helper.queue_prompt_payload = queued
+        try:
+            payload = self.payload(['9'])
+            payload.pop('partial_execution_targets')
+            self.assertTrue((await self.receive(payload))['ok'])
+            self.assertNotIn('partial_execution_targets', queued.call_args.kwargs)
+        finally:
+            self.helper.queue_prompt_payload = original
+
+
 class WorkerRoutesTests(unittest.IsolatedAsyncioTestCase):
     async def test_network_info_reports_actual_master_and_available_ports(self):
         with patch.object(worker_routes, "_get_cuda_info", return_value=(0, 1, 4)), \

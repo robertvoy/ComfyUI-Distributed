@@ -199,6 +199,73 @@ class MasterRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, 'worker|fallback'):
             self.rt.create_master_job('start', 'end', graph(), self.items, [], '')
 
+    async def test_values_reconstructed_in_source_order_without_transporting_originals(self):
+        self.workers.append({'id': 'remote', 'type': 'remote'})
+        context = self.create(count=6)
+        tensor = torch.ones(4, 2, 2, 3, dtype=torch.float64)
+        for index, item in enumerate(self.items):
+            item['values'].update(value_2=tensor, value_3=True, value_4=index / 8)
+        self.local_delay = 0.1  # Remote results arrive ahead of master item zero.
+        with patch.object(self.rt, 'encode_result', side_effect=AssertionError('originals must not return')):
+            result = await self.rt.run_image_list_job(context, include_values=True)
+        self.assertFalse(self.rt._MASTER_JOBS)
+        self.assertEqual(len(result), 4)
+        for index, row in enumerate(result[3]):
+            self.assertEqual(row['value_1'], str(index))
+            self.assertIs(row['value_2'], tensor)
+            self.assertIs(row['value_3'], True)
+            self.assertEqual(row['value_4'], index / 8)
+        self.assertTrue(self.dispatched and self.local_calls)
+
+    async def test_overrides_merge_add_and_recheck_capability_before_every_item(self):
+        self.workers.append({'id': 'remote', 'type': 'remote'})
+        context = self.create(participates=False, count=3)
+        self.state.original_prompt['end']['inputs'].update(value_1=['start', 4], value_10=['start', 2])
+        original_set = self.rt.set_master_result
+        def override(context, index, token, result):
+            result['values'] = {'value_1': f'new-{index}', 'value_10': index}
+            return original_set(context, index, token, result)
+        with patch.object(self.rt, 'set_master_result', side_effect=override):
+            result = await self.rt.run_image_list_job(context, include_values=True)
+        self.assertEqual(result[3], [{'value_1': f'new-{index}', 'value_10': index} for index in range(3)])
+        self.assertEqual(self.preflight.await_count, 4)
+        self.assertTrue(all(call.kwargs['require_value_results'] is True
+                            for call in self.preflight.await_args_list))
+        self.assertEqual(self.items[0]['values'], {'value_1': '0'})
+
+    async def test_override_capability_downgrade_stops_before_upload(self):
+        self.workers.append({'id': 'remote', 'type': 'remote'})
+        context = self.create(participates=False)
+        self.state.original_prompt['end']['inputs']['value_1'] = ['start', 4]
+        self.preflight.side_effect = [{'remote': True}, RuntimeError('value_results unsupported')]
+        with patch.object(self, 'post', wraps=self.post) as upload:
+            with self.assertRaisesRegex(RuntimeError, 'value_results'):
+                await self.rt.run_image_list_job(context, include_values=True)
+            upload.assert_not_called()
+        self.assertFalse(self.dispatched or self.rt._MASTER_JOBS)
+
+    async def test_missing_expected_override_fails_without_partial_output(self):
+        self.workers.append({'id': 'remote', 'type': 'remote'})
+        context = self.create(participates=False)
+        self.state.original_prompt['end']['inputs']['value_1'] = ['start', 4]
+        with self.assertRaisesRegex(ValueError, 'missing'):
+            await self.rt.run_image_list_job(context, include_values=True)
+        self.assertFalse(self.rt._MASTER_JOBS)
+
+    async def test_values_failure_and_cancellation_return_no_partial_lists(self):
+        self.local_error = RuntimeError('branch failed')
+        with self.assertRaisesRegex(RuntimeError, 'branch failed'):
+            await self.rt.run_image_list_job(self.create(), include_values=True)
+        self.local_error = None
+        self.local_started.clear()
+        self.local_delay = 0.1
+        task = asyncio.create_task(self.rt.run_image_list_job(self.create(), include_values=True))
+        await self.local_started.wait()
+        task.cancel()
+        with self.assertRaises(self.rt.ImageListCancelledError):
+            await task
+        self.assertFalse(self.rt._MASTER_JOBS)
+
     async def test_local_failure_surfaces_and_reclaims_staged_token(self):
         self.local_error = RuntimeError('local branch failed')
         with self.assertRaisesRegex(RuntimeError, 'local branch failed'):
@@ -373,6 +440,8 @@ def real_framework_probe(comfy_root):
             rt.remove_master_job(context)
 
         for behavior in ('normal', 'expand', 'error', 'cancel', 'interrupt', 'sync', 'already-interrupted'):
+            # Independent lifecycle cases start cold; retention is tested separately.
+            local._RETAINED_OUTPUTS = None
             mode[0] = behavior
             prompt['op']['class_type'] = 'Expanded' if behavior == 'expand' else 'Operation'
             loads.clear()

@@ -202,8 +202,10 @@ class ImageListGraphBoundaryTests(unittest.TestCase):
                     prompt["2"] = {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0]}}
                     prompt["7"] = {"class_type": "KSampler", "inputs": {"model": ["1", 0]}}
                 prompt["4"]["inputs"]["reference"] = ["2", 0]
-                with self.assertRaisesRegex(ValueError, "bypasses Start.*2"):
-                    validate_image_list_regions(prompt)
+                for explicit_targets in (False, True):
+                    with self.subTest(explicit_targets=explicit_targets):
+                        with self.assertRaisesRegex(ValueError, "bypasses Start.*2"):
+                            validate_image_list_regions(prompt, explicit_targets=explicit_targets)
 
     def test_shared_typed_loader_and_leaf_constant_remain_valid(self):
         import sys
@@ -247,19 +249,25 @@ class ImageListGraphBoundaryTests(unittest.TestCase):
     def test_rejects_missing_context_pair_nested_region_and_cross_boundary_branch(self):
         prompt = graph_one_region()
         prompt["5"]["inputs"]["context"] = ["2", 0]
-        with self.assertRaisesRegex(ValueError, "typed context output"):
-            validate_image_list_regions(prompt)
+        for explicit_targets in (False, True):
+            with self.subTest(explicit_targets=explicit_targets):
+                with self.assertRaisesRegex(ValueError, "typed context output"):
+                    validate_image_list_regions(prompt, explicit_targets=explicit_targets)
         nested = graph_one_region()
         nested["7"] = start_node(["4", 0])
         nested["8"] = {"class_type": "NestedOperation", "inputs": {"image": ["7", IMAGE_OUT]}}
         nested["5"]["inputs"]["images"] = ["8", 0]
         nested["9"] = {"class_type": END_CLASS, "inputs": {"images": ["8", 0], "context": ["7", CONTEXT_OUT]}}
-        with self.assertRaisesRegex(ValueError, "Nested/ambiguous"):
-            validate_image_list_regions(nested)
+        for explicit_targets in (False, True):
+            with self.subTest(explicit_targets=explicit_targets):
+                with self.assertRaisesRegex(ValueError, "Nested/ambiguous"):
+                    validate_image_list_regions(nested, explicit_targets=explicit_targets)
         outside = graph_one_region()
         outside["7"] = {"class_type": "PreviewImage", "inputs": {"images": ["3", IMAGE_OUT]}}
-        with self.assertRaisesRegex(ValueError, "cross-boundary"):
-            validate_image_list_regions(outside)
+        for explicit_targets in (False, True):
+            with self.subTest(explicit_targets=explicit_targets):
+                with self.assertRaisesRegex(ValueError, "cross-boundary"):
+                    validate_image_list_regions(outside, explicit_targets=explicit_targets)
 
     def test_rejects_duplicate_or_missing_results(self):
         prompt = graph_one_region()

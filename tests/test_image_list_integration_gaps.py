@@ -35,6 +35,15 @@ def load_routes():
     return module, routes
 
 
+class CapabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capability_advertises_target_control_without_tensor_protocol_bump(self):
+        module, _routes = load_routes()
+        response = await module.image_list_capabilities_endpoint(None)
+        payload = json.loads(response.text)
+        self.assertIs(payload['execution_targets'], True)
+        self.assertEqual(payload['protocol_version'], 2)
+
+
 class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.module, routes = load_routes()

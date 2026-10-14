@@ -1,4 +1,5 @@
 """Real-framework acceptance; opt in with COMFYUI_SOURCE_ROOT."""
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -33,5 +34,18 @@ def test_image_list_network_runtime():
     )
     assert result.returncode == 0, result.stdout + '\n' + result.stderr
     assert 'IMAGE_LIST_NETWORK_OK' in result.stdout
+    assert 'IMAGE_LIST_VALUES_OK' in result.stdout
     assert 'IMAGE_LIST_CANCEL_OK' in result.stdout
     assert 'IMAGE_LIST_MASTER_OK' in result.stdout
+    assert 'IMAGE_LIST_PREFLIGHT_OK' in result.stdout
+    assert 'IMAGE_LIST_SEQUENTIAL_OK' in result.stdout
+    assert 'IMAGE_LIST_FAILURE_OK' in result.stdout
+    reports = [json.loads(line.removeprefix('IMAGE_LIST_TARGETS_OK '))
+               for line in result.stdout.splitlines() if line.startswith('IMAGE_LIST_TARGETS_OK ')]
+    assert len(reports) == 1, result.stdout
+    assert reports[0] == {
+        'modes': ['delegate-only', 'mixed', 'master-only'],
+        'outer_targets': ['4', '5'], 'worker_targets': ['4'],
+        'required_utility_once_per_item': True, 'preview_discarded': True,
+        'saved_prompt_unchanged': True, 'capture_once_per_outer_prompt': True,
+    }

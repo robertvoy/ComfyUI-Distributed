@@ -52,7 +52,31 @@ Start outputs, in order: `image`, `mask`, `item_index` (zero-based), `context`, 
 
 Values that cannot be transported exactly (models, latents, conditioning and other objects) are rejected. Load models inside the region from a loader connected directly to the processing nodes, as described below.
 
-End accepts `images`, optional `masks` / `texts`, and `context`. It returns `image_list`, `masks`, and `texts` in original item order. Each job must produce exactly one image, at most one mask, and at most one text value. Unconnected optional outputs contain `None` entries.
+End accepts `images`, optional `masks` / `texts`, and `context`. Its first three outputs remain `image_list`, `masks`, and `texts` in original item order. Each job must produce exactly one image, at most one mask, and at most one text value. Unconnected optional mask/text outputs contain `None` entries.
+
+### Keep values through End without extra wires
+
+Start's existing **context** connection now also lets End recover each item's original `value_1` … `value_10`. You do not need to wire those values individually into End. Context remains a lightweight execution reference, not a general-purpose data pipe.
+
+End appends a **values** output (`DISTRIBUTED_IMAGE_LIST_VALUES`): one value bundle per image, in the same source order. Connect it to **Distributed Image List Get Value**, then choose `value_name` to extract the field you need. The getter preserves its type and ComfyUI maps it across the bundles, producing a list aligned with End's images. Missing fields fail clearly instead of producing empty placeholders.
+
+For example, to preserve filenames:
+
+```text
+filenames → Start.value_1
+                 Start.context ─────────────→ End.context
+                 Start.image → processing → End.images
+                                               ├─ image_list → Save.images
+                                               └─ values → Get Value [value_1] → Save.filename_prefix
+```
+
+**New or changed per-item values:** connect the calculated result to End's optional `value_N` input. It replaces the original field with that number, or adds it if Start did not supply it. Every connected override must produce exactly one supported value for each item. A tensor batch remains one value, just as it does at Start. Image, mask, string, integer, float and boolean values are supported; arbitrary objects/models/latents and non-finite numbers are not.
+
+End shows override inputs progressively. Use **Add value override** to expose a later slot without connecting the earlier ones. Disconnecting an override never renumbers the other End fields: `value_3` always means `value_3`. Unlike Start's native Autogrow inputs, End overrides must keep these identities stable. Existing image/mask/text/context sockets and output indices are unchanged. If the frontend extension is unavailable, Python still declares all optional override inputs and the values output.
+
+Original values are retained on the master; workers only return explicitly connected overrides, avoiding a redundant return trip for unchanged reference images or other values. Overrides use the existing exact value transport and size limits. Selected workers must advertise `value_results: true` when overrides are requested, checked before execution and again at dispatch. Original-value passthrough alone does not require that additional capability.
+
+Values leaving the region must come from **End**, not directly from Start. To chain regions, extract an End value and connect it to the next Start's corresponding input. Values remain available downstream after End cleans up the execution context; they do not depend on a later lookup of expired job state.
 
 Models are loaded and cached on each processing participant, not serialized between machines. Connect loader outputs directly to the processing nodes. The master needs the region's model files when participating, as does each selected worker. The master still validates the prompt: it needs the relevant node definitions and any model-name/file availability required by their validation (including combo lists). This is not a model-free-master guarantee.
 
@@ -62,15 +86,29 @@ End's optional `texts` is a connection-only socket. For workflows saved before t
 
 File-based dependencies keep ComfyUI's `[output]` / `[temp]` root annotations and are read on the master. Their worker copies use separate content-addressed paths under `input/distributed-media/`; each worker's rewritten prompt is reused across items without reusing item tokens.
 
+## Native cache reuse
+
+Repeated items can reuse **ComfyUI's native processing cache** on the same participant. Start uses a deterministic identity of the exact image, optional mask, all supplied value slots and source index; tensor dtype, shape and bytes are preserved. Fresh job IDs, assignment tokens and callback addresses live at End, so they no longer invalidate otherwise unchanged upstream processing. End still validates the current assignment and delivers results in source order on every run.
+
+- Processing settings, seeds, links and node fingerprints still participate in ComfyUI's normal signatures. Changed content invalidates reuse; nodes that declare themselves noncacheable still run.
+- The master's private executor retains one native LRU output cache between successful slots, capped at **128 entries when retained**. An active graph may temporarily exceed that target; oversized generations are not retained. Failed or cancelled local slots do not seed reuse, and `--cache-none` disables the local output cache. Direct workers use their own configured native caches.
+- Cache hits are best-effort, not guaranteed: eviction, restarts, changed ordering/index, changed settings and assignment to a different worker can cause misses. There is no worker affinity, disk cache or separate completed-result store.
+- Reuse retains tensor/model references and can increase RAM/VRAM use; the entry cap is **not a byte limit**. Exact identity calculation also adds CPU hashing and, for GPU-resident inputs, a CPU copy.
+- Remote items are still uploaded. Each upload returns a worker-computed identity; if a compatible older worker does not return a valid identity, that assignment uses the legacy graph without stable-input reuse. A worker downgrade between items also falls back safely. Assignment expiry and current-item validation apply even when processing hits the cache.
+- Keep side-effect nodes outside the region when they must run on every submission. A cached processing node follows ordinary ComfyUI semantics and does not repeat its save/preview side effects; End's delivery and downstream saving still run.
+
 ## Scope and failure behavior
 
 - This version supports the master and direct workers, not Runpod serverless pools. Unsupported pools are excluded without contacting the provider for this job.
-- Worker eligibility is determined before execution and checked again before dispatch. Busy or transiently unreachable workers are excluded; healthy candidates can continue. Malformed capability/queue responses and incompatible versions fail explicitly. Workers joining later are not added to an already-running region.
+- Queue submission checks selected direct workers for reachability and feature compatibility, but does not freeze the worker list to that moment's idle snapshot. A selected worker busy with an earlier prompt remains a candidate for the queued run. Immediately before a region starts assigning images, its saved candidates are checked again: workers still busy or transiently unreachable are excluded; healthy idle candidates can continue. Malformed capability/queue responses and incompatible versions fail explicitly. Workers excluded by the initial reachability probe are not retained, and newly selected workers are not added to an already-queued run. Workers becoming free after the region starts are not added mid-region.
+- **Orchestrator Only** requires a selected, reachable, feature-compatible direct worker at submission, but can queue while all selected workers are busy. At region start it requires at least one idle compatible direct worker and fails if none are available; it never falls back to master processing. The queue response's `worker_count` counts saved remote candidates, not guaranteed execution-time participants.
 - Omitted worker IDs select enabled direct workers. Explicit IDs select the named configured direct workers, including disabled ones; an empty list stays empty, unknown IDs fail, and serverless workers are excluded. Local workers use the master's loopback callback; remote workers use its configured public address.
 - Only the enclosed processing is distributed. List creation and downstream saving run on the master in both modes. With participation enabled, the master is a normal scheduler participant and can run alone when no direct workers are available. **Orchestrator-only mode never silently falls back to master processing.** Failed items are not reassigned automatically.
 - Local items execute while the enclosing master prompt waits; they are not queued behind that prompt on the master's `/prompt` queue. The enclosed branch is not also evaluated as a full list by the outer prompt.
 - Start/End regions may be chained sequentially and share model-loader dependencies. Nested/overlapping per-image regions and data escaping a region without End are rejected. Collector and distributed-upscaler nodes cannot be mixed into the same prompt in this first version.
-- Output nodes inside a region are rejected because ComfyUI would execute them independently on the master. Avoid other side-effecting processing nodes as well; save after End.
+- Queue preparation works on an execution copy, leaving the saved canvas unchanged. Unused per-item preview/save branches are pruned by dependency reachability, not node names. Required computational utilities marked `OUTPUT_NODE` stay in the graph; explicit `partial_execution_targets` prevent them from also becoming independent outer-master roots. End and legitimate post-End or unrelated outputs are retained. Bypass/rejoin branches still fail boundary validation rather than being silently removed.
+- Every selected worker must advertise `execution_targets: true` as well as the existing image-list protocol. Older workers fail preflight before dispatch. Both HTTP and WebSocket item submissions target End only; the participating master uses its existing End-only local executor. Submit through `/distributed/queue`: an ordinary all-output `/prompt` request does not receive this relaxation.
+- **Target selection is not a sandbox.** A required utility still runs its own save, preview or other side effects when it executes for an item. Keep intentional final saving after End.
 - The entire input list is materialized before scheduling; this is not streaming input. The limit is 4,096 frames. Remote transport preserves floating-point tensor dtype and values rather than encoding to lossy images. Each transported tensor is limited to 50 MiB, and the complete JSON/base64 HTTP request to 101 MiB; image/mask/value combinations can hit the aggregate request limit first. In-process master items use tensors directly and are not subject to those HTTP limits.
 - Results are accepted once per item using assignment tokens. Missing, duplicate, malformed and wrong-index results fail rather than silently returning a partial list. No failed or ambiguous submission is retried automatically.
 - Worker errors fail the region. The worker timeout measures loss of evidence for the owned prompt ID, not maximum render duration. Pending/running evidence refreshes liveness; unrelated busy jobs and failed polls do not. Healthy cold loads and long renders can continue.
@@ -89,7 +127,7 @@ Use trusted workers and trusted workflows, as with the existing ComfyUI API. Cap
 
 ## Verification
 
-The generic acceptance helper starts two isolated loopback worker test servers and uses actual CPU ComfyUI `PromptExecutor` instances. Production queue preparation, list nodes, graph extraction, HTTP item/result routes, dynamic scheduling, float transport, ordering and cancellation are exercised. The harness checks orchestrator-only, mixed master/worker and master-only execution, including exact-once item assignment, source-once materialization and cached local model-loader dependencies. The lightweight queue/history facade is test code; no managed ComfyUI service or model is started.
+The generic acceptance helper starts two isolated loopback workers using real ComfyUI HTTP handlers, `PromptQueue` records and CPU `PromptExecutor` instances. Production queue preparation, list nodes, graph extraction, HTTP item/result routes, dynamic scheduling, float transport, ordering and cancellation are exercised. The harness checks orchestrator-only, mixed master/worker and master-only execution, including exact-once required output utilities, discarded previews, unchanged source graphs, End-only worker roots, post-End capture, source-once materialization and cached local model-loader dependencies. WebSocket target propagation is covered by focused route/dispatch tests. No managed ComfyUI service or model is started.
 
 ```bash
 COMFYUI_SOURCE_ROOT=/path/to/ComfyUI /path/to/ComfyUI/.venv/bin/python -m pytest tests -q

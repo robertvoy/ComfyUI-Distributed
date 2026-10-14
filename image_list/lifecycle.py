@@ -14,6 +14,38 @@ DEFAULT_ORPHAN_GRACE_SECONDS = 300.0
 _LIFECYCLE_MARKER = object()
 
 
+def has_safe_execution_targets(prompt_server: Any, prompt_id: str | None, prompt: dict) -> bool:
+    """Prove outer roots from the running queue, not a forgeable prompt marker.
+
+    Plain /prompt remains strict when ComfyUI selected all outputs, including a
+    flagged per-item dependency. No saved workflow field grants this exemption.
+    """
+    if not prompt_id:
+        return False
+    from .execution_plan import prepare_image_list_execution
+    prepared, targets = prepare_image_list_execution(prompt)
+    if prepared != prompt or not targets:
+        return False
+    queue = getattr(prompt_server, "prompt_queue", None)
+    for name in ("get_current_queue_volatile", "get_current_queue"):
+        reader = getattr(queue, name, None)
+        if not callable(reader):
+            continue
+        try:
+            running, _pending = reader()
+            for entry in running:
+                if (isinstance(entry, (tuple, list)) and len(entry) > 4
+                        and entry[1] == prompt_id and entry[2] == prompt):
+                    roots = entry[4]
+                    return (isinstance(roots, (list, tuple))
+                            and all(isinstance(root, str) for root in roots)
+                            and len(roots) == len(targets) and set(roots) == set(targets))
+            return False
+        except Exception:
+            continue
+    return False
+
+
 def _queue_prompt_ids(prompt_server: Any) -> set[str]:
     """Read running/pending prompt IDs, preferring ComfyUI's volatile view."""
     queue = getattr(prompt_server, "prompt_queue", None)
