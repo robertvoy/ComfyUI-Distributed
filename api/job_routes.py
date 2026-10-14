@@ -136,7 +136,9 @@ def _decode_canonical_png_tensor(image_payload):
 
     try:
         with Image.open(io.BytesIO(png_bytes)) as img:
-            img = img.convert("RGB")
+            # PNG callbacks must retain alpha just like local IMAGE tensors.
+            has_alpha = "A" in img.getbands() or "transparency" in img.info
+            img = img.convert("RGBA" if has_alpha else "RGB")
             tensor = pil_to_tensor(img)
         return ensure_contiguous(tensor)
     except Exception as exc:

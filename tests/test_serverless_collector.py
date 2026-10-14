@@ -56,7 +56,7 @@ def test_serverless_pending_waits_past_normal_worker_timeout():
         queue.put_nowait({
             "worker_id": participant,
             "image_index": 0,
-            "tensor": torch.ones(1, 2, 2, 2),
+            "tensor": torch.ones(1, 2, 2, 3),
             "is_last": True,
         })
 
@@ -74,7 +74,7 @@ def test_serverless_pending_waits_past_normal_worker_timeout():
 
     images, _audio = asyncio.run(run_collection())
 
-    assert tuple(images.shape) == (1, 2, 2, 2)
+    assert tuple(images.shape) == (1, 2, 2, 3)
     assert manager.pending_calls
     assert probe_calls == []
     assert job_id not in module.prompt_server.distributed_pending_jobs
@@ -162,12 +162,12 @@ def test_serverless_tensor_shape_mismatch_raises_instead_of_silent_fallback():
     queue.put_nowait({
         "worker_id": "serverless:pool:1",
         "image_index": 0,
-        "tensor": torch.ones(1, 3, 2, 2),
+        "tensor": torch.ones(1, 3, 2, 3),
         "is_last": True,
     })
     manager = _FakeManager()
     collector = _set_up_collector(module, job_id, queue, manager)
-    local_images = torch.zeros(1, 2, 2, 2)
+    local_images = torch.zeros(1, 2, 2, 3)
 
     with pytest.raises(RuntimeError, match="serverless.*shape|shape.*serverless"):
         asyncio.run(collector.execute(
@@ -188,7 +188,7 @@ def test_regular_worker_timeout_keeps_partial_behavior_without_creating_manager(
     collector = _set_up_collector(module, job_id, queue)
     module.get_worker_timeout_seconds = lambda: 0.01
     module.HEARTBEAT_INTERVAL = 0.1
-    local_images = torch.zeros(1, 2, 2, 2)
+    local_images = torch.zeros(1, 2, 2, 3)
     collector._get_serverless_manager = lambda *_args, **_kwargs: pytest.fail("regular collection must not create manager")
 
     images, _audio = asyncio.run(collector.execute(

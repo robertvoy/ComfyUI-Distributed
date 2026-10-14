@@ -405,12 +405,40 @@ def test_exact_collector_rejects_old_worker_8bit_result(transport, monkeypatch, 
 def test_exact_collector_shape_mismatch_raises_instead_of_returning_local_images(transport, monkeypatch):
     async def scenario():
         async with endpoint(transport, monkeypatch) as ctx:
-            await send(ctx, frames(count=1, channels=4))
-            with pytest.raises(RuntimeError, match="shape|combin|mismatch"):
+            # Channel mixing is supported; incompatible spatial sizes still fail.
+            await send(ctx, frames(count=1, channels=4, width=10))
+            with pytest.raises(RuntimeError, match="spatial dimensions"):
                 await ctx.node.execute(
                     frames(count=1, channels=3), None, multi_job_id=JOB_ID,
                     enabled_worker_ids=json.dumps([WORKER_ID]), transfer_format="exact",
                 )
+            assert JOB_ID not in transport.server.distributed_pending_jobs
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("local_channels,worker_channels", [(3, 4), (4, 3)])
+def test_exact_collector_mixed_rgb_rgba_preserves_every_value(transport, monkeypatch, local_channels, worker_channels):
+    local = frames(count=1, channels=local_channels)
+    worker = frames(count=1, channels=worker_channels)
+
+    async def scenario():
+        async with endpoint(transport, monkeypatch) as ctx:
+            await send(ctx, worker)
+            result, _audio = await ctx.node.execute(
+                local, None, multi_job_id=JOB_ID,
+                enabled_worker_ids=json.dumps([WORKER_ID]), transfer_format="exact",
+            )
+            assert result.shape == (2, 7, 9, 4)
+            assert result.is_contiguous()
+            # RGB views into RGBA have a four-channel stride; materialize the
+            # sliced comparison without changing the output-contiguity check.
+            assert_exact(result[:1, ..., :local_channels].contiguous(), local)
+            assert_exact(result[1:, ..., :worker_channels].contiguous(), worker)
+            if local_channels == 3:
+                assert torch.all(result[:1, ..., 3] == 1)
+            if worker_channels == 3:
+                assert torch.all(result[1:, ..., 3] == 1)
             assert JOB_ID not in transport.server.distributed_pending_jobs
 
     asyncio.run(scenario())

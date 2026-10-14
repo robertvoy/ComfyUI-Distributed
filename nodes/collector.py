@@ -121,6 +121,46 @@ class DistributedCollectorNode:
             return value[0]
         return value
 
+    @staticmethod
+    def _combine_image_tensors(tensors, sources):
+        """Validate BHWC batches, retaining alpha and deterministic input order."""
+        nonempty = []
+        reference_shape = None
+        reference_source = None
+        for tensor, source in zip(tensors, sources):
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"Collector expected an IMAGE tensor from {source}")
+            shape = tuple(tensor.shape)
+            if tensor.ndim != 4 or shape[-1] not in (1, 3, 4) or min(shape[1:3]) <= 0:
+                raise ValueError(
+                    f"Collector received invalid IMAGE shape {shape} from {source}; "
+                    "expected [B, H, W, C] with 1, 3, or 4 channels"
+                )
+            # Empty master placeholders must not determine the worker image grid.
+            if shape[0] == 0:
+                continue
+            if reference_shape is None:
+                reference_shape, reference_source = shape, source
+            elif shape[1:3] != reference_shape[1:3]:
+                raise ValueError(
+                    "Collector cannot combine images with different spatial dimensions: "
+                    f"{reference_source} has shape {reference_shape}; {source} has shape {shape}"
+                )
+            nonempty.append(tensor)
+        if not nonempty:
+            raise ValueError("Collector cannot return an empty image batch")
+
+        channels = max(tensor.shape[-1] for tensor in nonempty)
+        normalized = []
+        for tensor in nonempty:
+            if tensor.shape[-1] == 1 and channels > 1:
+                tensor = tensor.expand(-1, -1, -1, 3)
+            if tensor.shape[-1] == 3 and channels == 4:
+                # RGB is opaque; never discard alpha from another participant.
+                tensor = torch.cat((tensor, torch.ones_like(tensor[..., :1])), dim=-1)
+            normalized.append(ensure_contiguous(tensor))
+        return ensure_contiguous(torch.cat(normalized, dim=0))
+
     def _normalize_images_input(self, images):
         """Collapse ComfyUI list IMAGE inputs into a normal batched IMAGE tensor."""
         if isinstance(images, (list, tuple)):
@@ -130,7 +170,9 @@ class DistributedCollectorNode:
                 raise TypeError("Collector expected IMAGE list items to be torch.Tensor instances")
             if len(images) == 1:
                 return ensure_contiguous(images[0])
-            return ensure_contiguous(torch.cat([ensure_contiguous(image) for image in images], dim=0))
+            return self._combine_image_tensors(
+                images, [f"IMAGE list item {index}" for index in range(len(images))]
+            )
         return ensure_contiguous(images)
 
     def _normalize_audio_input(self, audio):
@@ -624,9 +666,11 @@ class DistributedCollectorNode:
     ):
         """Assemble final tensor, or return None when the job contains only audio."""
         ordered_tensors = []
+        sources = []
         if not delegate_mode and images_on_cpu is not None:
             for i in range(master_batch_size):
                 ordered_tensors.append(images_on_cpu[i:i+1])
+                sources.append(f"master image {i}")
 
         ordered_worker_ids = [str(worker_id) for worker_id in (worker_order or [])]
         seen = set()
@@ -636,6 +680,7 @@ class DistributedCollectorNode:
                 continue
             for idx in sorted(worker_images[worker_id_str].keys()):
                 ordered_tensors.append(worker_images[worker_id_str][idx])
+                sources.append(f"worker {worker_id_str!r} image {idx}")
 
         # Append any unexpected worker ids deterministically.
         for worker_id_str in sorted(worker_images.keys()):
@@ -643,6 +688,7 @@ class DistributedCollectorNode:
                 continue
             for idx in sorted(worker_images[worker_id_str].keys()):
                 ordered_tensors.append(worker_images[worker_id_str][idx])
+                sources.append(f"worker {worker_id_str!r} image {idx}")
 
         cpu_tensors = []
         for t in ordered_tensors:
@@ -652,9 +698,9 @@ class DistributedCollectorNode:
             cpu_tensors.append(t)
 
         if cpu_tensors:
-            return ensure_contiguous(torch.cat(cpu_tensors, dim=0))
+            return self._combine_image_tensors(cpu_tensors, sources)
         if fallback_images is not None:
-            return ensure_contiguous(fallback_images)
+            return self._combine_image_tensors([fallback_images], ["master fallback"])
         return None
 
     async def execute(self, images, audio, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False, transfer_format=transfer_codec.DEFAULT_TRANSFER_FORMAT, transfer_quality=transfer_codec.DEFAULT_TRANSFER_QUALITY):
@@ -944,8 +990,9 @@ class DistributedCollectorNode:
                             f"{sorted(worker_images)}: {e}"
                         ) from e
                     log(f"Master - Error combining images: {e}")
-                    # Preserve collected audio for regular workers when image assembly fails.
-                    return (images, combined_audio)
+                    # Do not silently discard worker images or pass an empty
+                    # fallback batch downstream to SaveImage.
+                    raise
             except BaseException:
                 # Remove the queue first, preventing cancelled work from delivering into
                 # a collector that is already unwinding.
