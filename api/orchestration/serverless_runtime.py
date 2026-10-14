@@ -146,6 +146,10 @@ class ServerlessManager:
 
     async def start(self, execution_id, prompt_id, prepared_jobs):
         self.ensure_capacity(len(prepared_jobs))
+        from .serverless_typed_results import validate_prepared_job
+        # Validate the entire batch before creating even the first local slot.
+        for prepared in prepared_jobs:
+            validate_prepared_job(prepared)
         new_runs = []
         # Journal every local slot before starting any billed submission.
         for prepared in prepared_jobs:
@@ -177,14 +181,30 @@ class ServerlessManager:
         return any(run["worker"]["id"] == participant_id and
                    any(m["job_id"] == collector_job_id for m in run["manifest"]) for run in self.runs.values())
 
-    async def _deliver(self, run, images=None, error=None):
-        async with self.server.distributed_jobs_lock:
+    async def _deliver(self, run, images=None, error=None, *, media=None):
+        if media is not None and not error:
+            # Validate all destinations before exposing any partial success.
             for binding in run["manifest"]:
+                if binding["participant_id"] != run["worker"]["id"]:
+                    raise ValueError("Serverless media participant identity mismatch")
+                values = media[binding["job_id"]][binding["socket"]]
+                if not isinstance(values, list) or not values:
+                    raise ValueError("Missing serverless media values")
+        async with self.server.distributed_jobs_lock:
+            delivered = set()
+            for binding in run["manifest"]:
+                job_id = binding["job_id"]
+                if error or media is not None:
+                    if job_id in delivered:
+                        continue
+                    delivered.add(job_id)
                 queue = self.server.distributed_pending_jobs.get(binding["job_id"])
                 if queue is None:
                     continue  # A cancelled/finished collector must never be resurrected.
                 if error:
                     queue.put_nowait({"worker_id": run["worker"]["id"], "serverless_error": error, "is_last": True})
+                elif media is not None:
+                    queue.put_nowait({"worker_id": run["worker"]["id"], "media": media[job_id], "is_last": True})
                 else:
                     batch = images[binding["job_id"]]
                     for index, tensor in enumerate(batch):
@@ -218,13 +238,18 @@ class ServerlessManager:
         submitted = False
         provider_terminal = False
         try:
+            from .serverless_typed_results import validate_prepared_job, collect_typed_results
+            typed = validate_prepared_job(run)
             async with asyncio.timeout(max(0, run["deadline"] - time.monotonic())):
                 async with semaphore:
                     await self._reserve_provider_capacity(run)
                     client = await self._client(run["worker"])
                     run["client"] = client
                     submitted = True
-                    job_id = await client.submit(run["workflow"], run["images"], run["worker"]["timeout_seconds"])
+                    if typed:
+                        job_id = await client.submit(run["workflow"], run["images"], run["worker"]["timeout_seconds"], media=run["media"])
+                    else:
+                        job_id = await client.submit(run["workflow"], run["images"], run["worker"]["timeout_seconds"])
                     run["provider_job_id"] = job_id
                     # Persist immediately: all subsequent actions use this exact ID.
                     self.ledger.update(rid, job_id=job_id, status="IN_QUEUE", updated_at=time.time())
@@ -240,8 +265,12 @@ class ServerlessManager:
                             if not isinstance(output, dict) or output.get("error") or output.get("errors"):
                                 raise RunpodError("Serverless workflow reported an output error; inspect the provider job")
                             self.ledger.update(rid, status="DOWNLOADING", updated_at=time.time())
-                            images = await decode_results(output, run["manifest"])
-                            await self._deliver(run, images=images)
+                            if typed:
+                                media = await collect_typed_results(output, run["media"], run["manifest"])
+                                await self._deliver(run, media=media)
+                            else:
+                                images = await decode_results(output, run["manifest"])
+                                await self._deliver(run, images=images)
                             self.ledger.update(rid, status="COMPLETED", updated_at=time.time())
                             return
                         self.ledger.update(rid, status=status, updated_at=time.time())
@@ -276,6 +305,7 @@ class ServerlessManager:
             # base64 inputs, workflow metadata, or a client holding credentials.
             run.pop("workflow", None)
             run.pop("images", None)
+            run.pop("media", None)
             run["client"] = None
             # A released local semaphore alone cannot release a durable reservation.
             await self._notify_capacity()
@@ -359,6 +389,7 @@ class ServerlessManager:
                         self.ledger.update(rid, status="CANCELLED", updated_at=time.time())
                         run.pop("workflow", None)
                         run.pop("images", None)
+                        run.pop("media", None)
                         await self._deliver(run, error="Serverless job cancelled before submission")
                     continue
                 # Do not send two cancellation requests for the same live job in

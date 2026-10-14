@@ -4,6 +4,9 @@ import { cancelWorkerSettings, deleteWorker, isRemoteWorker, saveWorkerSettings,
 export const IMAGES_PER_RUN_TOOLTIP =
     "Separate Runpod jobs submitted each run, all at once. Runpod's max workers decides how many GPUs actually run them.";
 
+const MEDIA_PROFILE_TOOLTIP =
+    "Select Typed media v1 only after installing the ComfyUI-Distributed endpoint bridge. This declares bridge support; endpoint health checks do not auto-detect it. The v1 schema, media formats and limits are fixed.";
+
 export function createWorkerSettingsForm(ui, extension, worker) {
     const form = document.createElement("div");
     form.style.cssText = "display: flex; flex-direction: column; gap: 8px;";
@@ -59,6 +62,7 @@ export function createWorkerSettingsForm(ui, extension, worker) {
         const portInput = portGroup.input;
         const serverlessGroups = [
             endpointGroup.group,
+            mediaProfileGroup,
             apiKeyGroup.group,
             clearApiKeyGroup,
             jobsPerRunGroup.group,
@@ -136,6 +140,32 @@ export function createWorkerSettingsForm(ui, extension, worker) {
     endpointGroup.group.id = `endpoint-id-group-${worker.id}`;
     endpointGroup.group.style.display = "none";
     form.appendChild(endpointGroup.group);
+
+    const mediaProfileGroup = document.createElement("div");
+    mediaProfileGroup.id = `media-profile-group-${worker.id}`;
+    mediaProfileGroup.style.cssText = "display: none; flex-direction: column; gap: 4px;";
+    mediaProfileGroup.title = MEDIA_PROFILE_TOOLTIP;
+    const mediaProfileLabel = document.createElement("label");
+    mediaProfileLabel.htmlFor = `media-profile-${worker.id}`;
+    mediaProfileLabel.textContent = "Endpoint media profile";
+    mediaProfileLabel.style.cssText = typeLabel.style.cssText;
+    const mediaProfileSelect = document.createElement("select");
+    mediaProfileSelect.id = mediaProfileLabel.htmlFor;
+    mediaProfileSelect.style.cssText = typeSelect.style.cssText;
+    mediaProfileSelect.title = MEDIA_PROFILE_TOOLTIP;
+    for (const [value, label] of [
+        ["legacy-image-v1", "Legacy images (existing handler)"],
+        ["comfy-media-v1", "Typed media v1 (requires endpoint bridge)"],
+    ]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        mediaProfileSelect.appendChild(option);
+    }
+    mediaProfileSelect.value = worker.media_profile ?? "legacy-image-v1";
+    mediaProfileGroup.appendChild(mediaProfileLabel);
+    mediaProfileGroup.appendChild(mediaProfileSelect);
+    form.appendChild(mediaProfileGroup);
 
     const apiKeyGroup = ui.createFormGroup("Runpod API Key (write-only):", "", `api-key-${worker.id}`, "password", worker.api_key_configured ? "Leave blank to keep saved API key" : "Runpod API key");
     apiKeyGroup.group.id = `api-key-group-${worker.id}`;

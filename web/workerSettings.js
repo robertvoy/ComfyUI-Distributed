@@ -61,6 +61,7 @@ function showServerlessValidationError(extension, detail) {
 
 async function saveServerlessWorkerSettings(extension, worker, workerId, name) {
     const endpointId = normalizeRunpodEndpointId(document.getElementById(`endpoint-id-${workerId}`).value);
+    const mediaProfile = document.getElementById(`media-profile-${workerId}`).value;
     const apiKey = document.getElementById(`api-key-${workerId}`).value || "";
     const clearApiKey = Boolean(document.getElementById(`clear-api-key-${workerId}`).checked);
     const jobsPerRun = Number(document.getElementById(`jobs-per-run-${workerId}`).value);
@@ -81,6 +82,10 @@ async function saveServerlessWorkerSettings(extension, worker, workerId, name) {
         );
         return;
     }
+    if (!["legacy-image-v1", "comfy-media-v1"].includes(mediaProfile)) {
+        showServerlessValidationError(extension, "Select a supported endpoint media profile");
+        return;
+    }
     if (!Number.isInteger(jobsPerRun) || jobsPerRun < 1 || jobsPerRun > 16) {
         showServerlessValidationError(extension, "Images per run must be a whole number from 1 to 16");
         return;
@@ -95,6 +100,7 @@ async function saveServerlessWorkerSettings(extension, worker, workerId, name) {
         type: "serverless",
         provider: "runpod",
         endpoint_id: endpointId,
+        media_profile: mediaProfile,
         ...(apiKey.length > 0 && !clearApiKey ? { api_key: apiKey } : {}),
         ...(clearApiKey ? { clear_api_key: true } : {}),
         jobs_per_run: jobsPerRun,
@@ -111,6 +117,7 @@ async function saveServerlessWorkerSettings(extension, worker, workerId, name) {
         worker.type = "serverless";
         worker.provider = "runpod";
         worker.endpoint_id = endpointId;
+        worker.media_profile = mediaProfile;
         worker.jobs_per_run = jobsPerRun;
         // Replaced by a fixed backend limit; drop any value loaded from an older config.
         delete worker.concurrency;
@@ -310,6 +317,7 @@ export async function saveWorkerSettings(extension, workerId) {
         // Update local config
         worker.name = name.trim();
         worker.type = workerType;
+        delete worker.media_profile;
         if (isRemote) {
             worker.host = hostTrimmed;
             delete worker.cuda_device;
@@ -366,6 +374,8 @@ export function cancelWorkerSettings(extension, workerId) {
         document.getElementById(`args-${workerId}`).value = worker.extra_args || "";
         const endpointInput = document.getElementById(`endpoint-id-${workerId}`);
         if (endpointInput) endpointInput.value = worker.endpoint_id || "";
+        const mediaProfileInput = document.getElementById(`media-profile-${workerId}`);
+        if (mediaProfileInput) mediaProfileInput.value = worker.media_profile ?? "legacy-image-v1";
         const apiKeyInput = document.getElementById(`api-key-${workerId}`);
         if (apiKeyInput) {
             apiKeyInput.value = "";

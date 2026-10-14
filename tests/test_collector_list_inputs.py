@@ -4,6 +4,7 @@ import types
 import asyncio
 from pathlib import Path
 
+import pytest
 import torch
 
 
@@ -19,6 +20,13 @@ def _register_real_transfer_codec(package_name, utils_pkg):
 
 
 def _load_collector_module():
+    # Restore shared dependencies even when a different test imports this loader.
+    # Keep real modules imported during loading (notably extension modules) cached.
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        return _load_collector_module_with_stubs(monkeypatch)
+
+
+def _load_collector_module_with_stubs(monkeypatch):
     module_path = Path(__file__).resolve().parents[1] / "nodes" / "collector.py"
     package_name = "dist_collector_list_testpkg"
 
@@ -53,7 +61,7 @@ def _load_collector_module():
     )
     server_module = types.ModuleType("server")
     server_module.PromptServer = types.SimpleNamespace(instance=prompt_server)
-    sys.modules["server"] = server_module
+    monkeypatch.setitem(sys.modules, "server", server_module)
 
     comfy_module = types.ModuleType("comfy")
     model_management = types.ModuleType("comfy.model_management")
@@ -77,13 +85,13 @@ def _load_collector_module():
 
     comfy_utils.ProgressBar = ProgressBar
     comfy_module.utils = comfy_utils
-    sys.modules["comfy"] = comfy_module
-    sys.modules["comfy.model_management"] = model_management
-    sys.modules["comfy.utils"] = comfy_utils
+    monkeypatch.setitem(sys.modules, "comfy", comfy_module)
+    monkeypatch.setitem(sys.modules, "comfy.model_management", model_management)
+    monkeypatch.setitem(sys.modules, "comfy.utils", comfy_utils)
 
     aiohttp_module = types.ModuleType("aiohttp")
     aiohttp_module.ClientTimeout = lambda total: types.SimpleNamespace(total=total)
-    sys.modules["aiohttp"] = aiohttp_module
+    monkeypatch.setitem(sys.modules, "aiohttp", aiohttp_module)
 
     logging_module = types.ModuleType(f"{package_name}.utils.logging")
     logging_module.debug_log = lambda *_args, **_kwargs: None

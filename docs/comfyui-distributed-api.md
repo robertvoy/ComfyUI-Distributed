@@ -141,13 +141,16 @@ Also, for collector-based flows:
 
 ## Endpoint: `POST /distributed/job_complete`
 
-Submit one completed worker image back to the master collector queue.
+Submit direct-worker image/audio results to the master Collector queue. The route
+accepts canonical JSON completions or multipart image chunks, including opt-in
+exact floating-point IMAGE transport. Serverless typed results use their separate
+bridge/provider contract.
 
 ### URL
 
 - `http://<master-host>:<master-port>/distributed/job_complete`
 
-### Request Body
+### JSON request body
 
 ```json
 {
@@ -164,13 +167,35 @@ Submit one completed worker image back to the master collector queue.
 - `job_id` (string, required)
 - `worker_id` (string, required)
 - `batch_idx` (integer >= 0, required)
-- `image` (string, required)
+- `image` (string, optional if `audio` is present)
   - PNG payload as either:
     - data URL: `data:image/png;base64,...`
     - raw base64 PNG bytes
 - `is_last` (boolean, required)
 
-Legacy multipart/tensor payload formats are no longer accepted on this endpoint.
+At least one of `image` or `audio` must be present. Optional `audio` is an object
+with `sample_rate` (positive integer), `shape` (`[batch, channels, samples]`),
+`dtype: "float32"`, and `data` (base64 waveform bytes). Audio-only completions
+still include `batch_idx`; the Collector uses `0` and `is_last: true`.
+
+### Multipart image chunks
+
+Send `multipart/form-data` with a JSON `envelope` field and repeated binary
+`media` file fields. The envelope contains `job_id`, `worker_id`, `format`,
+`start_index` (nonnegative integer), `count`, `width`, `height`, `is_last`, and
+optional canonical `audio`.
+
+- `png`, `jpeg`, `webp`: one `media` part per frame.
+- `ffv1`, `h264`, `h265` (experimental), `av1`: one video part per chunk.
+- `exact`: one raw tensor part per frame and an envelope `descriptors` list with
+  one `tensor-le-v1` IMAGE descriptor per part. Each descriptor shape must be
+  `[1, height, width, channels]`; decoding preserves supported float dtype and
+  values instead of quantizing to 8-bit.
+
+`legacy_png` uses JSON, not multipart. Exact transport requires support on both
+sides and never retries as an 8-bit format when an older master rejects it.
+See [result transfer](compressed-result-transfer.md) for format controls,
+non-exact compatibility fallbacks and request limits.
 
 ### CORS note
 

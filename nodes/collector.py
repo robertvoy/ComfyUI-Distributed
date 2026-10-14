@@ -27,6 +27,39 @@ def _encode_all_chunks(frames, fmt, quality, max_chunk_bytes, max_frame_bytes):
     return list(transfer_codec.encode_chunks(frames, fmt, quality, max_chunk_bytes, max_frame_bytes))
 
 
+def _exact_frame_bytes(image_batch):
+    """Wire size of one exact frame, computed from shape/dtype before encoding."""
+    from ..serverless_bridge import codec as bridge_codec
+    if not isinstance(image_batch, torch.Tensor) or image_batch.layout != torch.strided or image_batch.is_nested:
+        raise transfer_codec.TransferCodecError("exact transfer requires a dense IMAGE tensor")
+    if image_batch.dtype not in bridge_codec._DTYPE_NAMES:
+        raise transfer_codec.TransferCodecError(f"exact transfer does not support dtype {image_batch.dtype}")
+    if image_batch.ndim != 4:
+        raise transfer_codec.TransferCodecError(
+            f"Expected IMAGE tensor [B,H,W,C], got shape {tuple(image_batch.shape)}")
+    batch, height, width, channels = (int(value) for value in image_batch.shape)
+    if min(batch, height, width) <= 0 or channels not in (1, 3, 4):
+        raise transfer_codec.TransferCodecError("exact IMAGE dimensions must be positive with 1, 3 or 4 channels")
+    size = height * width * channels * image_batch.element_size()
+    if size > bridge_codec.MAX_PAYLOAD_BYTES:
+        raise transfer_codec.FrameTooLargeError("exact frame exceeds the tensor codec byte limit")
+    return size
+
+
+def _encode_exact_frames(frames):
+    """Encode [1,H,W,C] CPU slices losslessly (runs in an executor)."""
+    from ..serverless_bridge import codec as bridge_codec
+    descriptors, parts = [], []
+    for frame in frames:
+        try:
+            descriptor, payload = bridge_codec.encode_payload("IMAGE", frame)
+        except ValueError as exc:
+            raise transfer_codec.TransferCodecError(f"exact transfer cannot encode this IMAGE: {exc}") from None
+        descriptors.append(descriptor)
+        parts.append(payload)
+    return descriptors, parts
+
+
 class DistributedCollectorNode:
     INPUT_IS_LIST = True
     EMPTY_AUDIO = {"waveform": torch.zeros(1, 2, 1), "sample_rate": 44100}
@@ -200,6 +233,10 @@ class DistributedCollectorNode:
         """Send an image batch, optionally with audio, or an audio-only completion."""
         batch_size = 0 if image_batch is None else image_batch.shape[0]
         fmt = self._resolve_transfer_format(transfer_format) if batch_size else transfer_codec.LEGACY_FORMAT
+        if fmt == transfer_codec.EXACT_FORMAT:
+            # Never downgrade exact to 8-bit: an older master fails the job clearly.
+            await self._send_exact_batch(image_batch, audio, multi_job_id, master_url, worker_id)
+            return
         if fmt != transfer_codec.LEGACY_FORMAT:
             sent = await self._send_compressed_batch(
                 image_batch, audio, multi_job_id, master_url, worker_id, fmt, transfer_quality
@@ -329,6 +366,100 @@ class DistributedCollectorNode:
         )
         return True
 
+    async def _send_exact_batch(self, image_batch, audio, multi_job_id, master_url, worker_id):
+        """Send original floating-point frames as binary multipart chunks.
+
+        Frame sizes are known from shape and dtype, so every request is planned
+        (and an oversized frame rejected) before anything is sent. Frames are
+        encoded one chunk at a time to avoid holding a second copy of the batch.
+        Any master rejection raises: there is no lossy or 8-bit fallback.
+        """
+        encoded_audio = encode_audio_payload(audio)
+        session = await get_client_session()
+        url = f"{master_url}/distributed/job_complete"
+        loop = asyncio.get_running_loop()
+        media_limit = max(1, TRANSFER_MAX_REQUEST_BYTES - self.TRANSFER_ENVELOPE_RESERVE_BYTES)
+        chunk_limit = min(TRANSFER_MAX_CHUNK_BYTES, media_limit)
+
+        frame_bytes = _exact_frame_bytes(image_batch)
+        total = int(image_batch.shape[0])
+        if frame_bytes > media_limit:
+            raise transfer_codec.FrameTooLargeError(
+                f"Frame 0 is {frame_bytes} bytes as exact, above the {media_limit}-byte request limit. "
+                "Use png or a lossy format, or raise the master's --max-upload-size together with "
+                "COMFYUI_DISTRIBUTED_TRANSFER_MAX_REQUEST_BYTES."
+            )
+        # Bound descriptor/part-header overhead even for tiny frames.
+        per_chunk = min(128, max(1, chunk_limit // frame_bytes))
+        ranges = [(start, min(per_chunk, total - start)) for start in range(0, total, per_chunk)]
+        audio_bytes = len(json.dumps(encoded_audio)) if encoded_audio is not None else 0
+        last_media = ranges[-1][1] * frame_bytes
+        audio_inline = encoded_audio is not None and last_media + audio_bytes <= media_limit
+        audio_separate = encoded_audio is not None and not audio_inline
+        height, width = int(image_batch.shape[1]), int(image_batch.shape[2])
+        if audio_separate and audio_bytes > media_limit:
+            raise transfer_codec.FrameTooLargeError("exact completion audio exceeds the request limit")
+        cpu_batch = ensure_contiguous(image_batch.detach().cpu())
+
+        started = time.time()
+        sent_bytes = 0
+        for index, (start, count) in enumerate(ranges):
+            frames = [cpu_batch[i:i + 1] for i in range(start, start + count)]
+            descriptors, parts = await loop.run_in_executor(None, _encode_exact_frames, frames)
+            is_final_chunk = index == len(ranges) - 1
+            envelope = {
+                "job_id": str(multi_job_id),
+                "worker_id": str(worker_id),
+                "format": transfer_codec.EXACT_FORMAT,
+                "start_index": start,
+                "count": count,
+                "width": width,
+                "height": height,
+                "descriptors": descriptors,
+                "is_last": bool(is_final_chunk and not audio_separate),
+            }
+            if is_final_chunk and audio_inline:
+                envelope["audio"] = encoded_audio
+            chunk_bytes = sum(len(p) for p in parts)
+            body = self._build_multipart(envelope, parts)()
+            if body.size is None or body.size > TRANSFER_MAX_REQUEST_BYTES:
+                raise transfer_codec.FrameTooLargeError("exact multipart body exceeds the request limit")
+            timeout_seconds = min(600, 60 + chunk_bytes // (256 * 1024))
+            try:
+                async with session.post(
+                    url,
+                    data=body,
+                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                ) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        raise RuntimeError(
+                            f"Master rejected exact chunk {index + 1}/{len(ranges)} ({chunk_bytes} bytes) "
+                            f"with HTTP {response.status}: {body[:300]}. exact needs a master with exact "
+                            "transfer support and requests within its --max-upload-size; it is never "
+                            "resent as an 8-bit format. Update the master or choose png."
+                        )
+            except Exception as e:
+                log(f"Worker - Failed to send exact chunk to master: {e}")
+                debug_log(f"Worker - Full error details: URL={url}")
+                raise
+            sent_bytes += chunk_bytes
+
+        requests = len(ranges)
+        if audio_separate:
+            await self._post_json_completion(session, url, {
+                "job_id": str(multi_job_id),
+                "worker_id": str(worker_id),
+                "batch_idx": 0,
+                "audio": encoded_audio,
+                "is_last": True,
+            })
+            requests += 1
+        log(
+            f"Worker - Sent {total} image(s) as exact in {requests} request(s): "
+            f"{sent_bytes / 1e6:.2f} MB in {time.time() - started:.1f}s"
+        )
+
     @staticmethod
     async def _post_json_completion(session, url, payload):
         timeout_seconds = 60 if "image" in payload else 600
@@ -457,6 +588,31 @@ class DistributedCollectorNode:
         worker_images[worker_id][image_index] = tensor
         return 1
 
+    # Collector sockets a comfy-media-v1 serverless pool may return.
+    TYPED_MEDIA_SOCKETS = ("images", "audio")
+
+    def _store_typed_media(self, worker_images: dict, worker_audio: dict, worker_id: str, media) -> int:
+        """Store one atomic typed serverless delivery: ordered IMAGE/AUDIO item lists.
+
+        Each IMAGE item is a BHWC batch kept at its list position; AUDIO items are
+        joined in order, exactly as list inputs are on the master.
+        """
+        if (not isinstance(media, dict) or not media
+                or any(socket not in self.TYPED_MEDIA_SOCKETS for socket in media)):
+            raise RuntimeError(f"Invalid serverless media delivery from {worker_id}")
+        for socket, items in media.items():
+            if not isinstance(items, list) or not items or any(item is None for item in items):
+                raise RuntimeError(f"Serverless participant {worker_id} returned no {socket} items")
+        stored = 0
+        for index, tensor in enumerate(media.get("images", [])):
+            if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4:
+                raise RuntimeError(f"Serverless participant {worker_id} returned an invalid IMAGE item")
+            worker_images.setdefault(worker_id, {})[index] = tensor
+            stored += 1
+        if "audio" in media:
+            worker_audio[worker_id] = self._normalize_audio_input(media["audio"])
+        return stored
+
     def _reorder_and_combine_tensors(
         self,
         worker_images: dict,
@@ -534,6 +690,10 @@ class DistributedCollectorNode:
                     serverless_manager = self._get_serverless_manager()
                 return serverless_manager
 
+            try:
+                exact_requested = transfer_codec.normalize_format(transfer_format) == transfer_codec.EXACT_FORMAT
+            except transfer_codec.TransferCodecError:
+                exact_requested = False
             num_workers = len(expected_workers)
             if num_workers == 0:
                 return (images, audio if audio is not None else self.EMPTY_AUDIO)
@@ -609,6 +769,27 @@ class DistributedCollectorNode:
                     raise RuntimeError(f"Serverless participant {participant} failed: {message}")
 
                 result_worker_id = str(result["worker_id"])
+                if "media" in result:
+                    if result_worker_id not in serverless_workers:
+                        raise RuntimeError(f"Unexpected serverless media participant {result_worker_id}")
+                    if result_worker_id in workers_done:
+                        raise RuntimeError(f"Duplicate serverless media delivery from {result_worker_id}")
+                    if result.get("is_last") is not True:
+                        raise RuntimeError("Serverless media delivery must be atomic and final")
+                    collected_count += self._store_typed_media(
+                        worker_images, worker_audio, result_worker_id, result["media"]
+                    )
+                    debug_log(f"Master - Got typed media from serverless participant {result_worker_id}")
+                    mark_worker_done(result_worker_id)
+                    return
+
+                if (exact_requested and result.get("tensor") is not None
+                        and result.get("format") != transfer_codec.EXACT_FORMAT):
+                    raise RuntimeError(
+                        f"Worker {result_worker_id} sent {result.get('format')} images, but this Collector "
+                        "requested exact. Update ComfyUI-Distributed on that worker; exact is never "
+                        "replaced by an 8-bit format."
+                    )
                 is_last = result.get("is_last", False)
                 collected_count += self._store_worker_result(worker_images, result)
                 debug_log(
@@ -733,6 +914,10 @@ class DistributedCollectorNode:
                             consume_result(item)
                         break
 
+                if exact_requested and workers_done != expected_workers:
+                    raise RuntimeError(
+                        f"Exact transfer incomplete: missing completion from {sorted(expected_workers - workers_done)}"
+                    )
                 total_collected = sum(len(imgs) for imgs in worker_images.values())
 
                 # Remove the queue before combining so a late provider callback cannot
@@ -753,10 +938,10 @@ class DistributedCollectorNode:
                                   f"(master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})")
                     return (combined, combined_audio)
                 except Exception as e:
-                    if serverless_results:
+                    if serverless_results or exact_requested:
                         raise RuntimeError(
-                            "Serverless result batch shape mismatch while combining participants "
-                            f"{sorted(serverless_results)}: {e}"
+                            "Serverless or exact result batch shape mismatch while combining participants "
+                            f"{sorted(worker_images)}: {e}"
                         ) from e
                     log(f"Master - Error combining images: {e}")
                     # Preserve collected audio for regular workers when image assembly fails.
