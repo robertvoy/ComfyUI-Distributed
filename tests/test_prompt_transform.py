@@ -260,6 +260,40 @@ class PrunePromptForWorkerTests(unittest.TestCase):
         preview_nodes = [n for n in result.values() if n.get("class_type") == "PreviewImage"]
         self.assertEqual(len(preview_nodes), 0)
 
+    def test_worker_sink_replaces_preview_image(self):
+        result = pt.prune_prompt_for_worker(_linear_prompt(), use_worker_sink=True)
+        sinks = [n for n in result.values() if n.get("class_type") == pt.WORKER_SINK_CLASS]
+        self.assertEqual(len(sinks), 1)
+        self.assertEqual(sinks[0]["inputs"], {"value": ["4", 0]})
+        self.assertFalse(any(n.get("class_type") in ("PreviewImage", "PreviewAudio") for n in result.values()))
+
+    def test_worker_sink_uses_audio_output_for_audio_only_collector(self):
+        result = pt.prune_prompt_for_worker(_audio_only_prompt(), use_worker_sink=True)
+        sinks = [n for n in result.values() if n.get("class_type") == pt.WORKER_SINK_CLASS]
+        self.assertEqual([s["inputs"] for s in sinks], [{"value": ["2", 1]}])
+        self.assertFalse(any(n.get("class_type") == "PreviewAudio" for n in result.values()))
+
+    def test_worker_sink_for_distributed_upscale(self):
+        prompt = {
+            "1": {"class_type": "LoadImage", "inputs": {}},
+            "2": {"class_type": "UltimateSDUpscaleDistributed", "inputs": {"upscaled_image": ["1", 0]}},
+            "3": {"class_type": "SaveImage", "inputs": {"images": ["2", 0]}},
+        }
+        result = pt.prune_prompt_for_worker(prompt, use_worker_sink=True)
+        sinks = [n for n in result.values() if n.get("class_type") == pt.WORKER_SINK_CLASS]
+        self.assertEqual([s["inputs"] for s in sinks], [{"value": ["2", 0]}])
+        self.assertNotIn("3", result)
+
+    def test_worker_sink_ids_do_not_collide_with_original_prompt(self):
+        prompt = _linear_prompt()
+        result = pt.prune_prompt_for_worker(prompt, use_worker_sink=True)
+        sink_ids = [k for k, n in result.items() if n.get("class_type") == pt.WORKER_SINK_CLASS]
+        self.assertTrue(all(k not in prompt for k in sink_ids))
+
+    def test_no_worker_sink_when_no_downstream(self):
+        result = pt.prune_prompt_for_worker(_collector_only_prompt(), use_worker_sink=True)
+        self.assertFalse(any(n.get("class_type") == pt.WORKER_SINK_CLASS for n in result.values()))
+
     def test_unrelated_nodes_are_pruned(self):
         prompt = {
             "1": {"class_type": "DistributedCollector", "inputs": {}},
@@ -302,8 +336,8 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         self.assertNotIn("1", result)
         self.assertNotIn("2", result)
 
-    def test_removes_dangling_upstream_refs(self):
-        """Collector must not retain dangling refs to pruned upstream nodes."""
+    def test_replaces_dangling_upstream_ref_with_one_empty_image_placeholder(self):
+        """Collector must point to exactly one valid placeholder after pruning."""
         prompt = _delegate_prompt()
         result = pt.prepare_delegate_master_prompt(prompt, ["3"])
         collector_inputs = result["3"].get("inputs", {})
@@ -314,10 +348,6 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         self.assertNotEqual(source_id, "2")
         self.assertIn(source_id, result)
         self.assertEqual(result[source_id].get("class_type"), "DistributedEmptyImage")
-
-    def test_injects_empty_image_placeholder(self):
-        prompt = _delegate_prompt()
-        result = pt.prepare_delegate_master_prompt(prompt, ["3"])
         empty_nodes = [(nid, n) for nid, n in result.items() if n.get("class_type") == "DistributedEmptyImage"]
         self.assertEqual(len(empty_nodes), 1)
         placeholder_id = empty_nodes[0][0]
@@ -383,13 +413,6 @@ class PrepareDelegateMasterPromptTests(unittest.TestCase):
         self.assertIn("15", result)
         self.assertEqual(result["15"], prompt["15"])
         self.assertEqual(result["9"]["inputs"]["filename_prefix"], ["15", 0])
-
-    def test_does_not_preserve_non_primitive_upstream_for_collector(self):
-        prompt = _delegate_prompt()
-        result = pt.prepare_delegate_master_prompt(prompt, ["3"])
-
-        self.assertNotIn("2", result)
-        self.assertNotEqual(result["3"]["inputs"]["images"], ["2", 0])
 
     def test_preserves_load_image_for_switch_alternate_required_input(self):
         """Delegate-only master keeps LoadImage inputs needed by switches."""

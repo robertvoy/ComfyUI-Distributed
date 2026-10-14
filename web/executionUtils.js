@@ -9,7 +9,9 @@ export function setupInterceptor(extension) {
             const hasCollector = findNodesByClass(prompt.output, NODE_CLASSES.DISTRIBUTED_COLLECTOR).length > 0;
             const hasDistUpscale = findNodesByClass(prompt.output, NODE_CLASSES.UPSCALE_DISTRIBUTED).length > 0;
 
-            if (hasCollector || hasDistUpscale) {
+            const hasImageList = findNodesByClass(prompt.output, NODE_CLASSES.IMAGE_LIST_START).length > 0;
+
+            if (hasCollector || hasDistUpscale || hasImageList) {
                 const result = await executeParallelDistributed(extension, prompt);
                 // Immediate status check for instant feedback
                 checkAllWorkerStatuses(extension);
@@ -25,14 +27,22 @@ export function setupInterceptor(extension) {
 export async function executeParallelDistributed(extension, promptWrapper) {
     const traceExecutionId = `exec_${Date.now()}_${generateUUID().slice(0, 6)}`;
     try {
-        const enabledWorkers = extension.enabledWorkers;
+        const hasImageList = findNodesByClass(promptWrapper.output, NODE_CLASSES.IMAGE_LIST_START).length > 0;
+        // Image-list v1 uses direct workers only; do not contact paid provider pools.
+        const enabledWorkers = hasImageList
+            ? extension.enabledWorkers.filter(worker => worker.type !== "serverless")
+            : extension.enabledWorkers;
         extension.log(`[exec:${traceExecutionId}] Starting distributed execution`, "debug");
         
         // Pre-flight health check on all enabled workers
         const activeWorkers = await performPreflightCheck(extension, enabledWorkers);
         
+        if (hasImageList && activeWorkers.length === 0 && extension.config?.settings?.master_delegate_only) {
+            throw new Error("Distributed Image List in orchestrator-only mode requires an active direct worker.");
+        }
+
         // Case: Enabled workers but all offline
-        if (activeWorkers.length === 0 && enabledWorkers.length > 0) {
+        if (!hasImageList && activeWorkers.length === 0 && enabledWorkers.length > 0) {
             extension.log("No active workers found. All enabled workers are offline.");
             if (extension.ui?.showToast) {
                 extension.ui.showToast(extension.app, "error", "All Workers Offline", 
@@ -112,6 +122,21 @@ export async function performPreflightCheck(extension, workers) {
     const startTime = Date.now();
     
     const checkPromises = workers.map(async (worker) => {
+        if (worker.type === "serverless") {
+            try {
+                const providerStatus = await extension.api.getServerlessStatus(worker.id);
+                if (providerStatus?.ok) {
+                    extension.log(`Serverless worker ${worker.name} is ready to scale`, "debug");
+                    return { worker, active: true };
+                }
+                extension.log(`Serverless worker ${worker.name} is not ready: ${providerStatus?.message || "unavailable"}`, "debug");
+                return { worker, active: false };
+            } catch (error) {
+                extension.log(`Serverless worker ${worker.name} status check failed: ${error.message}`, "debug");
+                return { worker, active: false };
+            }
+        }
+
         const workerUrl = getWorkerUrl(extension, worker);
         
         extension.log(`Pre-flight checking ${worker.name} at: ${workerUrl}`, "debug");

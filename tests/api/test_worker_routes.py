@@ -106,7 +106,7 @@ def _load_worker_routes_module():
     sys.modules[f"{package_name}.utils"] = utils_pkg
 
     workers_pkg = types.ModuleType(f"{package_name}.workers")
-    workers_pkg.__path__ = []
+    workers_pkg.__path__ = [str(module_path.parents[1] / "workers")]
     workers_pkg.get_worker_manager = lambda: _DummyWorkerManager()
     sys.modules[f"{package_name}.workers"] = workers_pkg
 
@@ -213,6 +213,7 @@ def _load_worker_routes_module():
         raise RuntimeError("not used in these tests")
 
     network_module.get_client_session = _get_client_session
+    network_module.get_server_port = lambda: 8189
     sys.modules[f"{package_name}.utils.network"] = network_module
 
     constants_module = types.ModuleType(f"{package_name}.utils.constants")
@@ -256,6 +257,8 @@ def _load_worker_routes_module():
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
     spec.loader.exec_module(module)
+    # Keep this module's response double independent of aiohttp import order.
+    module.web = types.SimpleNamespace(json_response=lambda payload, status=200: _FakeResponse(payload, status))
 
     if created_aiohttp_stub:
         sys.modules.pop("aiohttp", None)
@@ -268,7 +271,107 @@ def _load_worker_routes_module():
 worker_routes = _load_worker_routes_module()
 
 
+class WebsocketExecutionTargetTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from test_async_helpers import _load_async_helpers_module
+        self.modules = patch.dict(sys.modules)
+        self.modules.start()
+        self.addCleanup(self.modules.stop)
+        self.helper, self.server = _load_async_helpers_module()
+        sys.modules['dist_api_worker_testpkg.utils.async_helpers'] = self.helper
+        self.prompt = {'9': {'class_type': 'Output'}, '10': {'class_type': 'Output'}}
+
+    async def receive(self, payload):
+        import json
+        sent = []
+        class Socket:
+            async def prepare(self, request):
+                pass
+            async def send_json(self, value):
+                sent.append(value)
+            def __aiter__(self):
+                async def messages():
+                    yield types.SimpleNamespace(type=worker_routes.aiohttp.WSMsgType.TEXT,
+                                                data=json.dumps(payload))
+                return messages()
+        with patch.object(worker_routes, 'web', types.SimpleNamespace(WebSocketResponse=lambda **kw: Socket())), \
+             patch.object(worker_routes, 'queue_prompt_payload', self.helper.queue_prompt_payload), \
+             patch.object(worker_routes, 'PromptValidationError', self.helper.PromptValidationError):
+            await worker_routes.worker_ws_endpoint(_FakeRequest())
+        return sent[0]
+
+    def payload(self, targets):
+        return {'type': 'dispatch_prompt', 'request_id': 'req', 'prompt': self.prompt,
+                'partial_execution_targets': targets}
+
+    async def test_explicit_targets_reach_queue_and_acknowledgement(self):
+        ack = await self.receive(self.payload(['9']))
+        self.assertTrue(ack['ok'], ack)
+        self.assertEqual(ack['request_id'], 'req')
+        self.assertEqual(self.server.prompt_queue.items[0][4], ['9'])
+
+    async def test_malformed_targets_and_messages_are_rejected(self):
+        for targets in (None, [], '9', [True], [9], ['absent'], ['9', '9']):
+            with self.subTest(targets=targets):
+                ack = await self.receive(self.payload(targets))
+                self.assertFalse(ack['ok'])
+                self.assertIn('partial_execution_targets', ack['error'])
+        self.assertFalse((await self.receive([]))['ok'])
+        self.assertEqual(self.server.prompt_queue.items, [])
+
+    async def test_validation_cannot_silently_queue_a_partial_subset(self):
+        ack = await self.receive(self.payload(['9', '10']))
+        self.assertFalse(ack['ok'])
+        self.assertEqual(ack['validation_error']['type'], 'partial_execution_targets_failed_validation')
+        self.assertEqual(self.server.prompt_queue.items, [])
+
+    async def test_missing_target_field_keeps_legacy_queue_call(self):
+        from unittest.mock import AsyncMock
+        queued = AsyncMock(return_value='legacy')
+        original = self.helper.queue_prompt_payload
+        self.helper.queue_prompt_payload = queued
+        try:
+            payload = self.payload(['9'])
+            payload.pop('partial_execution_targets')
+            self.assertTrue((await self.receive(payload))['ok'])
+            self.assertNotIn('partial_execution_targets', queued.call_args.kwargs)
+        finally:
+            self.helper.queue_prompt_payload = original
+
+
 class WorkerRoutesTests(unittest.IsolatedAsyncioTestCase):
+    async def test_network_info_reports_actual_master_and_available_ports(self):
+        with patch.object(worker_routes, "_get_cuda_info", return_value=(0, 1, 4)), \
+             patch.object(worker_routes, "get_network_ips", return_value=["127.0.0.1"]), \
+             patch.object(worker_routes, "load_config", return_value={"workers": []}), \
+             patch.object(worker_routes, "get_server_port", return_value=8189), \
+             patch.object(worker_routes, "allocate_worker_ports", return_value=[8191, 8192, 8193]) as allocate:
+            response = await worker_routes.get_network_info_endpoint(_FakeRequest())
+        self.assertEqual(response.payload["master_port"], 8189)
+        self.assertEqual(response.payload["local_worker_ports"], [8191, 8192, 8193])
+        self.assertEqual(response.payload["cuda_device_count"], 4)
+        allocate.assert_called_once_with(8189, [], 3)
+
+    async def test_network_info_does_not_reallocate_existing_configuration(self):
+        with patch.object(worker_routes, "_get_cuda_info", return_value=(0, 4, 4)), \
+             patch.object(worker_routes, "get_network_ips", return_value=[]), \
+             patch.object(worker_routes, "load_config", return_value={"workers": [{"id": "existing", "port": 8189}]}), \
+             patch.object(worker_routes, "allocate_worker_ports") as allocate:
+            response = await worker_routes.get_network_info_endpoint(_FakeRequest())
+        self.assertEqual(response.payload["local_worker_ports"], [])
+        allocate.assert_not_called()
+
+    async def test_launch_conflict_is_a_clear_client_error(self):
+        manager = _DummyWorkerManager()
+        config = {"workers": [{"id": "worker-a", "name": "Worker A", "port": 8189}]}
+        with patch.object(worker_routes, "get_worker_manager", return_value=manager), \
+             patch.object(worker_routes, "load_config", return_value=config), \
+             patch.object(manager, "launch_worker", side_effect=ValueError("Worker port 8189 conflicts with the master port 8189")):
+            response = await worker_routes.launch_worker_endpoint(_FakeRequest({"worker_id": "worker-a"}))
+        self.assertEqual(response.status, 400)
+        self.assertIn("master port 8189", response.payload["message"])
+        self.assertEqual(manager.processes, {})
+
     async def test_launch_worker_valid_id_returns_200(self):
         manager = _DummyWorkerManager()
         config = {"workers": [{"id": "worker-a", "name": "Worker A", "port": 8188}]}

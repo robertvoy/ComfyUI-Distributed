@@ -18,7 +18,7 @@ export function isRemoteWorker(extension, worker) {
     const workerType = String(worker?.type || "").toLowerCase();
 
     // Explicit type always wins over host heuristics.
-    if (workerType === "cloud" || workerType === "remote") {
+    if (workerType === "cloud" || workerType === "remote" || workerType === "serverless") {
         return true;
     }
     if (workerType === "local") {
@@ -37,6 +37,156 @@ export function isCloudWorker(extension, worker) {
     return worker.type === "cloud";
 }
 
+// Mirrors the backend rule in utils/serverless_config.py.
+const RUNPOD_ENDPOINT_ID_RE = /^[A-Za-z0-9_-]{1,200}$/;
+
+/**
+ * Accept a pasted Runpod API URL (https://api.runpod.ai/v2/<id>/...) and keep
+ * only the endpoint ID; anything else is returned trimmed for validation.
+ */
+export function normalizeRunpodEndpointId(value) {
+    const text = String(value || "").trim();
+    const match = text.match(/^(?:https?:\/\/)?api\.runpod\.ai\/v2\/([A-Za-z0-9_-]{1,200})(?:[/?#].*)?$/i);
+    return match ? match[1] : text;
+}
+
+function showServerlessValidationError(extension, detail) {
+    extension.app.extensionManager.toast.add({
+        severity: "error",
+        summary: "Validation Error",
+        detail,
+        life: 3000,
+    });
+}
+
+async function saveServerlessWorkerSettings(extension, worker, workerId, name) {
+    const endpointId = normalizeRunpodEndpointId(document.getElementById(`endpoint-id-${workerId}`).value);
+    const mediaProfile = document.getElementById(`media-profile-${workerId}`).value;
+    const apiKey = document.getElementById(`api-key-${workerId}`).value || "";
+    const clearApiKey = Boolean(document.getElementById(`clear-api-key-${workerId}`).checked);
+    const jobsPerRun = Number(document.getElementById(`jobs-per-run-${workerId}`).value);
+    const timeoutSeconds = Number(document.getElementById(`timeout-seconds-${workerId}`).value);
+
+    if (!name.trim()) {
+        showServerlessValidationError(extension, "Worker name is required");
+        return;
+    }
+    if (!endpointId) {
+        showServerlessValidationError(extension, "Endpoint ID is required for Runpod serverless workers");
+        return;
+    }
+    if (!RUNPOD_ENDPOINT_ID_RE.test(endpointId)) {
+        showServerlessValidationError(
+            extension,
+            "Enter just the Runpod endpoint ID (for example abc123xyz), not a URL. It is shown on the endpoint's page in the Runpod console.",
+        );
+        return;
+    }
+    if (!["legacy-image-v1", "comfy-media-v1"].includes(mediaProfile)) {
+        showServerlessValidationError(extension, "Select a supported endpoint media profile");
+        return;
+    }
+    if (!Number.isInteger(jobsPerRun) || jobsPerRun < 1 || jobsPerRun > 16) {
+        showServerlessValidationError(extension, "Images per run must be a whole number from 1 to 16");
+        return;
+    }
+    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 30 || timeoutSeconds > 86400) {
+        showServerlessValidationError(extension, "Timeout must be an integer between 30 and 86400 seconds");
+        return;
+    }
+
+    const updateData = {
+        name: name.trim(),
+        type: "serverless",
+        provider: "runpod",
+        endpoint_id: endpointId,
+        media_profile: mediaProfile,
+        ...(apiKey.length > 0 && !clearApiKey ? { api_key: apiKey } : {}),
+        ...(clearApiKey ? { clear_api_key: true } : {}),
+        jobs_per_run: jobsPerRun,
+        timeout_seconds: timeoutSeconds,
+        // Never enable a serverless worker as a side effect of saving credentials.
+        enabled: worker.enabled,
+    };
+
+    try {
+        await extension.api.updateWorker(workerId, updateData);
+        document.getElementById(`api-key-${workerId}`).value = "";
+
+        worker.name = name.trim();
+        worker.type = "serverless";
+        worker.provider = "runpod";
+        worker.endpoint_id = endpointId;
+        worker.media_profile = mediaProfile;
+        worker.jobs_per_run = jobsPerRun;
+        // Replaced by a fixed backend limit; drop any value loaded from an older config.
+        delete worker.concurrency;
+        worker.timeout_seconds = timeoutSeconds;
+        worker.api_key_configured = clearApiKey
+            ? false
+            : apiKey.length > 0 || Boolean(worker.api_key_configured);
+        // The credential is write-only: never copy it into extension config/state.
+        delete worker.api_key;
+        delete worker.host;
+        delete worker.port;
+        delete worker.cuda_device;
+        delete worker.extra_args;
+
+        extension.state.updateWorker(workerId, { enabled: worker.enabled });
+        emitWorkersChanged(extension);
+        extension.app.extensionManager.toast.add({
+            severity: "success",
+            summary: "Settings Saved",
+            detail: `Worker ${worker.name} settings updated`,
+            life: 3000,
+        });
+        extension.state.setWorkerExpanded(workerId, false);
+        if (extension.panelElement) {
+            renderSidebarContent(extension, extension.panelElement);
+        }
+    } catch (error) {
+        extension.app.extensionManager.toast.add({
+            severity: "error",
+            summary: "Save Failed",
+            detail: error.message,
+            life: 5000,
+        });
+    }
+}
+
+export async function testServerlessWorker(extension, workerId) {
+    const button = document.getElementById(`test-serverless-${workerId}`);
+    const originalText = button?.textContent;
+    if (button) {
+        button.disabled = true;
+        button.textContent = "Testing...";
+    }
+    try {
+        // This endpoint only checks the saved endpoint configuration; it does not enqueue inference.
+        const result = await extension.api.testServerlessWorker(workerId);
+        extension.app.extensionManager.toast.add({
+            severity: result?.ok ? "success" : "error",
+            summary: result?.ok ? "Runpod Endpoint Ready" : "Runpod Endpoint Test Failed",
+            detail: result?.message || (result?.ok ? "Saved endpoint is reachable" : "Endpoint test failed"),
+            life: 4000,
+        });
+        return result;
+    } catch (error) {
+        extension.app.extensionManager.toast.add({
+            severity: "error",
+            summary: "Runpod Endpoint Test Failed",
+            detail: error.message,
+            life: 5000,
+        });
+        return null;
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = originalText;
+        }
+    }
+}
+
 export async function saveWorkerSettings(extension, workerId) {
     const worker = extension.config.workers.find((w) => w.id === workerId);
     if (!worker) {
@@ -44,8 +194,20 @@ export async function saveWorkerSettings(extension, workerId) {
     }
 
     // Get form values
-    const name = document.getElementById(`name-${workerId}`).value;
     const workerType = document.getElementById(`worker-type-${workerId}`).value;
+    if (workerType === "serverless") {
+        await saveServerlessWorkerSettings(extension, worker, workerId, document.getElementById(`name-${workerId}`).value);
+        return;
+    }
+    const name = document.getElementById(`name-${workerId}`).value;
+    if (worker.type === "serverless" && worker.api_key_configured) {
+        // The backend deletes the stored key when a worker stops being serverless.
+        const proceed = confirm(
+            `Change "${worker.name}" from Serverless (Runpod) to another type?\n\n` +
+            "Its saved Runpod API key will be deleted. You would need to enter it again to switch back."
+        );
+        if (!proceed) return;
+    }
     const isRemote = workerType === "remote" || workerType === "cloud";
     const isCloud = workerType === "cloud";
     const rawHost = isRemote ? document.getElementById(`host-${workerId}`).value : window.location.hostname;
@@ -155,6 +317,7 @@ export async function saveWorkerSettings(extension, workerId) {
         // Update local config
         worker.name = name.trim();
         worker.type = workerType;
+        delete worker.media_profile;
         if (isRemote) {
             worker.host = hostTrimmed;
             delete worker.cuda_device;
@@ -209,6 +372,21 @@ export function cancelWorkerSettings(extension, workerId) {
         document.getElementById(`port-${workerId}`).value = worker.port;
         document.getElementById(`cuda-${workerId}`).value = worker.cuda_device || 0;
         document.getElementById(`args-${workerId}`).value = worker.extra_args || "";
+        const endpointInput = document.getElementById(`endpoint-id-${workerId}`);
+        if (endpointInput) endpointInput.value = worker.endpoint_id || "";
+        const mediaProfileInput = document.getElementById(`media-profile-${workerId}`);
+        if (mediaProfileInput) mediaProfileInput.value = worker.media_profile ?? "legacy-image-v1";
+        const apiKeyInput = document.getElementById(`api-key-${workerId}`);
+        if (apiKeyInput) {
+            apiKeyInput.value = "";
+            apiKeyInput.disabled = false;
+        }
+        const clearApiKeyInput = document.getElementById(`clear-api-key-${workerId}`);
+        if (clearApiKeyInput) clearApiKeyInput.checked = false;
+        const jobsPerRunInput = document.getElementById(`jobs-per-run-${workerId}`);
+        if (jobsPerRunInput) jobsPerRunInput.value = worker.jobs_per_run ?? 1;
+        const timeoutInput = document.getElementById(`timeout-seconds-${workerId}`);
+        if (timeoutInput) timeoutInput.value = worker.timeout_seconds ?? 1800;
 
         // Reset remote checkbox
         const remoteCheckbox = document.getElementById(`remote-${workerId}`);

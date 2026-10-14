@@ -27,6 +27,11 @@
 - Intelligent distribution
 - Handles single images and videos
 
+#### Dynamic Image-List Processing
+- Process a whole image list in parallel: the master and every worker take the next image when they free up, and results come back in input order
+- Use **Distributed Image List Start / End** around a per-image processing region
+- [Wiring, supported inputs, and first-version limits](/docs/image-list-queue.md)
+
 #### Ease of Use
 - Auto-setup local workers; easily add remote/cloud ones
 - Convert any workflow to distributed with 2 nodes
@@ -38,11 +43,12 @@
 
 <img width="200" align="right" alt="ComfyUI_temp_khvcc_00034_@0 25x" src="https://github.com/user-attachments/assets/651e4912-7c23-4e32-bd88-250f5175e129" />
 
-ComfyUI Distributed supports three types of workers:
+ComfyUI Distributed supports four types of workers:
 
 - **Local Workers** - Additional GPUs on the same machine (auto-configured on first launch)
 - **Remote Workers** - GPUs on other computers in your network
 - **Cloud Workers** - GPUs hosted on a cloud service like Runpod, accessible via secure tunnels
+- **Serverless (Runpod)** - Queue-based endpoints for image Collector jobs; no Distributed install or inbound tunnel on the endpoint. [Setup, endpoint contract, and preview limitations](/docs/serverless-workers.md).
 
 > For detailed setup instructions, see the [setup guide](/docs/worker-setup-guides.md)
 
@@ -178,6 +184,8 @@ Use **Distributed Value** when you want per-worker overrides (for example, diffe
 | **Audio Segment Divider** | Splits an audio waveform into up to ten sequential time segments |
 | **Distributed Model Name** | Passes model paths to workers, enabling workflows to use models not present on the master in orchestrator-only mode |
 | **Distributed Empty Image** | Produces an empty IMAGE batch used when the master delegates all work |
+| **Distributed Image List Start** | Turns an image list or batch into one job per image, scheduled to the next available participant; mask and value inputs are shared across images or paired one per image |
+| **Distributed Image List End** | Closes the paired region and returns images, masks, and texts as lists in the original input order |
 
 ---
 
@@ -217,6 +225,26 @@ Yes. Open the Distributed panel and uncheck the master toggle to run in orchestr
 <summary>Can I make this work with my Docker setup?</summary>
 Yes, it is compatible with Docker setups, but you will need to configure your Docker environment yourself. Unfortunately, assistance with Docker configuration is not provided.
 </details>
+
+---
+
+## Community projects
+
+Community-maintained add-ons and forks that extend ComfyUI-Distributed.
+
+### [ComfyUI-H3MC-Distributed](https://github.com/ymiyad/ComfyUI-H3MC-Distributed) by ymiyad
+
+Connects H3 Motion Context with ComfyUI-Distributed to generate multiple candidate takes of the next video clip across your workers. Compare the results, pick your preferred take, and use it as context for the next clip.
+
+Each saved candidate video includes its continuation latent, so you don't need a shared folder or separate latent files. This add-on speeds up iteration through parallel candidates; it does not split a single clip across GPUs.
+
+### [ComfyUI-Deadline-Distributed](https://github.com/doubletwisted/ComfyUI-Deadline-Distributed) by doubletwisted
+
+A fork of ComfyUI-Distributed with Thinkbox/AWS Deadline 10 integration for render farms. Claim Deadline workers from the Distributed panel, register them automatically, and collect their results back into your master workflow.
+
+Requires Deadline 10 and the author's ComfyUI-Deadline-Plugin.
+
+See each repository for installation instructions, requirements, and support.
 
 ---
 

@@ -164,25 +164,10 @@ class ConvertPathsForPlatformTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class FindMediaReferencesTests(unittest.TestCase):
-    def test_finds_image_input(self):
-        prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "photo.png"}}}
-        refs = ms._find_media_references(prompt)
-        self.assertIn("photo.png", refs)
-
-    def test_finds_video_input(self):
-        prompt = {"1": {"class_type": "LoadVideo", "inputs": {"video": "clip.mp4"}}}
-        refs = ms._find_media_references(prompt)
-        self.assertIn("clip.mp4", refs)
-
     def test_finds_file_input_for_load_video(self):
         prompt = {"1": {"class_type": "LoadVideo", "inputs": {"file": "1 - Copy.mp4"}}}
         refs = ms._find_media_references(prompt)
         self.assertIn("1 - Copy.mp4", refs)
-
-    def test_finds_audio_input(self):
-        prompt = {"1": {"class_type": "LoadAudio", "inputs": {"audio": "track.wav"}}}
-        refs = ms._find_media_references(prompt)
-        self.assertIn("track.wav", refs)
 
     def test_strips_annotation_suffix(self):
         prompt = {"1": {"class_type": "LoadImage", "inputs": {"image": "photo.jpg [abc123]"}}}
@@ -258,5 +243,121 @@ class RewritePromptMediaInputsTests(unittest.TestCase):
         self.assertEqual(prompt["1"]["inputs"]["audio"], "song.wav")
 
 
+class AnnotatedMediaUploadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_output_temp_and_input_uploads_do_not_collide(self):
+        from unittest.mock import AsyncMock, patch
+
+        class Response:
+            status = 200
+            def __init__(self, data):
+                self.data = data
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_args):
+                return None
+            async def json(self):
+                return self.data
+            def raise_for_status(self):
+                pass
+
+        class Form:
+            def __init__(self):
+                self.fields = {}
+            def add_field(self, key, value, **kwargs):
+                self.fields[key] = value
+                if key == 'image':
+                    self.fields['name'] = kwargs['filename']
+
+        checked = []
+        def post(url, *, json=None, data=None, **kwargs):
+            if url.endswith('/check_file'):
+                checked.append(json['filename'])
+                return Response({'exists': False})
+            self.assertEqual(data.fields['type'], 'input')
+            self.assertEqual(data.fields['image'], b'real file bytes')
+            return Response({'name': data.fields['name'], 'subfolder': data.fields['subfolder']})
+
+        refs = ['shared/ref.png', 'shared/ref.png [output]', 'shared/ref.png [temp]']
+        prompt = {str(i): {'inputs': {'image': ref}} for i, ref in enumerate(refs)}
+        self.assertEqual(ms._find_media_references(prompt), refs)
+        with patch.object(ms, 'get_client_session', AsyncMock(return_value=types.SimpleNamespace(post=post))), \
+             patch.object(ms, 'aiohttp', types.SimpleNamespace(FormData=Form, ClientTimeout=lambda **kw: kw)):
+            paths = [await ms._upload_media_to_worker({}, ref, b'real file bytes', 'fixture-hash', 'image/png')
+                     for ref in refs]
+        expected = ['shared/ref.png', 'distributed-media/output/fixture-hash/ref.png',
+                    'distributed-media/temp/fixture-hash/ref.png']
+        self.assertEqual(checked, expected)
+        self.assertEqual(paths, [(True, path) for path in expected])
+        ms._rewrite_prompt_media_inputs(prompt, dict(zip(refs, expected)))
+        self.assertEqual([node['inputs']['image'] for node in prompt.values()], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# fetch_worker_has_node
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status, payload):
+        self.status = status
+        self._payload = payload
+
+    async def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.urls = []
+
+    def get(self, url, timeout=None):
+        self.urls.append(url)
+        if self.error:
+            raise self.error
+        return self.response
+
+
+class FetchWorkerHasNodeTests(unittest.TestCase):
+    def _probe(self, session):
+        import asyncio
+
+        async def _get_session():
+            return session
+
+        original = ms.get_client_session
+        ms.get_client_session = _get_session
+        try:
+            return asyncio.run(ms.fetch_worker_has_node({"id": "w1"}, "DistributedWorkerSink"))
+        finally:
+            ms.get_client_session = original
+
+    def test_registered_node_is_reported(self):
+        session = _FakeSession(_FakeResponse(200, {"DistributedWorkerSink": {"name": "DistributedWorkerSink"}}))
+        self.assertTrue(self._probe(session))
+        self.assertEqual(session.urls, ["http://localhost/object_info/DistributedWorkerSink"])
+
+    def test_unknown_node_returns_empty_object(self):
+        # ComfyUI answers 200 {} for classes that are not registered.
+        self.assertFalse(self._probe(_FakeSession(_FakeResponse(200, {}))))
+
+    def test_http_error_counts_as_missing(self):
+        self.assertFalse(self._probe(_FakeSession(_FakeResponse(404, None))))
+
+    def test_bad_json_counts_as_missing(self):
+        self.assertFalse(self._probe(_FakeSession(_FakeResponse(200, ValueError("bad json")))))
+
+    def test_connection_error_counts_as_missing(self):
+        self.assertFalse(self._probe(_FakeSession(error=OSError("unreachable"))))

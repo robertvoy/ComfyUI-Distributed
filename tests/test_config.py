@@ -18,7 +18,7 @@ def _load_config_module():
             del sys.modules[mod_name]
 
     root_pkg = types.ModuleType(package_name)
-    root_pkg.__path__ = []
+    root_pkg.__path__ = [str(module_path.parent)]
     sys.modules[package_name] = root_pkg
 
     logging_module = types.ModuleType(f"{package_name}.logging")

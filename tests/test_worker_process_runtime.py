@@ -1,10 +1,15 @@
 import importlib.util
+import os
 import sys
+import tempfile
 import types
 import unittest
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
+
+from sqlalchemy import create_engine
+from sqlalchemy.engine import URL, make_url
 
 
 def _load_process_module(module_filename: str):
@@ -21,7 +26,7 @@ def _load_process_module(module_filename: str):
     sys.modules[package_name] = root_pkg
 
     workers_pkg = types.ModuleType(f"{package_name}.workers")
-    workers_pkg.__path__ = []
+    workers_pkg.__path__ = [str(module_path.parents[1])]
     sys.modules[f"{package_name}.workers"] = workers_pkg
 
     process_pkg = types.ModuleType(f"{package_name}.workers.process")
@@ -39,7 +44,22 @@ def _load_process_module(module_filename: str):
 
     process_module = types.ModuleType(f"{package_name}.utils.process")
     process_module.get_python_executable = lambda: "/usr/bin/test-python"
+    process_module.is_process_alive = lambda _pid: False
+    process_module.terminate_process = lambda *_args, **_kwargs: None
     sys.modules[f"{package_name}.utils.process"] = process_module
+
+    config_module = types.ModuleType(f"{package_name}.utils.config")
+    config_module.load_config = lambda: {"workers": [], "settings": {"stop_workers_on_master_exit": False}}
+    config_module.save_config = lambda _config: None
+    sys.modules[f"{package_name}.utils.config"] = config_module
+    constants_module = types.ModuleType(f"{package_name}.utils.constants")
+    constants_module.PROCESS_TERMINATION_TIMEOUT = 1
+    constants_module.PROCESS_WAIT_TIMEOUT = 1
+    constants_module.WORKER_CHECK_INTERVAL = 0.01
+    sys.modules[f"{package_name}.utils.constants"] = constants_module
+    network_module = types.ModuleType(f"{package_name}.utils.network")
+    network_module.get_server_port = lambda: 8189
+    sys.modules[f"{package_name}.utils.network"] = network_module
 
     spec = importlib.util.spec_from_file_location(
         f"{package_name}.workers.process.{module_name}",
@@ -70,6 +90,145 @@ class ComfyRootDiscoveryTests(unittest.TestCase):
 
 
 class LaunchCommandBuilderTests(unittest.TestCase):
+    def build_command(self, root, worker=None, runtime=None):
+        builder = launch_builder_module.LaunchCommandBuilder()
+        worker = worker or {"id": "worker-a", "port": 8190}
+        runtime = runtime if runtime is not None else Namespace(database_url=None)
+        with patch.object(builder, "_get_runtime_args", return_value=runtime):
+            return builder.build_launch_command(worker, str(root))
+
+    def test_database_is_unique_and_stable_by_worker_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "main.py").touch()
+            first = self.build_command(root, {"id": "worker-a", "port": 8190})
+            renamed = self.build_command(root, {
+                "id": "worker-a", "port": 9001, "name": "Renamed", "cuda_device": 3,
+            })
+            second = self.build_command(root, {"id": "worker-b", "port": 8191})
+            database = first[first.index("--database-url") + 1]
+            self.assertEqual(database, renamed[renamed.index("--database-url") + 1])
+            self.assertNotEqual(database, second[second.index("--database-url") + 1])
+            self.assertTrue(database.startswith("sqlite:///" + root.as_posix() + "/"))
+            self.assertTrue(Path(database.removeprefix("sqlite:///")).parent.is_dir())
+            self.assertNotIn("--disable-assets", first)
+
+    def test_database_uses_effective_user_or_base_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "main.py").touch()
+            for extra_args, expected in [
+                (f'--user-directory "{root / "custom user"}"', root / "custom user"),
+                (f'--base-directory "{root / "custom base"}"', root / "custom base" / "user"),
+            ]:
+                with self.subTest(extra_args=extra_args):
+                    cmd = self.build_command(root, {
+                        "id": "worker-a", "port": 8190, "extra_args": extra_args,
+                    })
+                    database = cmd[cmd.index("--database-url") + 1]
+                    self.assertTrue(database.startswith("sqlite:///" + expected.as_posix() + "/"))
+            cmd = self.build_command(root, runtime=Namespace(
+                database_url="sqlite:///master.db", user_directory=str(root / "runtime user"),
+            ))
+            database = cmd[cmd.index("--database-url") + 1]
+            self.assertTrue(database.startswith("sqlite:///" + (root / "runtime user").as_posix() + "/"))
+            self.assertNotEqual(database, "sqlite:///master.db")
+
+    def test_relative_database_directories_use_worker_cwd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "ComfyUI"
+            root.mkdir()
+            (root / "main.py").touch()
+            launcher = Path(directory) / "launcher"
+            launcher.mkdir()
+            cases = [
+                (Namespace(database_url=None, user_directory="profiles"), "", root / "profiles"),
+                (Namespace(database_url=None, base_directory="data"), "", root / "data/user"),
+                (Namespace(database_url=None), "--user-directory=profiles", root / "profiles"),
+                (Namespace(database_url=None), "--base-directory data", root / "data/user"),
+            ]
+            for runtime, extra, expected in cases:
+                with self.subTest(runtime=runtime, extra=extra), \
+                     patch.object(os, "getcwd", return_value=str(launcher)):
+                    cmd = self.build_command(root, {
+                        "id": "worker-a", "port": 8190, "extra_args": extra,
+                    }, runtime)
+                    database = make_url(cmd[cmd.index("--database-url") + 1]).database
+                    self.assertEqual(Path(database).parent, expected / "distributed/workers")
+            self.assertFalse((launcher / "profiles").exists())
+            self.assertFalse((launcher / "data").exists())
+
+    def test_database_url_round_trips_special_characters_without_collisions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "main.py").touch()
+            for name in ["user?profile", "user%3Fprofile"]:
+                with self.subTest(name=name):
+                    user = root / name
+                    runtime = Namespace(database_url=None, user_directory=str(user))
+                    # SQLAlchemy 2.0 cannot round-trip '?' in a filename. Fail
+                    # clearly on those versions rather than silently sharing a DB.
+                    sample = (user / "test.db").as_posix()
+                    serialized = URL.create("sqlite", database=sample).render_as_string()
+                    if make_url(serialized).database != sample:
+                        with self.assertRaisesRegex(ValueError, "SQLAlchemy.*database path"):
+                            self.build_command(root, runtime=runtime)
+                        self.assertFalse(user.exists())
+                        continue
+                    databases = []
+                    for worker_id in ["worker-a", "worker-b"]:
+                        cmd = self.build_command(root, {"id": worker_id, "port": 8190}, runtime)
+                        url = cmd[cmd.index("--database-url") + 1]
+                        database = make_url(url).database
+                        self.assertEqual(Path(database).parent, user / "distributed/workers")
+                        engine = create_engine(url)
+                        try:
+                            with engine.connect() as connection:
+                                actual = connection.exec_driver_sql("PRAGMA database_list").one()[2]
+                                self.assertEqual(Path(actual), Path(database))
+                        finally:
+                            engine.dispose()
+                        databases.append(database)
+                    self.assertNotEqual(*databases)
+
+    def test_explicit_database_and_disabled_assets_are_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "main.py").touch()
+            for extra in ["--database-url sqlite:///explicit.db", "--database-url=sqlite:///explicit.db", "--disable-assets"]:
+                with self.subTest(extra=extra):
+                    cmd = self.build_command(root, {"id": "worker-a", "port": 8190, "extra_args": extra})
+                    self.assertEqual(sum(arg.split("=")[0] == "--database-url" for arg in cmd), 0 if extra == "--disable-assets" else 1)
+                    self.assertFalse((root / "user").exists())
+
+    def test_older_comfyui_without_database_flag_keeps_existing_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "main.py").touch()
+            cmd = self.build_command(root, runtime=Namespace())
+            self.assertNotIn("--database-url", cmd)
+            self.assertFalse((root / "user").exists())
+
+    def test_worker_id_cannot_escape_database_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "main.py").touch()
+            databases = []
+            for worker_id in ["../outside", "a/b", "a_b"]:
+                cmd = self.build_command(root, {"id": worker_id, "port": 8190})
+                path = Path(cmd[cmd.index("--database-url") + 1].removeprefix("sqlite:///"))
+                self.assertTrue(path.is_relative_to(root / "user"))
+                databases.append(path)
+            self.assertEqual(len(set(databases)), 3)
+
+    def test_extra_args_cannot_silently_override_the_configured_port(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "main.py").touch()
+            for extra in ["--port 8189", "--port=8189"]:
+                with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "configured worker port"):
+                    self.build_command(root, {"id": "worker-a", "port": 8190, "extra_args": extra})
+
     def test_inherits_runtime_layout_args_for_desktop(self):
         builder = launch_builder_module.LaunchCommandBuilder()
         runtime_args = Namespace(
@@ -128,6 +287,65 @@ class LaunchCommandBuilderTests(unittest.TestCase):
         self.assertIn("--port", cmd)
         self.assertIn("9001", cmd)
         self.assertNotIn("--auto-launch", cmd)
+
+
+class ProcessLaunchPortTests(unittest.TestCase):
+    def test_launch_before_master_listens_uses_configured_master_port(self):
+        lifecycle_module = _load_process_module("lifecycle.py")
+        cli_args = types.ModuleType("comfy.cli_args")
+        cli_args.args = Namespace(port=8189)
+        for missing in [AttributeError("PromptServer has no port"), None]:
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                manager = types.SimpleNamespace(
+                    find_comfy_root=lambda: directory,
+                    build_launch_command=lambda _worker, _root: ["python", "main.py"],
+                    processes={}, save_processes=lambda: None,
+                )
+                with patch.dict(sys.modules, {"comfy": types.ModuleType("comfy"), "comfy.cli_args": cli_args}), \
+                     patch.object(lifecycle_module, "get_server_port", side_effect=missing if isinstance(missing, Exception) else None, return_value=None), \
+                     patch.object(lifecycle_module, "validate_worker_port") as validate, \
+                     patch.object(lifecycle_module.subprocess, "Popen", return_value=types.SimpleNamespace(pid=1234)) as spawn:
+                    pid = lifecycle_module.ProcessLifecycle(manager).launch_worker({"id": "manual", "port": 8190})
+                validate.assert_called_once_with({"id": "manual", "port": 8190}, 8189, [])
+                spawn.assert_called_once()
+                self.assertEqual(pid, 1234)
+
+    def test_pre_listen_launch_still_rejects_the_configured_master_port(self):
+        lifecycle_module = _load_process_module("lifecycle.py")
+        cli_args = types.ModuleType("comfy.cli_args")
+        cli_args.args = Namespace(port=8189)
+        manager = types.SimpleNamespace(find_comfy_root=lambda: "/ComfyUI", processes={})
+        with patch.dict(sys.modules, {"comfy": types.ModuleType("comfy"), "comfy.cli_args": cli_args}), \
+             patch.object(lifecycle_module, "get_server_port", side_effect=AttributeError("port")), \
+             patch.object(lifecycle_module.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(ValueError, "master port 8189"):
+                lifecycle_module.ProcessLifecycle(manager).launch_worker({"id": "manual", "port": 8189})
+        spawn.assert_not_called()
+
+    def test_conflict_is_rejected_before_building_or_spawning(self):
+        lifecycle_module = _load_process_module("lifecycle.py")
+        manager = types.SimpleNamespace(find_comfy_root=lambda: "/ComfyUI", processes={})
+        with patch.object(lifecycle_module.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(ValueError, "master port 8189"):
+                lifecycle_module.ProcessLifecycle(manager).launch_worker({"id": "manual", "port": 8189})
+        spawn.assert_not_called()
+        self.assertEqual(manager.processes, {})
+
+    def test_available_port_reaches_existing_launch_path(self):
+        lifecycle_module = _load_process_module("lifecycle.py")
+        with tempfile.TemporaryDirectory() as directory:
+            manager = types.SimpleNamespace(
+                find_comfy_root=lambda: directory,
+                build_launch_command=lambda _worker, _root: ["python", "main.py", "--port", "8190"],
+                processes={}, save_processes=lambda: None,
+            )
+            with patch.object(lifecycle_module, "validate_worker_port") as validate, \
+                 patch.object(lifecycle_module.subprocess, "Popen", return_value=types.SimpleNamespace(pid=1234)) as spawn:
+                pid = lifecycle_module.ProcessLifecycle(manager).launch_worker({"id": "manual", "port": 8190})
+            validate.assert_called_once_with({"id": "manual", "port": 8190}, 8189, [])
+            spawn.assert_called_once()
+            self.assertEqual(pid, 1234)
+            self.assertEqual(manager.processes["manual"]["pid"], 1234)
 
 
 if __name__ == "__main__":

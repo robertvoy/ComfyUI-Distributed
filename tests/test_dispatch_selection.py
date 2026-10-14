@@ -4,7 +4,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 def _load_dispatch_module():
@@ -55,7 +55,13 @@ def _load_dispatch_module():
             def __init__(self, total=None):
                 self.total = total
 
-        class _ClientConnectorError(Exception):
+        class _ClientError(Exception):
+            pass
+
+        class _ClientConnectorError(_ClientError):
+            pass
+
+        class _ClientConnectionError(_ClientError):
             pass
 
         class _WSMsgType:
@@ -76,7 +82,9 @@ def _load_dispatch_module():
                 self.closed = True
 
         aiohttp_module.ClientTimeout = _ClientTimeout
+        setattr(aiohttp_module, "ClientError", _ClientError)
         aiohttp_module.ClientConnectorError = _ClientConnectorError
+        setattr(aiohttp_module, "ClientConnectionError", _ClientConnectionError)
         aiohttp_module.WSMsgType = _WSMsgType
         aiohttp_module.TCPConnector = _TCPConnector
         aiohttp_module.ClientSession = _ClientSession
@@ -98,6 +106,113 @@ def _load_dispatch_module():
 
 
 dispatch = _load_dispatch_module()
+
+
+def _load_prompt_transform_module():
+    module_path = Path(__file__).resolve().parents[1] / "api" / "orchestration" / "prompt_transform.py"
+    package_name = "prompt_transform_worker_selection_testpkg"
+    for suffix in ("", ".api", ".api.orchestration", ".utils"):
+        package = types.ModuleType(package_name + suffix)
+        package.__path__ = []
+        sys.modules[package_name + suffix] = package
+    logging_module = types.ModuleType(f"{package_name}.utils.logging")
+    setattr(logging_module, "debug_log", lambda *_args, **_kwargs: None)
+    sys.modules[f"{package_name}.utils.logging"] = logging_module
+
+    spec = importlib.util.spec_from_file_location(
+        f"{package_name}.api.orchestration.prompt_transform",
+        module_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+prompt_transform = _load_prompt_transform_module()
+
+
+class _FakeResponse:
+    def __init__(self, status=200, payload=None, error=None):
+        self.status = status
+        self.payload = payload
+        self.error = error
+
+    async def __aenter__(self):
+        if self.error is not None:
+            raise self.error
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def json(self):
+        return self.payload
+
+
+class _FakeSession:
+    def __init__(self, responses):
+        self.responses = responses
+
+    def get(self, url, timeout=None):
+        del timeout
+        worker_id = url.removeprefix("http://").split("/", 1)[0]
+        endpoint = "capabilities" if url.endswith("/capabilities") else "queue"
+        response = self.responses[(worker_id, endpoint)]
+        if isinstance(response, BaseException):
+            return _FakeResponse(error=response)
+        status, payload = response
+        return _FakeResponse(status=status, payload=payload)
+
+
+def _valid_capability():
+    return {
+        "supported": True,
+        "execution_targets": True,
+        "protocol_version": 2,
+        "node_ids": ["DistributedImageListStart", "DistributedImageListEnd"],
+    }
+
+
+def _valid_queue(running=None, pending=None):
+    return {"queue_running": running or [], "queue_pending": pending or []}
+
+
+class ExplicitTargetTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_preserves_targets_and_omits_default_field(self):
+        response = types.SimpleNamespace(raise_for_status=lambda: None)
+        class Response:
+            async def __aenter__(self): return response
+            async def __aexit__(self, *args): pass
+        calls = []
+        def post(url, **kwargs):
+            calls.append(kwargs['json'])
+            return Response()
+        session = types.SimpleNamespace(post=post)
+        with patch.object(dispatch, 'get_client_session', AsyncMock(return_value=session)):
+            await dispatch.dispatch_worker_prompt({'id': 'worker'}, {'9': {}}, None,
+                                                  partial_execution_targets=['9'])
+            await dispatch.dispatch_worker_prompt({'id': 'worker'}, {'9': {}}, None)
+        self.assertEqual(calls[0]['partial_execution_targets'], ['9'])
+        self.assertNotIn('partial_execution_targets', calls[1])
+
+    async def test_websocket_sends_targets_all_the_way_to_wire(self):
+        import json
+        sent = []
+        async def receive():
+            return types.SimpleNamespace(type=dispatch.aiohttp.WSMsgType.TEXT, data=json.dumps({
+                'type': 'dispatch_ack', 'request_id': sent[-1]['request_id'],
+                'ok': True, 'prompt_id': 'worker-prompt'}))
+        ws = types.SimpleNamespace(send_json=AsyncMock(side_effect=sent.append),
+                                   receive=receive, close=AsyncMock())
+        session = types.SimpleNamespace(ws_connect=AsyncMock(return_value=ws))
+        with patch.object(dispatch, 'get_client_session', AsyncMock(return_value=session)):
+            result = await dispatch.dispatch_worker_prompt({'id': 'worker'}, {'9': {}}, None,
+                use_websocket=True, return_prompt_id=True, partial_execution_targets=['9'])
+            await dispatch.dispatch_worker_prompt({'id': 'worker'}, {'9': {}}, None, use_websocket=True)
+        self.assertEqual(result, 'worker-prompt')
+        self.assertEqual(sent[0]['partial_execution_targets'], ['9'])
+        self.assertNotIn('partial_execution_targets', sent[1])
 
 
 class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
@@ -248,6 +363,230 @@ class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
             selected = await dispatch.select_least_busy_worker(workers, probe_concurrency=1)
 
         self.assertIsNone(selected)
+
+    async def test_image_list_preflight_skips_unreachable_worker_and_keeps_healthy_worker(self):
+        workers = [{"id": "healthy"}, {"id": "offline"}]
+        responses = {
+            (worker_id, "capabilities"): (200, _valid_capability())
+            for worker_id in ("healthy", "offline")
+        }
+        responses.update({
+            (worker_id, "queue"): (200, _valid_queue())
+            for worker_id in ("healthy", "offline")
+        })
+        responses[("offline", "capabilities")] = dispatch.aiohttp.ClientConnectionError("connection refused")
+        session = _FakeSession(responses)
+
+        async def fake_session():
+            return session
+
+        with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+            dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+        ), patch.object(dispatch, "log") as log_mock:
+            result = await dispatch.preflight_image_list_workers(workers)
+
+        self.assertEqual(result, {"healthy": True})
+        self.assertTrue(any("offline" in str(call) for call in log_mock.call_args_list))
+
+    async def test_image_list_preflight_skips_timeout_and_keeps_healthy_worker(self):
+        workers = [{"id": "healthy"}, {"id": "slow"}]
+        responses: dict = {
+            (worker_id, "capabilities"): (200, _valid_capability())
+            for worker_id in ("healthy", "slow")
+        }
+        responses.update({
+            (worker_id, "queue"): (200, _valid_queue())
+            for worker_id in ("healthy", "slow")
+        })
+        responses[("slow", "queue")] = asyncio.TimeoutError()
+        session = _FakeSession(responses)
+
+        async def fake_session():
+            return session
+
+        with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+            dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+        ), patch.object(dispatch, "log") as log_mock:
+            result = await dispatch.preflight_image_list_workers(workers)
+
+        self.assertEqual(result, {"healthy": True})
+        self.assertTrue(any("slow" in str(call) for call in log_mock.call_args_list))
+
+    async def test_image_list_preflight_excludes_busy_workers(self):
+        workers = [{"id": "idle"}, {"id": "busy"}]
+        responses = {
+            (worker_id, "capabilities"): (200, _valid_capability())
+            for worker_id in ("idle", "busy")
+        }
+        responses.update({
+            ("idle", "queue"): (200, _valid_queue()),
+            ("busy", "queue"): (200, _valid_queue(running=[{"prompt": "existing"}])),
+        })
+        session = _FakeSession(responses)
+
+        async def fake_session():
+            return session
+
+        with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+            dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+        ):
+            result = await dispatch.preflight_image_list_workers(workers)
+
+        self.assertEqual(result, {"idle": True})
+
+    async def test_image_list_preflight_reports_no_idle_workers_when_all_are_unavailable(self):
+        workers = [{"id": "offline-a"}, {"id": "offline-b"}]
+        responses = {
+            (worker_id, "capabilities"): dispatch.aiohttp.ClientConnectionError("unreachable")
+            for worker_id in ("offline-a", "offline-b")
+        }
+        session = _FakeSession(responses)
+
+        async def fake_session():
+            return session
+
+        with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+            dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+        ):
+            self.assertEqual(
+                await dispatch.preflight_image_list_workers(workers, require_idle=False),
+                {},
+            )
+            with self.assertRaisesRegex(RuntimeError, "No selected feature-compatible direct worker is idle"):
+                await dispatch.preflight_image_list_workers(workers, require_idle=True)
+
+    async def test_image_list_preflight_requires_exact_execution_targets_support(self):
+        for value in (None, False, 1, "true", []):
+            with self.subTest(value=value):
+                capability = _valid_capability()
+                if value is None:
+                    capability.pop("execution_targets")
+                else:
+                    capability["execution_targets"] = value
+                session = _FakeSession({("worker", "capabilities"): (200, capability)})
+                async def fake_session():
+                    return session
+                with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+                    dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "execution_targets.*upgrade"):
+                        await dispatch.preflight_image_list_workers([{"id": "worker"}])
+
+    async def test_image_list_value_results_requires_exact_true_only_for_overrides(self):
+        for value in (None, False, 1, "true", [], True):
+            capability = _valid_capability()
+            if value is not None:
+                capability['value_results'] = value
+            session = _FakeSession({('worker', 'capabilities'): (200, capability),
+                                    ('worker', 'queue'): (200, _valid_queue())})
+            async def fake_session():
+                return session
+            with patch.object(dispatch, 'get_client_session', side_effect=fake_session), patch.object(
+                dispatch, 'build_worker_url', side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+            ):
+                self.assertEqual(await dispatch.preflight_image_list_workers([{'id': 'worker'}]), {'worker': True})
+                if value is True:
+                    self.assertEqual(await dispatch.preflight_image_list_workers(
+                        [{'id': 'worker'}], require_value_results=True), {'worker': True})
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'value_results.*upgrade'):
+                        await dispatch.preflight_image_list_workers([{'id': 'worker'}], require_value_results=True)
+    async def test_image_list_preflight_fails_closed_for_malformed_capabilities(self):
+        malformed = {"supported": True, "protocol_version": 2, "node_ids": None}
+        session = _FakeSession({("worker", "capabilities"): (200, malformed)})
+
+        async def fake_session():
+            return session
+
+        with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+            dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "malformed.*capabilit"):
+                await dispatch.preflight_image_list_workers([{"id": "worker"}])
+
+    async def test_image_list_preflight_fails_closed_for_incompatible_protocol(self):
+        incompatible = _valid_capability()
+        incompatible["protocol_version"] = 1
+        session = _FakeSession({("worker", "capabilities"): (200, incompatible)})
+
+        async def fake_session():
+            return session
+
+        with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+            dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "incompatible"):
+                await dispatch.preflight_image_list_workers([{"id": "worker"}])
+
+    async def test_image_list_preflight_fails_closed_for_missing_required_node(self):
+        incompatible = _valid_capability()
+        incompatible["node_ids"] = ["DistributedImageListStart"]
+        session = _FakeSession({("worker", "capabilities"): (200, incompatible)})
+
+        async def fake_session():
+            return session
+
+        with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+            dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "incompatible"):
+                await dispatch.preflight_image_list_workers([{"id": "worker"}])
+
+    async def test_image_list_preflight_fails_closed_for_malformed_queue(self):
+        responses = {
+            ("worker", "capabilities"): (200, _valid_capability()),
+            ("worker", "queue"): (200, {"queue_running": [], "queue_pending": None}),
+        }
+        session = _FakeSession(responses)
+
+        async def fake_session():
+            return session
+
+        with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+            dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "malformed /queue"):
+                await dispatch.preflight_image_list_workers([{"id": "worker"}])
+
+    async def test_image_list_preflight_does_not_hide_unexpected_errors(self):
+        session = _FakeSession({("worker", "capabilities"): ValueError("programming error")})
+
+        async def fake_session():
+            return session
+
+        with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+            dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+        ):
+            with self.assertRaisesRegex(ValueError, "programming error"):
+                await dispatch.preflight_image_list_workers([{"id": "worker"}])
+
+
+class ImageListDirectWorkerResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.config = {"workers": [
+            {"id": "enabled", "enabled": True, "host": "enabled-host", "port": 8188},
+            {"id": "disabled", "enabled": False, "host": "disabled-host", "port": 8189},
+            {"id": "serverless", "enabled": True, "type": "serverless"},
+            {"id": "other", "enabled": True, "host": "other-host", "port": 8190},
+        ]}
+
+    def test_implicit_selection_uses_only_enabled_direct_workers(self):
+        workers = prompt_transform._resolve_direct_workers_for_image_list(self.config, None)
+        self.assertEqual([worker["id"] for worker in workers], ["enabled", "other"])
+
+    def test_explicit_selection_includes_exact_disabled_direct_worker(self):
+        workers = prompt_transform._resolve_direct_workers_for_image_list(self.config, ["disabled"])
+        self.assertEqual([worker["id"] for worker in workers], ["disabled"])
+
+    def test_explicit_empty_selection_returns_no_workers(self):
+        self.assertEqual(prompt_transform._resolve_direct_workers_for_image_list(self.config, []), [])
+
+    def test_unknown_explicit_id_raises_instead_of_falling_back(self):
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            prompt_transform._resolve_direct_workers_for_image_list(self.config, ["enabled", "missing"])
+
+    def test_explicit_serverless_selection_is_excluded(self):
+        self.assertEqual(prompt_transform._resolve_direct_workers_for_image_list(self.config, ["serverless"]), [])
 
 
 if __name__ == "__main__":

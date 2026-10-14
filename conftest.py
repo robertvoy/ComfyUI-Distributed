@@ -1,7 +1,7 @@
 # conftest.py — project-level pytest configuration.
 #
 # Problem: custom_nodes/ComfyUI-Distributed/__init__.py uses relative imports
-# (from .distributed import ...) that fail when pytest tries to import it as a
+# (from .nodes.v3 import ...) that fail when pytest tries to import it as a
 # standalone module during Package.setup() for the root package node.
 #
 # Fix: patch Package.setup() to skip the root-package's __init__.py import.

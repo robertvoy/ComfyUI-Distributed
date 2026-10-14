@@ -6,6 +6,9 @@ import aiohttp
 
 from ...utils.logging import debug_log, log
 from ...utils.network import build_worker_url, get_client_session, probe_worker
+# Must match image_list.runtime.PROTOCOL_VERSION (kept local so this module
+# stays importable without the image-list runtime; a test pins them equal).
+IMAGE_LIST_PROTOCOL_VERSION = 2
 try:
     from ...utils.trace_logger import trace_debug, trace_info
 except ImportError:
@@ -55,6 +58,11 @@ async def worker_ws_is_active(worker):
 
 async def _probe_worker_active(worker, use_websocket, semaphore):
     async with semaphore:
+        if worker.get("type") == "serverless":
+            from .serverless_runtime import get_manager
+            # Authentication/configuration failures must surface, not silently skip paid work.
+            status = await get_manager().health(worker)
+            return worker, status["ok"]
         is_active = await (worker_ws_is_active(worker) if use_websocket else worker_is_active(worker))
         return worker, is_active
 
@@ -69,30 +77,49 @@ async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
         "workflow": payload.get("workflow"),
         "client_id": client_id,
     }
+    if "partial_execution_targets" in payload:
+        ws_payload["partial_execution_targets"] = payload["partial_execution_targets"]
     ws_url = worker_url.replace("http://", "ws://").replace("https://", "wss://")
     ws_url = f"{ws_url}/distributed/worker_ws"
     session = await get_client_session()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    ws = None
 
-    async with session.ws_connect(ws_url, heartbeat=20, timeout=timeout) as ws:
-        await ws.send_json(ws_payload)
-        async for msg in ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(msg.data or "{}")
-                if data.get("type") == "dispatch_ack" and data.get("request_id") == request_id:
-                    if data.get("ok"):
-                        return
-                    error_text = data.get("error") or "Worker rejected websocket dispatch."
-                    validation_error = data.get("validation_error")
-                    node_errors = data.get("node_errors")
-                    if validation_error:
-                        error_text = f"{error_text} | validation_error={validation_error}"
-                    if node_errors:
-                        error_text = f"{error_text} | node_errors={node_errors}"
-                    raise RuntimeError(error_text)
-            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
-                raise RuntimeError(f"Worker websocket closed unexpectedly: {msg.type}")
-
-    raise RuntimeError("Worker websocket closed before dispatch_ack was received.")
+    try:
+        async with asyncio.timeout_at(deadline):
+            ws = await session.ws_connect(ws_url, heartbeat=20)
+            await ws.send_json(ws_payload)
+            while True:
+                msg = await ws.receive()
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data or "{}")
+                    if data.get("type") == "dispatch_ack" and data.get("request_id") == request_id:
+                        if data.get("ok"):
+                            return data.get("prompt_id")
+                        error_text = data.get("error") or "Worker rejected websocket dispatch."
+                        validation_error = data.get("validation_error")
+                        node_errors = data.get("node_errors")
+                        if validation_error:
+                            error_text = f"{error_text} | validation_error={validation_error}"
+                        if node_errors:
+                            error_text = f"{error_text} | node_errors={node_errors}"
+                        raise RuntimeError(error_text)
+                elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                    raise RuntimeError(f"Worker websocket closed before acknowledgement: {msg.type}; submission status is ambiguous")
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            "Worker websocket dispatch timed out before dispatch_ack; submission status is ambiguous."
+        ) from exc
+    finally:
+        if ws is not None:
+            # Closing must not discard an already acknowledged prompt ID or
+            # replace a definite rejection with an ambiguous timeout.
+            try:
+                async with asyncio.timeout_at(min(deadline, loop.time() + 1.0)):
+                    await ws.close()
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                pass
 
 
 async def dispatch_worker_prompt(
@@ -102,11 +129,18 @@ async def dispatch_worker_prompt(
     client_id=None,
     use_websocket=False,
     trace_execution_id=None,
+    return_prompt_id=False,
+    *,
+    partial_execution_targets=None,
 ):
     """Send the prepared prompt to a worker ComfyUI instance."""
     worker_url = build_worker_url(worker)
     url = build_worker_url(worker, "/prompt")
     payload = {"prompt": prompt_obj}
+    target_payload = {}
+    if partial_execution_targets is not None:
+        target_payload["partial_execution_targets"] = list(partial_execution_targets)
+        payload.update(target_payload)
     extra_data = {}
     if workflow_meta:
         extra_data.setdefault("extra_pnginfo", {})["workflow"] = workflow_meta
@@ -115,15 +149,18 @@ async def dispatch_worker_prompt(
 
     if use_websocket:
         try:
-            await _dispatch_via_websocket(
+            prompt_id = await _dispatch_via_websocket(
                 worker_url,
                 {
                     "prompt": prompt_obj,
                     "workflow": workflow_meta,
+                    **target_payload,
                 },
                 client_id,
             )
-            return
+            if return_prompt_id and (not isinstance(prompt_id, str) or not prompt_id):
+                raise RuntimeError("Worker websocket acknowledgement omitted prompt_id")
+            return prompt_id if return_prompt_id else None
         except Exception as exc:
             worker_id = worker.get("id")
             if trace_execution_id:
@@ -139,6 +176,127 @@ async def dispatch_worker_prompt(
         timeout=aiohttp.ClientTimeout(total=60),
     ) as resp:
         resp.raise_for_status()
+        if not return_prompt_id:
+            return None
+        try:
+            response_data = await resp.json()
+        except Exception as exc:
+            raise RuntimeError("Worker /prompt response did not contain JSON acknowledgement") from exc
+        prompt_id = response_data.get("prompt_id") if isinstance(response_data, dict) else None
+        if not isinstance(prompt_id, str) or not prompt_id:
+            raise RuntimeError("Worker /prompt response omitted prompt_id")
+        return prompt_id if return_prompt_id else None
+
+
+async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0, *,
+                                       required_transfer_formats=(), require_value_results=False):
+    """Require protocol/node support and report which direct workers are idle.
+
+    This performs read-only GETs only; it never submits a prompt or contacts a
+    serverless provider. Unsupported worker releases fail before master inputs run.
+    """
+    if not workers:
+        raise RuntimeError("Distributed Image List requires at least one selected direct worker")
+    if (not isinstance(required_transfer_formats, (list, tuple, set, frozenset))
+            or any(type(fmt) is not str for fmt in required_transfer_formats)):
+        raise ValueError("required_transfer_formats must contain image transfer format names")
+    required_formats = set(required_transfer_formats) - {"exact"}
+    if required_formats:
+        from ...serverless_bridge.image_transfer import validate_options
+        for fmt in required_formats:
+            validate_options(fmt)
+    session = await get_client_session()
+    required_nodes = {"DistributedImageListStart", "DistributedImageListEnd"}
+    semaphore = asyncio.Semaphore(8)
+
+    async def inspect(worker):
+        worker_id = str(worker.get("id") or "unknown")
+        check = "capability"
+        try:
+            async with semaphore:
+                cap_url = build_worker_url(worker, "/distributed/image-list/capabilities")
+                async with session.get(cap_url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                    if response.status != 200:
+                        raise RuntimeError(
+                            f"Image-list worker {worker_id} does not expose the capability endpoint "
+                            f"(HTTP {response.status}); upgrade that worker before running this feature"
+                        )
+                    capability = await response.json()
+                if not isinstance(capability, dict):
+                    raise RuntimeError(f"Image-list worker {worker_id} returned malformed capability data")
+                supported = capability.get("supported")
+                protocol_version = capability.get("protocol_version")
+                nodes = capability.get("node_ids")
+                if (
+                    not isinstance(supported, bool)
+                    or type(protocol_version) is not int
+                    or not isinstance(nodes, list)
+                    or any(not isinstance(node_id, str) for node_id in nodes)
+                ):
+                    raise RuntimeError(f"Image-list worker {worker_id} returned malformed capability data")
+                if (
+                    supported is not True
+                    or protocol_version != IMAGE_LIST_PROTOCOL_VERSION
+                    or not required_nodes.issubset(nodes)
+                ):
+                    raise RuntimeError(
+                        f"Image-list worker {worker_id} is incompatible: requires protocol "
+                        f"v{IMAGE_LIST_PROTOCOL_VERSION} and nodes "
+                        f"{sorted(required_nodes)}; no work was submitted"
+                    )
+
+                if capability.get("execution_targets") is not True:
+                    raise RuntimeError(
+                        f"Image-list worker {worker_id} lacks explicit execution_targets support; "
+                        "upgrade that worker before running this feature; no work was submitted"
+                    )
+
+                if required_formats:
+                    advertised = capability.get("image_transfer_formats")
+                    if (not isinstance(advertised, list)
+                            or any(type(fmt) is not str for fmt in advertised)
+                            or not required_formats.issubset(advertised)):
+                        raise RuntimeError(
+                            f"Image-list worker {worker_id} lacks required image_transfer_formats "
+                            f"{sorted(required_formats)}; upgrade that worker before compressed IMAGE returns; "
+                            "no work was submitted"
+                        )
+                if require_value_results and capability.get("value_results") is not True:
+                    raise RuntimeError(
+                        f"Image-list worker {worker_id} lacks explicit value_results support; "
+                        "upgrade that worker before using End overrides; no work was submitted"
+                    )
+
+                check = "queue"
+                queue_url = build_worker_url(worker, "/queue")
+                async with session.get(queue_url, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"Image-list worker {worker_id} queue preflight returned HTTP {response.status}")
+                    queue = await response.json()
+                if (
+                    not isinstance(queue, dict)
+                    or not isinstance(queue.get("queue_running"), list)
+                    or not isinstance(queue.get("queue_pending"), list)
+                ):
+                    raise RuntimeError(f"Image-list worker {worker_id} returned malformed /queue state")
+                idle = not queue["queue_running"] and not queue["queue_pending"]
+                return worker_id, idle
+        except (asyncio.TimeoutError, aiohttp.ClientConnectionError) as exc:
+            log(
+                f"[Distributed] Image-list worker {worker_id} unavailable during {check} check; "
+                f"skipping: {exc}"
+            )
+            return worker_id, None
+
+    statuses = await asyncio.gather(*(inspect(worker) for worker in workers))
+    idle_workers = {
+        worker_id: True
+        for worker_id, idle in statuses
+        if idle is True
+    }
+    if require_idle and not idle_workers:
+        raise RuntimeError("No selected feature-compatible direct worker is idle; unrelated worker prompts were left untouched")
+    return idle_workers
 
 
 async def select_active_workers(
@@ -203,6 +361,10 @@ def _extract_queue_remaining(payload):
 
 async def _probe_worker_queue(worker, semaphore, probe_timeout):
     async with semaphore:
+        if worker.get("type") == "serverless":
+            from .serverless_runtime import get_manager
+            status = await get_manager().health(worker)
+            return {"worker": worker, "queue_remaining": status["queueRemaining"]}
         worker_url = build_worker_url(worker)
         payload = await probe_worker(worker_url, timeout=probe_timeout)
         if payload is None:

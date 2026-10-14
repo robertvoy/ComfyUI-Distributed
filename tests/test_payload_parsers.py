@@ -86,26 +86,24 @@ class ParseTilesFromFormTests(unittest.TestCase):
 
     # --- happy paths ---
 
-    def test_single_tile_returns_one_entry(self):
+    def test_single_tile_returns_image_and_metadata(self):
         tiles = pp._parse_tiles_from_form(_make_form(1))
         self.assertEqual(len(tiles), 1)
-
-    def test_multiple_tiles_all_returned(self):
-        tiles = pp._parse_tiles_from_form(_make_form(3))
-        self.assertEqual(len(tiles), 3)
-
-    def test_tile_image_is_pil_image(self):
-        tiles = pp._parse_tiles_from_form(_make_form(1))
-        self.assertIsInstance(tiles[0]["image"], PILImage.Image)
-
-    def test_tile_metadata_fields_are_parsed(self):
-        tiles = pp._parse_tiles_from_form(_make_form(1))
         tile = tiles[0]
+        self.assertIsInstance(tile["image"], PILImage.Image)
         self.assertEqual(tile["tile_idx"], 0)
         self.assertEqual(tile["x"], 0)
         self.assertEqual(tile["y"], 0)
         self.assertEqual(tile["extracted_width"], 64)
         self.assertEqual(tile["extracted_height"], 64)
+
+    def test_multiple_tiles_preserve_count_order_and_coordinates(self):
+        tiles = pp._parse_tiles_from_form(_make_form(3))
+        self.assertEqual(len(tiles), 3)
+        for i, tile in enumerate(tiles):
+            self.assertEqual(tile["tile_idx"], i)
+        self.assertEqual(tiles[1]["x"], 64)
+        self.assertEqual(tiles[2]["x"], 128)
 
     def test_padding_is_parsed_from_form(self):
         tiles = pp._parse_tiles_from_form(_make_form(1, padding=16))
@@ -137,16 +135,6 @@ class ParseTilesFromFormTests(unittest.TestCase):
         tiles = pp._parse_tiles_from_form(_make_form(1))
         self.assertNotIn("batch_idx", tiles[0])
         self.assertNotIn("global_idx", tiles[0])
-
-    def test_tile_indices_match_metadata_order(self):
-        tiles = pp._parse_tiles_from_form(_make_form(3))
-        for i, tile in enumerate(tiles):
-            self.assertEqual(tile["tile_idx"], i)
-
-    def test_x_coordinates_reflect_metadata(self):
-        tiles = pp._parse_tiles_from_form(_make_form(3))
-        self.assertEqual(tiles[1]["x"], 64)
-        self.assertEqual(tiles[2]["x"], 128)
 
     # --- error cases ---
 

@@ -2,7 +2,6 @@ import { app } from "/scripts/app.js";
 import { ENDPOINTS } from "./constants.js";
 
 const NODE_CLASS = "DistributedValue";
-const CONVERTED_WIDGET = "converted-widget";
 const DYNAMIC_DEFAULT_WIDGET = "_dv_default";
 const DYNAMIC_WORKER_WIDGET_PREFIX = "_dv_worker_";
 const WORKERS_CHANGED_EVENT = "distributed:workers-changed";
@@ -42,15 +41,13 @@ function getDynamicWorkerWidgets(node) {
     return (node.widgets || []).filter((w) => w.name.startsWith(DYNAMIC_WORKER_WIDGET_PREFIX));
 }
 
-function hideWidgetForGood(node, widget, suffix = "") {
+function hideWidgetForGood(widget) {
     if (!widget) return;
-    if (typeof widget.type === "string" && widget.type.startsWith(CONVERTED_WIDGET)) return;
-
-    widget.origType = widget.type;
-    widget.origComputeSize = widget.computeSize;
-    widget.origSerializeValue = widget.serializeValue;
-    widget.computeSize = () => [0, -4];
-    widget.type = `${CONVERTED_WIDGET}${suffix}`;
+    // These are serialized backing fields, not widgets converted into sockets.
+    // Keep their native type/serializer and mutate the shared options in place
+    // so both the classic canvas and Nodes 2.0 suppress the whole widget row.
+    widget.options ??= {};
+    widget.options.hidden = true;
 
     // Hide any attached DOM element (multiline widgets).
     if (widget.element) widget.element.style.display = "none";
@@ -58,14 +55,14 @@ function hideWidgetForGood(node, widget, suffix = "") {
 
     if (widget.linkedWidgets) {
         for (const linked of widget.linkedWidgets) {
-            hideWidgetForGood(node, linked, `:${widget.name}`);
+            hideWidgetForGood(linked);
         }
     }
 }
 
 function hideRawWidgets(node) {
-    hideWidgetForGood(node, getRawDefaultWidget(node), ":default_value");
-    hideWidgetForGood(node, getRawWorkerValuesWidget(node), ":worker_values");
+    hideWidgetForGood(getRawDefaultWidget(node));
+    hideWidgetForGood(getRawWorkerValuesWidget(node));
 }
 
 function removeDynamicDefaultWidget(node) {

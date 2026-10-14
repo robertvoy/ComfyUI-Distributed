@@ -3,6 +3,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 
 class _PromptQueue:
@@ -85,6 +86,60 @@ class QueuePromptPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(extra_data["create_time"], int)
         self.assertGreater(extra_data["create_time"], 0)
         self.assertEqual(extra_data["extra_pnginfo"]["workflow"], {"id": "workflow-1"})
+
+
+class ExplicitTargetTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.module, self.server = _load_async_helpers_module()
+        self.prompt = {"9": {"class_type": "Output"}, "10": {"class_type": "Output"}}
+        self.validate = AsyncMock(return_value=(True, None, ["9"], {}))
+        self.module.execution.validate_prompt = self.validate
+
+    async def test_targets_survive_callback_omission_and_are_queued_exactly(self):
+        seen = []
+        def callback(payload):
+            seen.append(payload["partial_execution_targets"][:])
+            payload["partial_execution_targets"].append("10")
+            return {"prompt": payload["prompt"]}
+        self.server.trigger_on_prompt = callback
+        targets = ["9"]
+        await self.module.queue_prompt_payload(self.prompt, partial_execution_targets=targets)
+        self.assertEqual(seen, [["9"]])
+        self.assertEqual(targets, ["9"])
+        self.assertEqual(self.validate.call_args.args[2], ["9"])
+        self.assertEqual(self.server.prompt_queue.items[0][4], ["9"])
+
+    async def test_invalid_requests_never_reach_validation_or_queue(self):
+        for targets in ([], "9", [9], [True], ["9", "9"], ["missing"], {}):
+            with self.subTest(targets=targets):
+                with self.assertRaises(self.module.PromptValidationError):
+                    await self.module.queue_prompt_payload(self.prompt, partial_execution_targets=targets)
+        self.validate.assert_not_awaited()
+        self.assertEqual(self.server.prompt_queue.items, [])
+
+    async def test_removed_target_after_callback_is_rejected(self):
+        self.server.trigger_on_prompt = lambda payload: {"prompt": {"10": self.prompt["10"]}}
+        with self.assertRaises(self.module.PromptValidationError):
+            await self.module.queue_prompt_payload(self.prompt, partial_execution_targets=["9"])
+        self.validate.assert_not_awaited()
+        self.assertEqual(self.server.prompt_queue.items, [])
+
+    async def test_partial_subset_extra_roots_and_target_errors_fail_closed(self):
+        for roots, errors in ((["9"], {}), (["9", "10", "extra"], {}),
+                              (["9", "10"], {"9": {"errors": [{"message": "bad"}]}}),
+                              (["9", "10"], {"dep": {"dependent_outputs": ["10"], "errors": []}})):
+            with self.subTest(roots=roots, errors=errors):
+                self.validate.return_value = (True, None, roots, errors)
+                with self.assertRaises(self.module.PromptValidationError):
+                    await self.module.queue_prompt_payload(self.prompt, partial_execution_targets=["9", "10"])
+        self.assertEqual(self.server.prompt_queue.items, [])
+
+    async def test_none_preserves_legacy_payload_and_validation(self):
+        seen = []
+        self.server.trigger_on_prompt = lambda payload: seen.append(payload.copy()) or payload
+        await self.module.queue_prompt_payload(self.prompt)
+        self.assertNotIn("partial_execution_targets", seen[0])
+        self.assertIsNone(self.validate.call_args.args[2])
 
 
 if __name__ == "__main__":

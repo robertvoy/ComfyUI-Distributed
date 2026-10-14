@@ -104,7 +104,8 @@ export const PULSE_ANIMATION_CSS = `
         transition: max-height 0.3s ease, opacity 0.3s ease, padding 0.3s ease, margin 0.3s ease;
     }
     .worker-settings.expanded {
-        max-height: 500px;
+        /* Let long forms and wrapped labels fit; the sidebar owns scrolling. */
+        max-height: none;
         opacity: 1;
         padding: 12px;
         margin-top: 8px;
@@ -130,7 +131,7 @@ export const PULSE_ANIMATION_CSS = `
 `;
 
 export const UI_STYLES = {
-    statusDot: "display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 10px;",
+    statusDot: "display: inline-block; flex: 0 0 10px; width: 10px; height: 10px; border-radius: 50%; margin-right: 10px;",
     controlsDiv: "padding: 0 12px 12px 12px; display: flex; gap: 6px;",
     formGroup: "display: flex; flex-direction: column; gap: 5px;",
     formLabel: "font-size: 12px; color: var(--dist-label-text, #ccc); font-weight: 500;",
@@ -146,12 +147,12 @@ export const UI_STYLES = {
     // Column styles
     columnBase: "display: flex; align-items: center; justify-content: center;",
     checkboxColumn: "flex: 0 0 44px; display: flex; align-items: center; justify-content: center; cursor: default;",
-    contentColumn: "flex: 1; display: flex; flex-direction: column; transition: background-color 0.2s ease;",
+    contentColumn: "flex: 1; min-width: 0; display: flex; flex-direction: column; transition: background-color 0.2s ease;",
     iconColumn: "width: 44px; flex-shrink: 0; font-size: 20px; color: var(--dist-placeholder-add-color, #666);",
     
     // Row and content styles
     infoRow: "display: flex; align-items: center; padding: 12px; cursor: pointer; min-height: 64px;",
-    workerContent: "display: flex; align-items: center; gap: 10px; flex: 1;",
+    workerContent: "display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0;",
     
     // Form and controls styles
     buttonGroup: "display: flex; gap: 4px; margin-top: 10px;",
@@ -224,6 +225,7 @@ export const ENDPOINTS = {
 
 export const NODE_CLASSES = {
     DISTRIBUTED_COLLECTOR: 'DistributedCollector',
+    IMAGE_LIST_START: 'DistributedImageListStart',
     DISTRIBUTED_SEED: 'DistributedSeed',
     DISTRIBUTED_EMPTY_IMAGE: 'DistributedEmptyImage',
     UPSCALE_DISTRIBUTED: 'UltimateSDUpscaleDistributed',

@@ -1,0 +1,691 @@
+{
+  "DistributedCollector": {
+    "input": {
+      "required": {
+        "load_balance": [
+          "BOOLEAN",
+          {
+            "default": false,
+            "tooltip": "Run this workflow on one least-busy participant (master included when participating)."
+          }
+        ]
+      },
+      "optional": {
+        "images": [
+          "IMAGE"
+        ],
+        "audio": [
+          "AUDIO"
+        ]
+      },
+      "hidden": {
+        "multi_job_id": [
+          "STRING",
+          {
+            "default": ""
+          }
+        ],
+        "is_worker": [
+          "BOOLEAN",
+          {
+            "default": false
+          }
+        ],
+        "master_url": [
+          "STRING",
+          {
+            "default": ""
+          }
+        ],
+        "enabled_worker_ids": [
+          "STRING",
+          {
+            "default": "[]"
+          }
+        ],
+        "worker_batch_size": [
+          "INT",
+          {
+            "default": 1,
+            "min": 1,
+            "max": 1024
+          }
+        ],
+        "worker_id": [
+          "STRING",
+          {
+            "default": ""
+          }
+        ],
+        "pass_through": [
+          "BOOLEAN",
+          {
+            "default": false
+          }
+        ],
+        "delegate_only": [
+          "BOOLEAN",
+          {
+            "default": false
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "load_balance"
+      ],
+      "optional": [
+        "images",
+        "audio"
+      ],
+      "hidden": [
+        "multi_job_id",
+        "is_worker",
+        "master_url",
+        "enabled_worker_ids",
+        "worker_batch_size",
+        "worker_id",
+        "pass_through",
+        "delegate_only"
+      ]
+    },
+    "output": [
+      "IMAGE",
+      "AUDIO"
+    ],
+    "output_name": [
+      "images",
+      "audio"
+    ],
+    "output_is_list": [
+      false,
+      false
+    ],
+    "is_input_list": true,
+    "output_node": false,
+    "category": "image",
+    "display_name": "Distributed Collector"
+  },
+  "DistributedSeed": {
+    "input": {
+      "required": {
+        "seed": [
+          "INT",
+          {
+            "default": 1125899906842,
+            "min": 0,
+            "max": 1125899906842624,
+            "forceInput": false
+          }
+        ]
+      },
+      "hidden": {
+        "is_worker": [
+          "BOOLEAN",
+          {
+            "default": false
+          }
+        ],
+        "worker_id": [
+          "STRING",
+          {
+            "default": ""
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "seed"
+      ],
+      "hidden": [
+        "is_worker",
+        "worker_id"
+      ]
+    },
+    "output": [
+      "INT"
+    ],
+    "output_name": [
+      "seed"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "is_input_list": false,
+    "output_node": false,
+    "category": "utils",
+    "display_name": "Distributed Seed"
+  },
+  "DistributedModelName": {
+    "input": {
+      "required": {
+        "text": [
+          "STRING",
+          {
+            "default": ""
+          }
+        ]
+      },
+      "hidden": {
+        "unique_id": "UNIQUE_ID",
+        "extra_pnginfo": "EXTRA_PNGINFO"
+      }
+    },
+    "input_order": {
+      "required": [
+        "text"
+      ],
+      "hidden": [
+        "unique_id",
+        "extra_pnginfo"
+      ]
+    },
+    "output": [
+      "*"
+    ],
+    "output_name": [
+      "output"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "is_input_list": false,
+    "output_node": true,
+    "category": "utils",
+    "display_name": "Distributed Model Name"
+  },
+  "DistributedValue": {
+    "input": {
+      "required": {
+        "default_value": [
+          "STRING",
+          {
+            "default": ""
+          }
+        ],
+        "worker_values": [
+          "STRING",
+          {
+            "default": "{}"
+          }
+        ]
+      },
+      "hidden": {
+        "is_worker": [
+          "BOOLEAN",
+          {
+            "default": false
+          }
+        ],
+        "worker_id": [
+          "STRING",
+          {
+            "default": ""
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "default_value",
+        "worker_values"
+      ],
+      "hidden": [
+        "is_worker",
+        "worker_id"
+      ]
+    },
+    "output": [
+      "*"
+    ],
+    "output_name": [
+      "value"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "is_input_list": false,
+    "output_node": false,
+    "category": "utils",
+    "display_name": "Distributed Value"
+  },
+  "ImageBatchDivider": {
+    "input": {
+      "required": {
+        "images": [
+          "IMAGE"
+        ],
+        "divide_by": [
+          "INT",
+          {
+            "default": 2,
+            "min": 1,
+            "max": 10,
+            "step": 1,
+            "display": "number",
+            "tooltip": "Number of parts to divide the batch into"
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "images",
+        "divide_by"
+      ]
+    },
+    "output": [
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*"
+    ],
+    "output_name": [
+      "batch_1",
+      "batch_2",
+      "batch_3",
+      "batch_4",
+      "batch_5",
+      "batch_6",
+      "batch_7",
+      "batch_8",
+      "batch_9",
+      "batch_10"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "is_input_list": false,
+    "output_node": true,
+    "category": "image",
+    "display_name": "Image Batch Divider"
+  },
+  "AudioBatchDivider": {
+    "input": {
+      "required": {
+        "audio": [
+          "AUDIO"
+        ],
+        "divide_by": [
+          "INT",
+          {
+            "default": 2,
+            "min": 1,
+            "max": 10,
+            "step": 1,
+            "display": "number",
+            "tooltip": "Number of sequential time segments to create"
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "audio",
+        "divide_by"
+      ]
+    },
+    "output": [
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+      "*"
+    ],
+    "output_name": [
+      "audio_1",
+      "audio_2",
+      "audio_3",
+      "audio_4",
+      "audio_5",
+      "audio_6",
+      "audio_7",
+      "audio_8",
+      "audio_9",
+      "audio_10"
+    ],
+    "output_is_list": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ],
+    "is_input_list": false,
+    "output_node": true,
+    "category": "audio",
+    "display_name": "Audio Segment Divider"
+  },
+  "DistributedEmptyImage": {
+    "input": {
+      "required": {
+        "height": [
+          "INT",
+          {
+            "default": 64,
+            "min": 1,
+            "max": 4096,
+            "step": 1
+          }
+        ],
+        "width": [
+          "INT",
+          {
+            "default": 64,
+            "min": 1,
+            "max": 4096,
+            "step": 1
+          }
+        ],
+        "channels": [
+          "INT",
+          {
+            "default": 3,
+            "min": 1,
+            "max": 4,
+            "step": 1
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "height",
+        "width",
+        "channels"
+      ]
+    },
+    "output": [
+      "IMAGE"
+    ],
+    "output_name": [
+      "IMAGE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "is_input_list": false,
+    "output_node": false,
+    "category": "image",
+    "display_name": "Distributed Empty Image"
+  },
+  "UltimateSDUpscaleDistributed": {
+    "input": {
+      "required": {
+        "upscaled_image": [
+          "IMAGE"
+        ],
+        "model": [
+          "MODEL"
+        ],
+        "positive": [
+          "CONDITIONING"
+        ],
+        "negative": [
+          "CONDITIONING"
+        ],
+        "vae": [
+          "VAE"
+        ],
+        "seed": [
+          "INT",
+          {
+            "default": 0,
+            "min": 0,
+            "max": 18446744073709551615
+          }
+        ],
+        "steps": [
+          "INT",
+          {
+            "default": 20,
+            "min": 1,
+            "max": 10000
+          }
+        ],
+        "cfg": [
+          "FLOAT",
+          {
+            "default": 8.0,
+            "min": 0.0,
+            "max": 100.0
+          }
+        ],
+        "sampler_name": [
+          [
+            "euler",
+            "euler_cfg_pp",
+            "euler_ancestral",
+            "euler_ancestral_cfg_pp",
+            "heun",
+            "heunpp2",
+            "exp_heun_2_x0",
+            "exp_heun_2_x0_sde",
+            "dpm_2",
+            "dpm_2_ancestral",
+            "lms",
+            "dpm_fast",
+            "dpm_adaptive",
+            "dpmpp_2s_ancestral",
+            "dpmpp_2s_ancestral_cfg_pp",
+            "dpmpp_sde",
+            "dpmpp_sde_gpu",
+            "dpmpp_2m",
+            "dpmpp_2m_cfg_pp",
+            "dpmpp_2m_sde",
+            "dpmpp_2m_sde_gpu",
+            "dpmpp_2m_sde_heun",
+            "dpmpp_2m_sde_heun_gpu",
+            "dpmpp_3m_sde",
+            "dpmpp_3m_sde_gpu",
+            "ddpm",
+            "lcm",
+            "ipndm",
+            "ipndm_v",
+            "deis",
+            "cfgpp_ud10_ab",
+            "res_multistep",
+            "res_multistep_cfg_pp",
+            "res_multistep_ancestral",
+            "res_multistep_ancestral_cfg_pp",
+            "gradient_estimation",
+            "gradient_estimation_cfg_pp",
+            "er_sde",
+            "seeds_2",
+            "seeds_3",
+            "sa_solver",
+            "sa_solver_pece",
+            "ddim",
+            "uni_pc",
+            "uni_pc_bh2"
+          ]
+        ],
+        "scheduler": [
+          [
+            "simple",
+            "sgm_uniform",
+            "karras",
+            "exponential",
+            "ddim_uniform",
+            "beta",
+            "normal",
+            "linear_quadratic",
+            "kl_optimal"
+          ]
+        ],
+        "denoise": [
+          "FLOAT",
+          {
+            "default": 0.5,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.01
+          }
+        ],
+        "tile_width": [
+          "INT",
+          {
+            "default": 512,
+            "min": 64,
+            "max": 2048,
+            "step": 8
+          }
+        ],
+        "tile_height": [
+          "INT",
+          {
+            "default": 512,
+            "min": 64,
+            "max": 2048,
+            "step": 8
+          }
+        ],
+        "padding": [
+          "INT",
+          {
+            "default": 32,
+            "min": 0,
+            "max": 256,
+            "step": 8
+          }
+        ],
+        "mask_blur": [
+          "INT",
+          {
+            "default": 8,
+            "min": 0,
+            "max": 256
+          }
+        ],
+        "force_uniform_tiles": [
+          "BOOLEAN",
+          {
+            "default": true
+          }
+        ],
+        "tiled_decode": [
+          "BOOLEAN",
+          {
+            "default": false
+          }
+        ]
+      },
+      "hidden": {
+        "multi_job_id": [
+          "STRING",
+          {
+            "default": ""
+          }
+        ],
+        "is_worker": [
+          "BOOLEAN",
+          {
+            "default": false
+          }
+        ],
+        "master_url": [
+          "STRING",
+          {
+            "default": ""
+          }
+        ],
+        "enabled_worker_ids": [
+          "STRING",
+          {
+            "default": "[]"
+          }
+        ],
+        "worker_id": [
+          "STRING",
+          {
+            "default": ""
+          }
+        ],
+        "tile_indices": [
+          "STRING",
+          {
+            "default": ""
+          }
+        ],
+        "dynamic_threshold": [
+          "INT",
+          {
+            "default": 8,
+            "min": 1,
+            "max": 64
+          }
+        ]
+      }
+    },
+    "input_order": {
+      "required": [
+        "upscaled_image",
+        "model",
+        "positive",
+        "negative",
+        "vae",
+        "seed",
+        "steps",
+        "cfg",
+        "sampler_name",
+        "scheduler",
+        "denoise",
+        "tile_width",
+        "tile_height",
+        "padding",
+        "mask_blur",
+        "force_uniform_tiles",
+        "tiled_decode"
+      ],
+      "hidden": [
+        "multi_job_id",
+        "is_worker",
+        "master_url",
+        "enabled_worker_ids",
+        "worker_id",
+        "tile_indices",
+        "dynamic_threshold"
+      ]
+    },
+    "output": [
+      "IMAGE"
+    ],
+    "output_name": [
+      "IMAGE"
+    ],
+    "output_is_list": [
+      false
+    ],
+    "is_input_list": false,
+    "output_node": false,
+    "category": "image/upscaling",
+    "display_name": "Ultimate SD Upscale Distributed (No Upscale)"
+  }
+}
