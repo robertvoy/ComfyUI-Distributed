@@ -361,6 +361,14 @@ async def orchestrate_distributed_execution(
                 "DistributedMediaCollector or Ultimate SD Upscale nodes in one prompt"
             )
         validate_image_list_regions(prompt_obj, explicit_targets=True)
+        from ..serverless_bridge.image_transfer import DEFAULT_FORMAT, DEFAULT_QUALITY, validate_options
+        required_transfer_formats = set()
+        for end_id in prompt_index.nodes_for_class("DistributedImageListEnd"):
+            end_inputs = prompt_obj[end_id].get("inputs", {})
+            fmt, _ = validate_options(end_inputs.get("transfer_format", DEFAULT_FORMAT),
+                                      end_inputs.get("transfer_quality", DEFAULT_QUALITY))
+            if fmt != DEFAULT_FORMAT:
+                required_transfer_formats.add(fmt)
         workers = _resolve_direct_workers_for_image_list(config, requested_ids)
         if _has_selected_serverless_workers(config, requested_ids):
             from ..image_list.serverless import resolve_serverless_workers
@@ -421,7 +429,9 @@ async def orchestrate_distributed_execution(
                 "No selected worker is reachable for Distributed Image List in orchestrator-only mode"
             )
         direct_workers = [worker for worker in active_workers if worker.get("type") != "serverless"]
-        idle_ids = (await preflight_image_list_workers(direct_workers, require_idle=delegate_master)
+        transfer_kwargs = ({"required_transfer_formats": sorted(required_transfer_formats)}
+                           if required_transfer_formats else {})
+        idle_ids = (await preflight_image_list_workers(direct_workers, require_idle=delegate_master, **transfer_kwargs)
                     if direct_workers else {})
         active_workers = [worker for worker in active_workers
                           if worker.get("type") == "serverless" or worker["id"] in idle_ids]

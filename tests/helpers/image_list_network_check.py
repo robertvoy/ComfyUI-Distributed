@@ -458,7 +458,14 @@ async def coordinator():
             ALLOW_MASTER = True
             config['settings']['master_delegate_only'] = False
             participation_counts = {}
-            for mode, selected in [('mixed', [w['id'] for w in workers]), ('master-only', [])]:
+            for mode, selected, fmt in [('mixed', [w['id'] for w in workers], 'exact'),
+                                         ('master-only', [], 'exact'),
+                                         ('mixed-png', [w['id'] for w in workers], 'png'),
+                                         ('master-only-png', [], 'png')]:
+                case_prompt = copy.deepcopy(prompt)
+                if fmt != 'exact':
+                    case_prompt['4']['inputs'].update(transfer_format=fmt, transfer_quality=73)
+                saved_case = copy.deepcopy(case_prompt)
                 executor = execution.PromptExecutor(ps, cache_args={'ram': 0, 'ram_inactive': 0}, asset_manager=assets)
                 before_sources, before_local, before_models = len(SOURCE_CALLS), len(BRANCH_CALLS), len(MODEL_CALLS)
                 before_utilities, before_events = len(UTILITY_CALLS), len(ITEM_EXECUTIONS)
@@ -472,8 +479,8 @@ async def coordinator():
                      patch.object(orchestration, 'queue_prompt_payload', enqueue), \
                      patch.object(config_mod, 'get_worker_timeout_seconds', return_value=15):
                     queued = await asyncio.wait_for(orchestration.orchestrate_distributed_execution(
-                        prompt, None, 'test', selected), 45)
-                assert prompt == saved_prompt, (mode, 'saved/source graph changed')
+                        case_prompt, None, 'test', selected), 45)
+                assert case_prompt == saved_case and prompt == saved_prompt, (mode, 'saved/source graph changed')
                 assert executor.success, (mode, executor.status_messages)
                 assert queued[2] == len(selected)
                 assert len(SOURCE_CALLS) == before_sources + 1, 'source was reevaluated per local item'
@@ -499,7 +506,7 @@ async def coordinator():
                             assert '5' not in submission['node_ids']
                         remote_calls.extend(calls)
                         assert not current['running'] and not current['pending'], current
-                if mode == 'mixed':
+                if mode.startswith('mixed'):
                     assert remote_calls, 'mixed execution failed to use direct workers'
                 else:
                     assert not remote_calls and len(local_calls) == COUNT
@@ -507,13 +514,18 @@ async def coordinator():
                 images, masks, texts = CAPTURED[-1]
                 assert len(images) == len(masks) == len(texts) == COUNT
                 for i, row in enumerate(source_rows()):
-                    assert torch.equal(images[i], row['image'] + row['strength']), (mode, i)
+                    expected = row['image'] + row['strength']
+                    if fmt == 'png' and i in remote_calls:
+                        expected = expected.clone()
+                        expected[..., :3] = (expected[..., :3].clamp(0, 1) * 255).to(torch.uint8).float() / 255
+                    assert torch.equal(images[i], expected), (mode, i)
                     assert torch.equal(masks[i], row['mask'] * 0.5), (mode, i)
                     assert texts[i] == f'item-{i}:seed-{100 + i}', (mode, texts)
                 assert not runtime._MASTER_JOBS and not runtime._WORKER_ITEMS
                 participation_counts[mode] = {'master': len(local_calls), 'workers': len(remote_calls)}
             print('IMAGE_LIST_MASTER_OK ' + json.dumps(participation_counts))
-            assert len(outer_executions) == 4 and all(row['captures'] == 1 for row in outer_executions)
+            assert len(outer_executions) == 2 + len(participation_counts) and all(row['captures'] == 1 for row in outer_executions)
+            print('IMAGE_LIST_TRANSFER_HTTP_OK mixed-png and master-only-png; masks/text/alpha/local images exact')
             print('IMAGE_LIST_TARGETS_OK ' + json.dumps({
                 'modes': ['delegate-only', 'mixed', 'master-only'],
                 'outer_targets': outer_executions[0]['targets'], 'worker_targets': ['4'],

@@ -15,6 +15,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+try:
+    from ..serverless_bridge.image_transfer import (
+        FORMATS as IMAGE_TRANSFER_FORMATS, DEFAULT_FORMAT, DEFAULT_QUALITY, validate_options,
+    )
+except ImportError:  # Standalone image_list.runtime (without extension bootstrap).
+    from serverless_bridge.image_transfer import (
+        FORMATS as IMAGE_TRANSFER_FORMATS, DEFAULT_FORMAT, DEFAULT_QUALITY, validate_options,
+    )
+
 # v2: Start carries generic value_N slots instead of fixed reference/text/strength/seed fields.
 PROTOCOL_VERSION = 2
 START_CLASS = "DistributedImageListStart"
@@ -257,6 +266,8 @@ def decode_value(data: Any, expected_kind: str) -> Any:
         return None
     if not isinstance(data, dict) or data.get("type") != expected_kind:
         raise ValueError(f"Expected {expected_kind} transport value")
+    if "encoding" in data or "descriptor" in data:
+        raise ValueError("Compressed transport is supported only for the returned IMAGE")
     if expected_kind in ("IMAGE", "MASK", "TENSOR"):
         torch = _torch()
         dtype_name = data.get("dtype")
@@ -734,10 +745,48 @@ def register_assignment(context_id: str, item_index: int, worker_id: str, token:
         state.expected_workers[item_index] = worker_id
 
 
+def _image_codec():
+    # Exact returns and inputs must not import optional media codec dependencies.
+    if __package__ == "image_list":
+        from serverless_bridge import image_codec
+    else:
+        from ..serverless_bridge import image_codec
+    return image_codec
+
+
+def _decode_return_image(data: Any) -> Any:
+    if (not isinstance(data, dict) or set(data) != {"type", "encoding", "descriptor", "data"}
+            or data["type"] != "IMAGE" or data["encoding"] != "image-transfer-v1"):
+        raise ValueError("Invalid compressed IMAGE envelope")
+    descriptor = data["descriptor"]
+    if not isinstance(descriptor, dict) or descriptor.get("encoding") != "image-transfer-v1":
+        raise ValueError("Invalid compressed IMAGE descriptor")
+    shape = descriptor.get("shape")
+    if (not isinstance(shape, list) or len(shape) != 4
+            or any(type(dim) is not int or dim < 1 for dim in shape)
+            or shape[0] != 1 or shape[-1] not in (3, 4)):
+        raise ValueError("Compressed IMAGE must have shape [1,H,W,3|4]")
+    encoded = data["data"]
+    if not isinstance(encoded, str) or len(encoded) > ((MAX_PAYLOAD_BYTES + 2) // 3) * 4:
+        raise ValueError("Compressed IMAGE data is missing or exceeds the transport limit")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("Compressed IMAGE data must be valid base64") from exc
+    if len(raw) > MAX_PAYLOAD_BYTES:
+        raise ValueError("Compressed IMAGE exceeds the transport limit")
+    return _image_codec().decode_image(descriptor, raw, max_bytes=MAX_PAYLOAD_BYTES)
+
+
 def decode_result(result: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ValueError("result must be an object")
-    image = decode_value(result.get("image"), "IMAGE")
+    image_data = result.get("image")
+    if isinstance(image_data, dict) and ("encoding" in image_data or "descriptor" in image_data):
+        encode_request_payload(result)  # Bound combined JSON/base64 before codec allocation.
+        image = _decode_return_image(image_data)
+    else:
+        image = decode_value(image_data, "IMAGE")
     if image is None or image.ndim != 4 or image.shape[0] != 1 or image.shape[-1] not in (3, 4):
         raise ValueError("result.image must contain exactly one RGB/RGBA image")
     mask = decode_value(result.get("mask"), "MASK")
@@ -773,11 +822,28 @@ def normalize_worker_result(images: Any, masks: Any = None, texts: Any = None) -
     return {"image": image, "mask": mask, "text": text}
 
 
-def encode_result(result: dict[str, Any]) -> dict[str, Any]:
+def encode_result(result: dict[str, Any], *, transfer_format=DEFAULT_FORMAT,
+                  transfer_quality=DEFAULT_QUALITY) -> dict[str, Any]:
+    fmt, quality = validate_options(transfer_format, transfer_quality)
     normalized = normalize_worker_result(result.get("image"), result.get("mask"), result.get("text"))
-    return {"image": encode_value(normalized["image"], "IMAGE"),
-            "mask": encode_value(normalized["mask"], "MASK"),
-            "text": encode_value(normalized["text"], "STRING")}
+    if fmt == "exact":
+        image = encode_value(normalized["image"], "IMAGE")
+    else:
+        value = normalized["image"]
+        # Reject before moving/copying a potentially oversized device tensor.
+        if value.numel() * value.element_size() > MAX_PAYLOAD_BYTES:
+            raise ValueError("IMAGE item exceeds the image-list transport limit")
+        descriptor, raw = _image_codec().encode_image(
+            value.detach().to("cpu").contiguous(), transfer_format=fmt,
+            transfer_quality=quality, max_bytes=MAX_PAYLOAD_BYTES,
+        )
+        image = {"type": "IMAGE", "encoding": "image-transfer-v1", "descriptor": descriptor,
+                 "data": base64.b64encode(raw).decode("ascii")}
+    encoded = {"image": image, "mask": encode_value(normalized["mask"], "MASK"),
+               "text": encode_value(normalized["text"], "STRING")}
+    if fmt != "exact":
+        encode_request_payload(encoded)
+    return encoded
 
 
 def _collect_output_lists(results: list[dict[str, Any]]) -> tuple[list[Any], list[Any], list[Any]]:
@@ -872,8 +938,17 @@ async def _run_image_list_slots(state, config, workers, region, controller):
     import aiohttp
 
     serverless_slots = list(controller.slots) if controller is not None else []
+    end_inputs = state.original_prompt[state.end_id]["inputs"]
+    transfer_format, _ = validate_options(
+        end_inputs.get("transfer_format", DEFAULT_FORMAT),
+        end_inputs.get("transfer_quality", DEFAULT_QUALITY),
+    )
+    transfer_requirements = ({"required_transfer_formats": (transfer_format,)}
+                             if transfer_format != "exact" else {})
     # Direct capability/idle probes must never be sent to a serverless pool.
-    worker_statuses = await preflight_image_list_workers(workers, require_idle=not state.master_participates) if workers else {}
+    worker_statuses = await preflight_image_list_workers(
+        workers, require_idle=not state.master_participates, **transfer_requirements,
+    ) if workers else {}
     workers = [worker for worker in workers if worker["id"] in worker_statuses]
     if not workers and not serverless_slots and not state.master_participates:
         raise RuntimeError("No reachable, feature-compatible image-list workers are available; master execution is disabled")
@@ -913,6 +988,13 @@ async def _run_image_list_slots(state, config, workers, region, controller):
         if worker is None:
             raise RuntimeError(f"Worker {worker_id} was removed before dispatch")
         assert session is not None
+        if transfer_requirements:
+            # Recheck on every compressed assignment, before staging or POSTing.
+            statuses = await preflight_image_list_workers(
+                [worker], require_idle=True, **transfer_requirements,
+            )
+            if worker_id not in statuses:
+                raise RuntimeError(f"Image-list worker {worker_id} unavailable before compressed return dispatch")
         token = create_worker_task_token()
         register_assignment(context_id, index, worker_id, token)
         item_payload = {"context_id": context_id, "item": encode_item(state.items[index])}

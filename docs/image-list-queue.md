@@ -62,6 +62,32 @@ End's optional `texts` is a connection-only socket. For workflows saved before t
 
 File-based dependencies keep ComfyUI's `[output]` / `[temp]` root annotations and are read on the master. Direct-worker copies use separate content-addressed paths under `input/distributed-media/`; each direct worker's rewritten prompt is reused across items without reusing item tokens. Cloud requests use the PR2 bounded file-input adapters instead.
 
+## Image return format and quality
+
+End adds `transfer_format` (default **exact**) and `transfer_quality` (default **90**).
+These apply to returned images from **both direct workers and serverless pools**.
+Master-local results bypass encoding. Input images, masks, generic values and
+returned masks/text retain their exact existing transport.
+
+- `exact` preserves floating-point dtype and values.
+- `legacy_png`, `png`, `ffv1` preserve quantized 8-bit image pixels, not the
+  original floating-point colors. `legacy_png` is PNG without compression.
+- `jpeg`, `webp`, `h264`, `h265`, `av1` are lossy choices; quality is 1–100.
+  Video codecs encode each assigned image independently, not the whole source list.
+- Dimensions, floating dtype and alpha survive; alpha is an exact sidecar.
+- Direct workers must advertise the selected codec in `image_transfer_formats`;
+  older workers fail before submission for non-exact choices. Exact remains
+  compatible with the existing protocol. Serverless endpoints need the updated
+  complete bridge; health probing does not prove codec availability.
+- The selected software encoder must be installed. Encoding failures stop the
+  item; there is no silent format fallback. No hardware encoder is selected.
+
+Compression can reduce transfer size, but does **not** bypass decoded tensor,
+conservative codec scratch, or complete request limits. For details and codec
+limits, see [image return options](serverless-media.md#image-return-format-and-quality).
+Mixed local/remote results may have different color fidelity when compression is
+selected, because local images are deliberately not quantized.
+
 ## Serverless pools and bounded capacity
 
 Select `media_profile: "comfy-media-v1"` for each cloud pool. The endpoint must
@@ -87,7 +113,8 @@ Provider health/authentication probing does not verify bridge/model installation
 - Each cloud request uses the standard media-v1 envelope and existing durable
   serverless job lifecycle. The private item graph replaces Start/End with typed
   inputs and explicit exporter roots, not independent all-output execution.
-  IMAGE/MASK tensor data and text are preserved by the typed codecs. There is no
+  IMAGE returns are exact by default, or explicitly encoded as selected at End.
+  MASK tensor data, input images and text retain exact typed codecs. There is no
   image-list-specific endpoint protocol or new visible node socket.
 - Cloud `value_N` tensors must have native IMAGE `[B,H,W,C]` or MASK `[B,H,W]`
   shapes, not arbitrary rank-one/rank-two tensor payloads. Typed tensors must be
@@ -118,7 +145,7 @@ Provider health/authentication probing does not verify bridge/model installation
 - Queue preparation works on an execution copy, leaving the saved canvas unchanged. Unused per-item preview/save branches are pruned by dependency reachability, not node names. Required computational utilities marked `OUTPUT_NODE` stay in the graph; explicit `partial_execution_targets` prevent them from also becoming independent outer-master roots. End and legitimate post-End or unrelated outputs are retained. Bypass/rejoin branches still fail boundary validation rather than being silently removed.
 - Every selected direct worker must advertise `execution_targets: true` as well as the existing image-list protocol. Older workers fail preflight before dispatch. Both HTTP and WebSocket item submissions target End only; the participating master uses its existing End-only local executor. Cloud jobs use explicit media exporter roots. Submit through `/distributed/queue`: an ordinary all-output `/prompt` request does not receive this relaxation.
 - **Target selection is not a sandbox.** A required utility still runs its own save, preview or other side effects when it executes for an item. Keep intentional final saving after End.
-- The entire input list is materialized before scheduling; this is not streaming input. The limit is 4,096 frames. Direct-worker transport preserves floating-point tensor dtype and values rather than encoding to lossy images. Each direct-worker tensor is limited to 50 MiB, and the complete JSON/base64 HTTP request to 101 MiB; image/mask/value combinations can hit the aggregate request limit first. Serverless inline limits are smaller, as described above. In-process master items use tensors directly and are not subject to those HTTP limits.
+- The entire input list is materialized before scheduling; this is not streaming input. The limit is 4,096 frames. Direct-worker input transport and default exact returns preserve floating-point tensor dtype and values. Opt-in image return encoding does not relax decoded-size limits. Each direct-worker tensor is limited to 50 MiB, and the complete JSON/base64 HTTP request to 101 MiB; image/mask/value combinations can hit the aggregate request limit first. Serverless inline limits are smaller, as described above. In-process master items use tensors directly and are not subject to those HTTP limits.
 - Results are accepted once per item using assignment tokens. Missing, duplicate, malformed and wrong-index results fail rather than silently returning a partial list. No failed or ambiguous submission is retried automatically.
 - Worker errors fail the region. For direct workers, the worker timeout measures loss of evidence for the owned prompt ID, not maximum render duration. Pending/running evidence refreshes liveness; unrelated busy jobs and failed polls do not. Healthy cold loads and long renders can continue. Serverless jobs instead use their configured serverless timeout and durable manager lifecycle; they are excluded from direct-history/liveness polling.
 - User interruption is checked during submission and result waiting. Cleanup targets only this region's acknowledged prompt IDs and staged input tokens. Submission may wait briefly for an acknowledgement before cancellation; remote transport and cleanup have finite time limits. Local cleanup stops at node/progress boundaries and waits for its execution thread to finish before the parent prompt can resume. A synchronous node that does not cooperate with cancellation can delay this beyond the configured deadline. Lost acknowledgements are ambiguous, never retried automatically. Unreachable cleanup is logged as unconfirmed and may require checking the worker manually; cancellation does not guarantee remote termination through a broken network.

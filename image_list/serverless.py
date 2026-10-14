@@ -150,11 +150,17 @@ async def prepare_serverless_item(prompt, region, item, worker, *, request_id, j
         raise ValueError("Image-list region is missing its boundary nodes")
     graph = {nid: copy.deepcopy(prompt[nid]) for nid in sorted(ids)}
     end_inputs = graph[end].get("inputs", {})
+    from ..serverless_bridge.image_transfer import DEFAULT_FORMAT, DEFAULT_QUALITY, validate_options
+    transfer_format, transfer_quality = validate_options(
+        end_inputs.get("transfer_format", DEFAULT_FORMAT),
+        end_inputs.get("transfer_quality", DEFAULT_QUALITY))
     if "images" not in end_inputs:
         raise ValueError("Image-list End requires images")
     graph[end] = {"class_type": "DistributedMediaCollector", "inputs": {
         **{key: end_inputs[key] for key in ("images", "masks", "texts") if key in end_inputs},
         "multi_job_id": job_id, "worker_id": worker["id"]}}
+    if transfer_format != DEFAULT_FORMAT:
+        graph[end]["inputs"].update(transfer_format=transfer_format, transfer_quality=transfer_quality)
     del graph[start]
     if type(item.get("index")) is not int or item["index"] < 0:
         raise ValueError("Image-list item index must be a nonnegative integer")

@@ -5,6 +5,7 @@ from aiohttp import web
 import server
 
 from ..image_list.runtime import (
+    IMAGE_TRANSFER_FORMATS,
     MAX_REQUEST_BYTES,
     PROTOCOL_VERSION,
     decode_result,
@@ -39,6 +40,7 @@ async def image_list_capabilities_endpoint(_request):
         "protocol_version": PROTOCOL_VERSION,
         "node_ids": ["DistributedImageListStart", "DistributedImageListEnd"],
         "transport": "typed-float-tensor-json-v1",
+        "image_transfer_formats": list(IMAGE_TRANSFER_FORMATS),
     })
 
 
