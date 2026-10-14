@@ -347,12 +347,12 @@ async def orchestrate_distributed_execution(
         requires_values = any(end_override_names(node.get("inputs", {}))
                               for node in prompt_obj.values() if node.get("class_type") == END_CLASS)
         value_preflight = {"require_value_results": True} if requires_values else {}
-        idle_ids = (await preflight_image_list_workers(active_workers, require_idle=delegate_master,
-                                                       **value_preflight)
-                    if active_workers else {})
-        active_workers = [worker for worker in active_workers if worker["id"] in idle_ids]
-        if not active_workers and delegate_master:
-            raise RuntimeError("No feature-compatible direct worker is idle in orchestrator-only mode")
+        # Persist candidates, not this submission-time idle snapshot: a preceding
+        # master prompt may still be using them. The image-list runtime rechecks
+        # capability and availability before assigning the first item.
+        if active_workers:
+            await preflight_image_list_workers(active_workers, require_idle=False,
+                                               **value_preflight)
     else:
         delegate_master = selected_delegate_master
 
