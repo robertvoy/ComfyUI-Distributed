@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import math
 import secrets
+import struct
 import threading
 import time
 from dataclasses import dataclass, field
@@ -242,6 +244,64 @@ def normalize_image_list_inputs(images: Any, mask: Any = None, values: Any = Non
     ]
 
 
+def is_valid_item_identity(identity: Any) -> bool:
+    return (isinstance(identity, str) and len(identity) == 71
+            and identity.startswith("sha256:")
+            and all(char in "0123456789abcdef" for char in identity[7:]))
+
+
+def item_content_identity(item: dict[str, Any]) -> str:
+    """Hash normalized content, not transport bytes or dispatch metadata.
+
+    Length-framed, typed fields distinguish scalars, absent masks, slot names,
+    shapes and exact tensor bits (including bfloat16). CPU copying changes neither
+    dtype nor values; local items deliberately have no HTTP transport-size limit.
+    """
+    digest = hashlib.sha256(b"distributed-image-list-item-v1\0")
+
+    def field(tag, raw):
+        digest.update(tag.encode("ascii") + b"\0")
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+
+    def value(raw, name):
+        if raw is None:
+            field("NONE", b"")
+            return
+        kind = value_kind(raw, name)
+        if kind == "TENSOR":
+            cpu = raw.detach().to("cpu").contiguous()
+            field("DTYPE", str(cpu.dtype).encode("ascii"))
+            field("SHAPE", json.dumps(list(cpu.shape), separators=(",", ":")).encode("ascii"))
+            field("TENSOR", memoryview(cpu.view(_torch().uint8).numpy()).cast("B"))
+        elif kind == "FLOAT":
+            field(kind, struct.pack("!d", raw))
+        elif kind == "BOOLEAN":
+            field(kind, b"1" if raw else b"0")
+        elif kind == "INT":
+            field(kind, str(raw).encode("ascii"))
+        else:
+            field(kind, raw.encode("utf-8", errors="surrogatepass"))
+
+    index = item["index"]
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError("item.index must be a non-negative integer")
+    field("INDEX", str(index).encode("ascii"))
+    field("IMAGE", b"")
+    value(item["image"], "image")
+    field("MASK", b"")
+    value(item.get("mask"), "mask")
+    values = item.get("values") or {}
+    if not isinstance(values, dict) or any(name not in VALUE_NAMES for name in values):
+        raise ValueError("item.values must be a mapping of value_N slots")
+    # Canonical socket order, not the producer's mapping insertion order.
+    for name in VALUE_NAMES:
+        if name in values:
+            field("SLOT", name.encode("ascii"))
+            value(values[name], name)
+    return "sha256:" + digest.hexdigest()
+
+
 def _tensor_dtype_name(tensor: Any) -> str:
     name = str(tensor.dtype).removeprefix("torch.")
     if name not in _ALLOWED_FLOAT_DTYPES:
@@ -391,26 +451,64 @@ def _sweep_worker_items() -> None:
                 del _WORKER_ITEMS[token]
 
 
-def store_worker_item(token: str, item: dict[str, Any]) -> None:
+def store_worker_item(token: str, item: dict[str, Any]) -> str:
     if not isinstance(token, str) or len(token) < 32 or len(token) > 128:
         raise ValueError("token must be a 32-128 character capability")
     clean = decode_item(item)
+    # Never trust a master-supplied digest; hash the decoded worker-owned item.
+    identity = item_content_identity(clean)
     _sweep_worker_items()
     with _LOCK:
         if token in _WORKER_ITEMS:
             raise ValueError("duplicate item token")
         _WORKER_ITEMS[token] = (time.monotonic() + _WORKER_ITEM_TTL_SECONDS, clean)
+    return identity
 
 
-def consume_worker_item(token: str) -> dict[str, Any]:
+def _pop_worker_item(token: str) -> tuple[float, dict[str, Any]]:
     if not isinstance(token, str) or not token:
         raise ValueError("worker item token is required")
     _sweep_worker_items()
     with _LOCK:
         entry = _WORKER_ITEMS.pop(token, None)
-    if entry is None:
+    if entry is None or entry[0] <= time.monotonic():
         raise RuntimeError("Image-list item is missing, expired, or already consumed")
-    return entry[1]
+    return entry
+
+
+def _check_worker_item_identity(item: dict[str, Any], identity: str, index: int) -> None:
+    if not is_valid_item_identity(identity):
+        raise ValueError("Invalid worker item identity")
+    actual = item_content_identity(item) if "image" in item else item.get("item_identity")
+    if actual != identity:
+        raise ValueError("Worker item identity does not match the staged item")
+    if isinstance(index, bool) or not isinstance(index, int) or item["index"] != index:
+        raise ValueError("Worker item index does not match the staged item")
+
+
+def consume_worker_item(token: str, *, item_identity: str | None = None,
+                        item_index: int | None = None) -> dict[str, Any]:
+    with _LOCK:
+        expires, item = _pop_worker_item(token)
+        if "image" not in item:
+            raise RuntimeError("Image-list item is already consumed")
+        if item_identity is not None:
+            _check_worker_item_identity(item, item_identity, item_index)
+            if expires <= time.monotonic():
+                raise RuntimeError("Image-list item is expired")
+            # Start misses release staged tensors, but retain a tiny per-token
+            # receipt until End. This is NOT a completed-result/content cache.
+            # Keeping the original deadline prevents cache hits bypassing TTL.
+            _WORKER_ITEMS[token] = (expires, {"item_identity": item_identity, "index": item["index"]})
+    return item
+
+
+def finish_worker_item(token: str, item_identity: str, item_index: int) -> None:
+    """Validate and release this dispatch, whether Start ran or hit native cache."""
+    expires, item = _pop_worker_item(token)
+    _check_worker_item_identity(item, item_identity, item_index)
+    if expires <= time.monotonic():
+        raise RuntimeError("Image-list item is expired")
 
 
 def delete_worker_item(token: str) -> bool:
@@ -638,18 +736,28 @@ def validate_image_list_regions(prompt: dict[str, Any], *, explicit_targets: boo
 
 
 def build_worker_prompt(prompt: dict[str, Any], region: dict[str, Any], item_token: str,
-                        context_id: str, item_index: int, callback_url: str) -> dict[str, Any]:
-    """Copy only the per-image branch and its worker-side dependencies."""
+                        context_id: str, item_index: int, callback_url: str, *,
+                        item_identity: str | None = None) -> dict[str, Any]:
+    """Copy the branch; opt into stable ancestry only after a worker handshake."""
     start_id, end_id = region["start_id"], region["end_id"]
     _direct_link(prompt[end_id].get("inputs", {}).get("context"), prompt, end_id, "context")
     kept = {node_id: json.loads(json.dumps(prompt[node_id])) for node_id in region["node_ids"]}
-    start_inputs = kept[start_id].setdefault("inputs", {})
-    # Per-item data reaches workers only through the staged item token.
-    for name in list(start_inputs):
-        if name in ("images", "mask") or name.startswith(VALUES_INPUT + "."):
-            start_inputs.pop(name)
-    start_inputs.update({"worker_item_token": item_token, "worker_context_id": context_id})
     end_inputs = kept[end_id].setdefault("inputs", {})
+    if item_identity is not None:
+        if not is_valid_item_identity(item_identity):
+            raise ValueError("Invalid worker item identity")
+        # Native ancestry signatures include EVERY literal, not just a custom
+        # fingerprint. Remove inherited execution IDs, callbacks and all source
+        # inputs wholesale; transient delivery state belongs downstream at End.
+        kept[start_id]["inputs"] = {"worker_item_identity": item_identity}
+        end_inputs.update(worker_context_id=context_id, worker_item_identity=item_identity)
+    else:
+        # Preserve old raw /prompt and older-worker behavior byte-for-byte.
+        start_inputs = kept[start_id].setdefault("inputs", {})
+        for name in list(start_inputs):
+            if name in ("images", "mask") or name.startswith(VALUES_INPUT + "."):
+                start_inputs.pop(name)
+        start_inputs.update({"worker_item_token": item_token, "worker_context_id": context_id})
     end_inputs.update({"worker_result_token": item_token,
                        "worker_item_index": int(item_index),
                        "master_callback_url": callback_url})
@@ -957,7 +1065,8 @@ async def _run_image_list_job(state: ImageListJob, *, include_values: bool = Fal
             # /prompt queue, or repeated execution of the original source.
             with _LOCK:
                 _WORKER_ITEMS[token] = (time.monotonic() + _WORKER_ITEM_TTL_SECONDS, state.items[index])
-            prompt = build_worker_prompt(state.original_prompt, region, token, context_id, index, "")
+            prompt = build_worker_prompt(state.original_prompt, region, token, context_id, index, "",
+                                         item_identity=item_content_identity(state.items[index]))
             prompt[state.start_id]["inputs"]["image_list_local_execution"] = True
             prompt[state.end_id]["inputs"]["image_list_local_execution"] = True
             future = local_executor.submit(prompt, f"{context_id}:{index}", state.end_id, state.workflow_meta)
@@ -987,6 +1096,14 @@ async def _run_image_list_job(state: ImageListJob, *, include_values: bool = Fal
                                 timeout=aiohttp.ClientTimeout(total=60)) as response:
             if response.status >= 400:
                 raise RuntimeError(f"Worker {worker_id} rejected image-list item {index}: HTTP {response.status}")
+            try:
+                stored = await response.json()
+            except (ValueError, aiohttp.ClientError):
+                stored = None
+        # A per-upload acknowledgement gates the new graph. Older workers may
+        # return no identity; do not change global protocol/preflight contracts.
+        identity = stored.get("item_identity") if isinstance(stored, dict) else None
+        identity_options = {"item_identity": identity} if is_valid_item_identity(identity) else {}
         callback_url = build_master_callback_url(worker, config=config)
         if worker_id not in prepared_worker_prompts:
             worker_prompt = build_worker_prompt(state.original_prompt, region, token, context_id,
@@ -999,9 +1116,11 @@ async def _run_image_list_job(state: ImageListJob, *, include_values: bool = Fal
             from ..api.orchestration.media_sync import sync_worker_media
             await asyncio.wait_for(sync_worker_media(worker, worker_prompt), timeout=60)
             prepared_worker_prompts[worker_id] = worker_prompt
-        # Reuse media rewrites, never assignment identity or a mutable submitted graph.
+        # Reuse legacy media rewrites, never assignment identity or a mutable
+        # submitted graph. Keeping this template legacy also permits a worker to
+        # downgrade between items without inheriting a previous stable identity.
         worker_prompt = build_worker_prompt(prepared_worker_prompts[worker_id], region, token,
-                                            context_id, index, callback_url)
+                                            context_id, index, callback_url, **identity_options)
         handle["submission_pending"] = True
         prompt_id = await dispatch_worker_prompt(
             worker, worker_prompt, state.workflow_meta,

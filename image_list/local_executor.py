@@ -24,6 +24,34 @@ from .runtime import ImageListCancelledError
 
 
 _EXECUTION_LOCK = threading.Lock()
+_CACHE_LOCK = threading.Lock()
+# One process-local native output cache, not a second completed-result cache.
+# Core's LRU can temporarily exceed its target for the active graph; oversized
+# generations are discarded rather than retained after an item/run finishes.
+NATIVE_CACHE_MAX_ENTRIES = 128
+_RETAINED_OUTPUTS = None
+
+
+def _take_outputs(execution):
+    global _RETAINED_OUTPUTS
+    with _CACHE_LOCK:
+        outputs, _RETAINED_OUTPUTS = _RETAINED_OUTPUTS, None
+    if getattr(execution.args, "cache_none", False):
+        return execution.NullCache()
+    return outputs if outputs is not None else execution.LRUCache(
+        execution.CacheKeySetInputSignature, max_size=NATIVE_CACHE_MAX_ENTRIES)
+
+
+def _retain_outputs(outputs):
+    global _RETAINED_OUTPUTS
+    # Only the bounded native LRU is eligible. NullCache and test doubles are not.
+    if getattr(outputs, "max_size", None) != NATIVE_CACHE_MAX_ENTRIES:
+        return
+    outputs.clean_unused()
+    if len(outputs.cache) > NATIVE_CACHE_MAX_ENTRIES:
+        return
+    with _CACHE_LOCK:
+        _RETAINED_OUTPUTS = outputs
 
 
 class LocalExecutionSlot:
@@ -32,6 +60,7 @@ class LocalExecutionSlot:
         self._stop = threading.Event()
         self._future = None
         self._caches = None
+        self._failed = False
         self._model_callback = model_callback
         self._closed = False
         self._loop = None
@@ -55,6 +84,10 @@ class LocalExecutionSlot:
                 self._loop.call_soon_threadsafe(self._task.cancel)
 
     async def close(self):
+        if self._closed:
+            return
+        # A stop requested before close indicates cancellation, not normal drain.
+        cancelled = self._stop.is_set()
         self.request_stop()
         try:
             if self._future is not None:
@@ -72,6 +105,8 @@ class LocalExecutionSlot:
                     waiter.exception()
         finally:
             self._pool.shutdown(wait=True, cancel_futures=True)
+            if not cancelled and not self._failed and self._caches is not None:
+                _retain_outputs(self._caches.outputs)
             self._caches = None
             self._closed = True
 
@@ -84,7 +119,11 @@ class LocalExecutionSlot:
         try:
             asyncio.run(self._execute(prompt, prompt_id, end_id, workflow_meta))
         except asyncio.CancelledError as exc:
+            self._failed = True
             raise ImageListCancelledError("Local image-list execution cancelled") from exc
+        except BaseException:
+            self._failed = True
+            raise
         finally:
             with self._state_lock:
                 self._loop = self._task = None
@@ -125,7 +164,7 @@ class LocalExecutionSlot:
         try:
             with torch.inference_mode():
                 if self._caches is None:
-                    outputs = execution.HierarchicalCache(execution.CacheKeySetInputSignature)
+                    outputs = _take_outputs(execution)
                     objects = execution.HierarchicalCache(execution.CacheKeySetID)
                     self._caches = SimpleNamespace(outputs=outputs, objects=objects, all=[outputs, objects])
                 caches = self._caches
