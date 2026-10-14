@@ -1,6 +1,6 @@
 # Typed serverless media (PR2)
 
-`comfy-media-v1` adds typed, lossless list results for `IMAGE`, `AUDIO`, `MASK`,
+`comfy-media-v1` adds typed list results, exact by default, for `IMAGE`, `AUDIO`, `MASK`,
 `STRING`, and native ComfyUI `VIDEO`. It is an **explicit endpoint profile**, not
 an automatically detected capability. Omitting `media_profile` still selects
 `legacy-image-v1`; existing image collectors and handlers keep their old contract.
@@ -43,6 +43,32 @@ Lists are not concatenated into one tensor, resampled, resized, or aligned acros
 sockets. Different items may have different valid shapes or audio sample rates.
 The entire remote response is validated and decoded before any of its results
 are delivered; missing, duplicate, mismatched, or corrupt results fail collection.
+
+## Image return format and quality
+
+`transfer_format` defaults to **`exact`** and `transfer_quality` to **90**.
+These controls affect **remote IMAGE returns only**, not master-local images,
+uploaded inputs, MASK, AUDIO, STRING or native VIDEO values.
+
+- `exact`: preserve floating-point dtype and values, with no image quantization.
+- `legacy_png`, `png`, `ffv1`: lossless **8-bit image pixels**, not exact float
+  tensors. Image values are clipped to [0,1] and quantized as in the existing
+  Collector. `legacy_png` uses PNG without compression; `png` compresses it.
+- `jpeg`, `webp`: lossy still-image compression.
+- `h264`, `h265`, `av1`: lossy video encoding of each IMAGE tensor's frame batch.
+  This does not transcode the native `video` socket or combine separate list items.
+- Quality 1–100 affects lossy formats only, using the existing Collector's
+  quality-to-CRF mapping for video. Dimensions, frame order and channel count
+  are preserved; alpha is carried separately where needed, not silently dropped.
+
+Both master and endpoint must have this bridge revision for compressed image
+returns. Pillow handles still formats and CPU/software PyAV encoders handle video;
+unavailable codecs fail clearly rather than silently changing the selection.
+Compression can reduce result egress and inline response size, but does not relax
+encoded/decoded byte budgets or the input request limit. Compressed IMAGE batches
+are capped at 240 frames and 8192 pixels per dimension, with a conservative
+256 MiB aggregate decode budget (including codec scratch and alpha). The original Collector's
+settings, default and fallback behavior are unchanged.
 
 ## Inputs and fidelity
 
