@@ -14,6 +14,20 @@ DEFAULT_ORPHAN_GRACE_SECONDS = 300.0
 _LIFECYCLE_MARKER = object()
 
 
+def _without_runtime_fingerprints(prompt: dict) -> dict:
+    """Compare submitted structure without ComfyUI's per-node cache annotation.
+
+    PromptQueue snapshots the graph before IsChangedCache adds ``is_changed``
+    to executing nodes. Ignore only that top-level field, never inputs or nested
+    metadata, and leave both the queued and executing graphs untouched.
+    """
+    return {
+        node_id: {key: value for key, value in node.items() if key != "is_changed"}
+        if isinstance(node, dict) else node
+        for node_id, node in prompt.items()
+    }
+
+
 def has_safe_execution_targets(prompt_server: Any, prompt_id: str | None, prompt: dict) -> bool:
     """Prove outer roots from the running queue, not a forgeable prompt marker.
 
@@ -23,8 +37,9 @@ def has_safe_execution_targets(prompt_server: Any, prompt_id: str | None, prompt
     if not prompt_id:
         return False
     from .execution_plan import prepare_image_list_execution
-    prepared, targets = prepare_image_list_execution(prompt)
-    if prepared != prompt or not targets:
+    execution_prompt = _without_runtime_fingerprints(prompt)
+    prepared, targets = prepare_image_list_execution(execution_prompt)
+    if prepared != execution_prompt or not targets:
         return False
     queue = getattr(prompt_server, "prompt_queue", None)
     for name in ("get_current_queue_volatile", "get_current_queue"):
@@ -35,7 +50,8 @@ def has_safe_execution_targets(prompt_server: Any, prompt_id: str | None, prompt
             running, _pending = reader()
             for entry in running:
                 if (isinstance(entry, (tuple, list)) and len(entry) > 4
-                        and entry[1] == prompt_id and entry[2] == prompt):
+                        and entry[1] == prompt_id and isinstance(entry[2], dict)
+                        and _without_runtime_fingerprints(entry[2]) == execution_prompt):
                     roots = entry[4]
                     return (isinstance(roots, (list, tuple))
                             and all(isinstance(root, str) for root in roots)
