@@ -38,7 +38,7 @@ from .orchestration.prompt_transform import (
     WORKER_SINK_CLASS,
     _resolve_direct_workers_for_image_list,
 )
-from ..image_list.runtime import validate_image_list_regions
+from ..image_list.runtime import validate_image_list_regions, _has_selected_serverless_workers
 from ..image_list.execution_plan import prepare_image_list_execution
 
 
@@ -361,23 +361,16 @@ async def orchestrate_distributed_execution(
                 "DistributedMediaCollector or Ultimate SD Upscale nodes in one prompt"
             )
         validate_image_list_regions(prompt_obj, explicit_targets=True)
-        configured_serverless = [
-            str(worker.get("id")) for worker in config.get("workers", [])
-            if worker.get("enabled", False)
-            and str(worker.get("type") or "local").lower() == "serverless"
-            and (requested_ids is None or str(worker.get("id")) in {str(x) for x in requested_ids})
-        ]
-        if configured_serverless:
-            trace_debug(
-                execution_trace_id,
-                "Image List v1 explicitly excludes unsupported serverless pools: "
-                + ", ".join(configured_serverless),
-            )
         workers = _resolve_direct_workers_for_image_list(config, requested_ids)
+        if _has_selected_serverless_workers(config, requested_ids):
+            from ..image_list.serverless import resolve_serverless_workers
+            # Pool identity is retained once, never expanded by Images per run.
+            # Validate profiles before reachability can hide an invalid selection.
+            workers += resolve_serverless_workers(config, requested_ids)
         if not workers and delegate_master:
             raise RuntimeError(
-                "Distributed Image List in orchestrator-only mode requires a selected direct worker; "
-                "serverless pools are unsupported"
+                "Distributed Image List in orchestrator-only mode requires a selected direct worker "
+                "or comfy-media-v1 serverless pool"
             )
     else:
         if typed_media_mode and requested_ids is not None:
@@ -425,13 +418,15 @@ async def orchestrate_distributed_execution(
         from .orchestration.dispatch import preflight_image_list_workers
         if not active_workers and delegate_master:
             raise RuntimeError(
-                "No selected direct worker is reachable for Distributed Image List in orchestrator-only mode"
+                "No selected worker is reachable for Distributed Image List in orchestrator-only mode"
             )
-        idle_ids = (await preflight_image_list_workers(active_workers, require_idle=delegate_master)
-                    if active_workers else {})
-        active_workers = [worker for worker in active_workers if worker["id"] in idle_ids]
+        direct_workers = [worker for worker in active_workers if worker.get("type") != "serverless"]
+        idle_ids = (await preflight_image_list_workers(direct_workers, require_idle=delegate_master)
+                    if direct_workers else {})
+        active_workers = [worker for worker in active_workers
+                          if worker.get("type") == "serverless" or worker["id"] in idle_ids]
         if not active_workers and delegate_master:
-            raise RuntimeError("No feature-compatible direct worker is idle in orchestrator-only mode")
+            raise RuntimeError("No feature-compatible worker is available in orchestrator-only mode")
     else:
         delegate_master = selected_delegate_master
 

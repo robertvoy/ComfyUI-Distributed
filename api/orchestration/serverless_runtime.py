@@ -171,6 +171,8 @@ class ServerlessManager:
         for rid in done[:-200]:
             self.tasks.pop(rid, None)
             self.runs.pop(rid, None)
+        # Additive ownership handle for item schedulers; legacy callers ignore it.
+        return [record_id for record_id, _run, _semaphore in new_runs]
 
     def is_pending(self, collector_job_id, participant_id):
         return any(not task.done() and run["worker"]["id"] == participant_id and

@@ -383,7 +383,7 @@ def create_master_job(start_id: str, end_id: str, prompt: dict[str, Any], items:
     if not isinstance(master_participates, bool):
         raise ValueError("master_participates must be a boolean")
     if not worker_ids and not master_participates:
-        raise RuntimeError("Distributed Image List requires at least one preflighted direct worker; master fallback is disabled")
+        raise RuntimeError("Distributed Image List requires at least one selected worker; master fallback is disabled")
     # Only the target-controlled Start caller may relax the outer prompt guard.
     regions = validate_image_list_regions(prompt, explicit_targets=explicit_targets is True)
     if not any(region["start_id"] == str(start_id) and region["end_id"] == str(end_id)
@@ -794,7 +794,7 @@ def _collect_output_lists(results: list[dict[str, Any]]) -> tuple[list[Any], lis
 
 
 async def run_image_list_job(context_id: str, *, model_callback=None) -> tuple[list[Any], list[Any], list[Any]]:
-    """Schedule a shared queue across the optional master and direct workers."""
+    """Schedule one queue across master, direct peers and bounded cloud slots."""
     state = get_master_job(context_id)
     if state is None:
         raise RuntimeError("Distributed Image List context is missing or expired")
@@ -820,34 +820,64 @@ async def run_image_list_job(context_id: str, *, model_callback=None) -> tuple[l
         remove_master_job(context_id)
 
 
+def _has_selected_serverless_workers(config, requested_ids):
+    """Keep direct/master-only execution free of optional cloud adapter imports.
+
+    This is only an import guard, not validation. The adapter validates original
+    pool IDs/configuration without repairing them, before any cloud work starts.
+    """
+    requested = None if requested_ids is None else {str(value) for value in requested_ids}
+    return any(
+        str(worker.get("type") or "local").strip().lower() == "serverless"
+        and (worker.get("enabled", False) if requested is None
+             else str(worker.get("id") or "").strip() in requested)
+        for worker in config.get("workers", [])
+    )
+
+
 async def _run_image_list_job(state: ImageListJob):
-    context_id = state.context_id
     state.event = asyncio.Event()
     state.event_loop = asyncio.get_running_loop()
-    from ..api.orchestration.dispatch import (
-        preflight_image_list_workers, dispatch_worker_prompt,
-    )
     from ..api.orchestration.prompt_transform import _resolve_direct_workers_for_image_list
-    from ..utils.config import load_config, get_worker_timeout_seconds
-    from ..utils.network import build_master_callback_url, build_worker_url, get_client_session
-    from ..utils.logging import log
-    import aiohttp
+    from ..utils.config import load_config
 
     config = load_config()
     workers = _resolve_direct_workers_for_image_list(config, state.worker_ids)
-    if not workers and not state.master_participates:
-        raise RuntimeError("Distributed Image List requires enabled direct workers; serverless pools are unsupported")
-    # Recheck worker capability and idle state immediately before the first item.
-    worker_statuses = await preflight_image_list_workers(workers, require_idle=not state.master_participates) if workers else {}
-    workers = [worker for worker in workers if worker["id"] in worker_statuses]
-    if not workers and not state.master_participates:
-        raise RuntimeError("No free, reachable, feature-compatible direct workers are available; master execution is disabled")
-    session = await get_client_session() if workers else None
-    # Both item paths below select End explicitly, never all OUTPUT_NODE roots.
+    # Every item path selects End explicitly, never all OUTPUT_NODE roots.
     regions = validate_image_list_regions(state.original_prompt, explicit_targets=True)
     region = next((entry for entry in regions if entry["start_id"] == state.start_id and entry["end_id"] == state.end_id), None)
     if region is None:
         raise RuntimeError("Image-list region no longer matches the submitted prompt")
+    controller = None
+    try:
+        if _has_selected_serverless_workers(config, state.worker_ids):
+            from .serverless import create_serverless_slots
+            controller = await create_serverless_slots(state, region, config, state.event)
+        return await _run_image_list_slots(state, config, workers, region, controller)
+    finally:
+        # Own cloud jobs even if direct preflight/local setup fails, or dispatch
+        # is cancelled before returning an acknowledged handle to the scheduler.
+        if controller is not None:
+            await controller.close()
+
+
+async def _run_image_list_slots(state, config, workers, region, controller):
+    context_id = state.context_id
+    from ..api.orchestration.dispatch import (
+        preflight_image_list_workers, dispatch_worker_prompt,
+    )
+    from ..utils.config import get_worker_timeout_seconds
+    from ..utils.network import build_master_callback_url, build_worker_url, get_client_session
+    from ..utils.logging import log
+    import aiohttp
+
+    serverless_slots = list(controller.slots) if controller is not None else []
+    # Direct capability/idle probes must never be sent to a serverless pool.
+    worker_statuses = await preflight_image_list_workers(workers, require_idle=not state.master_participates) if workers else {}
+    workers = [worker for worker in workers if worker["id"] in worker_statuses]
+    if not workers and not serverless_slots and not state.master_participates:
+        raise RuntimeError("No reachable, feature-compatible image-list workers are available; master execution is disabled")
+    session = await get_client_session() if workers else None
     timeout_seconds = max(5.0, float(get_worker_timeout_seconds()))
     use_websocket = bool((config.get("settings", {}) or {}).get("websocket_orchestration", False))
     prepared_worker_prompts: dict[str, dict[str, Any]] = {}
@@ -862,6 +892,8 @@ async def _run_image_list_job(state: ImageListJob):
         local_executor = LocalExecutionSlot(model_callback=state.local_model_callback)
 
     async def dispatch(worker_id: Any, index: int) -> dict[str, Any]:
+        if worker_id in serverless_slots:
+            return await controller.dispatch(worker_id, index)
         if worker_id is master_slot:
             assert local_executor is not None
             token = create_worker_task_token()
@@ -926,6 +958,10 @@ async def _run_image_list_job(state: ImageListJob):
             state.event.clear()
             if state.failed:
                 raise RuntimeError(state.failed)
+            if controller is not None:
+                completed = controller.poll(inflight)
+                if completed is not None:
+                    return completed
             local = inflight.get(master_slot)
             if local is not None and local["future"].done():
                 # A posted result does not release this slot until execution has
@@ -975,10 +1011,15 @@ async def _run_image_list_job(state: ImageListJob):
                     return None
                 return None
             errors = await asyncio.gather(*(history_status(wid, handle) for wid, handle in inflight.items()
-                                            if wid is not master_slot))
+                                            if wid is not master_slot and wid not in serverless_slots))
             failure = next((error for error in errors if isinstance(error, str)), None)
             if failure:
                 raise RuntimeError(failure)
+            # A cloud manager task may finish during direct HTTP history waits.
+            if controller is not None:
+                completed = controller.poll(inflight)
+                if completed is not None:
+                    return completed
             completed = next((entry for entry in errors if isinstance(entry, tuple)), None)
             if completed is not None:
                 # The callback precedes the worker prompt finishing. Wait for its
@@ -989,7 +1030,8 @@ async def _run_image_list_job(state: ImageListJob):
                 return completed
             now = time.monotonic()
             expired = [f"{wid}/item {handle['index']}" for wid, handle in inflight.items()
-                       if wid is not master_slot and now - handle["last_seen"] > timeout_seconds]
+                       if wid is not master_slot and wid not in serverless_slots
+                       and now - handle["last_seen"] > timeout_seconds]
             if expired:
                 raise TimeoutError(f"Image-list owned-prompt liveness timeout after {timeout_seconds:.1f}s: {', '.join(expired)}")
             try:
@@ -998,6 +1040,10 @@ async def _run_image_list_job(state: ImageListJob):
                 pass
 
     async def cleanup(worker_id: Any, handle: dict[str, Any]) -> None:
+        if worker_id in serverless_slots:
+            # The controller owns exact manager records, including dispatches
+            # that never returned a handle. Close it once in the outer finally.
+            return
         if worker_id is master_slot:
             # The outer finally owns the non-abandonable stop/join. The generic
             # scheduler's bounded remote cleanup must never detach local work.
@@ -1038,7 +1084,8 @@ async def _run_image_list_job(state: ImageListJob):
             return False
 
     try:
-        slots = ([master_slot] if local_executor is not None else []) + [worker["id"] for worker in workers]
+        slots = (([master_slot] if local_executor is not None else [])
+                 + [worker["id"] for worker in workers] + serverless_slots)
         results = await dynamic_schedule(len(state.items), slots,
                                          dispatch, wait_next, cleanup, interrupted)
         return _collect_output_lists(results)
