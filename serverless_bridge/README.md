@@ -155,6 +155,28 @@ only and must not be returned to the master. The executor reads validated
 `media_exports` history records and bounded `/view` payloads before constructing
 the external envelope. [contract.py](contract.py) is the schema authority.
 
+## Optional image return encoding
+
+IMAGE `MediaExportV1` nodes may also contain literal `transfer_format` and
+`transfer_quality` controls. Defaults are `exact` and `90`; old exact requests
+omit the controls and retain their original representation. Other media exports
+must not carry image controls. The master compiler supplies them from the typed
+Collector's widgets; callers should not alter binding identity metadata.
+
+Formats: `exact`, `legacy_png`, `png`, `ffv1`, `jpeg`, `webp`, `h264`, `h265`, `av1`.
+`exact` preserves float tensor bits. The image/video codecs quantize RGB/grayscale
+to 8-bit; PNG/FFV1 are lossless at that precision, while the other codecs are
+lossy. Quality is an integer 1–100 and affects only lossy formats. IMAGE batch
+order, shape and channel count are retained, and alpha is not discarded.
+Native VIDEO/MASK/AUDIO/STRING still use their original exact codecs.
+
+Copy/update the complete bridge directory on both sides, including
+`image_transfer.py` and `image_codec.py`. Pillow and the selected CPU/software
+PyAV codec must be available; missing encoders fail without automatic fallback.
+Compressed IMAGE artifacts use `image-transfer-v1`; decode through the shared
+`codec.decode_payload`, which enforces payload and decoded-shape limits.
+See [image transfer choices](../docs/serverless-media.md#image-return-format-and-quality).
+
 ## Transport budgets and ownership
 
 - Contract maxima: 256 MiB per artifact, 512 MiB aggregate artifact bytes,

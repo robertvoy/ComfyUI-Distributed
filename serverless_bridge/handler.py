@@ -119,8 +119,13 @@ def _validate_request(input_data):
         if node is None or node["class_type"] != "MediaExportV1":
             raise ValueError("Missing declared MediaExportV1 node")
         controls = node["inputs"]
-        if set(controls) != {"request_id", "binding_json", binding["socket"]}:
+        from .image_transfer import DEFAULT_FORMAT, DEFAULT_QUALITY, validate_options
+        required = {"request_id", "binding_json", binding["socket"]}
+        optional = {"transfer_format", "transfer_quality"} if binding["kind"] == "IMAGE" else set()
+        if not required <= set(controls) or set(controls) - required - optional:
             raise ValueError("Media exporter must have exactly its declared socket and controls")
+        validate_options(controls.get("transfer_format", DEFAULT_FORMAT),
+                         controls.get("transfer_quality", DEFAULT_QUALITY))
         if controls["request_id"] != media["request_id"]:
             raise ValueError("Media exporter request identity mismatch")
         text = controls["binding_json"]
