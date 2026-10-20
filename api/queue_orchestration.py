@@ -350,12 +350,11 @@ def _register_waiting_run(prompt_index, job_id_map, candidates, *, master_may_ru
 
     prompt_id = str(uuid.uuid4())
 
-    async def dispatch_to_worker(worker):
-        enabled_ids = [worker["id"]]
+    async def prepare_for_worker(worker):
         _, worker_prompt = await _prepare_worker_payload(
             worker,
             prompt_index,
-            enabled_ids,
+            [worker["id"]],
             job_id_map,
             master_url,
             config,
@@ -365,6 +364,9 @@ def _register_waiting_run(prompt_index, job_id_map, candidates, *, master_may_ru
             asyncio.Semaphore(1),
             media_sync_timeout_seconds,
         )
+        return worker_prompt
+
+    async def send_to_worker(worker, worker_prompt):
         await dispatch_worker_prompt(
             worker,
             worker_prompt,
@@ -385,7 +387,8 @@ def _register_waiting_run(prompt_index, job_id_map, candidates, *, master_may_ru
         job_id_map.values(),
         candidates,
         master_may_run,
-        dispatch_to_worker,
+        prepare_for_worker,
+        send_to_worker,
         requeue_as_delegate,
         trace_execution_id=execution_trace_id,
     )
@@ -406,11 +409,23 @@ def _waiting_run_queued(prompt_id):
 
 
 def _discard_waiting_run(prompt_id):
+    """The run never made it: forget it and its result queues."""
+    from .orchestration.load_balance_queue import get_load_balance_queue
+    get_load_balance_queue().discard_run(prompt_id)
+
+
+def _hold_unresolved_run(prompt_id, worker):
+    """The eager submission to ``worker`` may have been accepted: never resend it.
+
+    The dispatcher confirms with the worker; if it took the run its result
+    is still collected, otherwise the run is dropped (there is nothing on the
+    master to put back, and the caller already reported the failure).
+    """
     from .orchestration.load_balance_queue import get_load_balance_queue
     queue = get_load_balance_queue()
     record = queue._records.get(str(prompt_id))
     if record is not None:
-        queue._remove(record)
+        queue.mark_unresolved(record, worker)
 
 
 async def orchestrate_distributed_execution(
@@ -728,9 +743,14 @@ async def orchestrate_distributed_execution(
                     for worker, wprompt in regular_payloads
                 ]
             )
-        except Exception:
+        except Exception as exc:
             if held_prompt_id is not None:
-                _discard_waiting_run(held_prompt_id)
+                from .orchestration import dispatch as _dispatch
+                ambiguous_error = getattr(_dispatch, "AmbiguousDispatchError", ())
+                if isinstance(exc, ambiguous_error):
+                    _hold_unresolved_run(held_prompt_id, hold_delegate_for_worker)
+                else:
+                    _discard_waiting_run(held_prompt_id)
             raise
 
     if held_prompt_id is not None:

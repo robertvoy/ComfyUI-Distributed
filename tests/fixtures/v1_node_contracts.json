@@ -6,7 +6,7 @@
           "BOOLEAN",
           {
             "default": false,
-            "tooltip": "Run this workflow on one least-busy participant (master included when participating)."
+            "tooltip": "Run this workflow on one free participant (master included when participating). When every GPU is busy, the run waits in the queue and goes to whichever GPU frees up first."
           }
         ]
       },

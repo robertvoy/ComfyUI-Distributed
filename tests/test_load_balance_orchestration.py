@@ -27,6 +27,12 @@ class FakeLoadBalanceQueue:
         self.records.append(record)
         record.dispatched_worker = worker
 
+    def discard_run(self, prompt_id):
+        self.records = [record for record in self.records if record.prompt_id != prompt_id]
+
+    def mark_unresolved(self, record, worker, item=None):
+        record.unresolved = worker
+
     def _remove(self, record):
         self.records.remove(record)
 
@@ -36,14 +42,20 @@ class FakeLoadBalanceQueue:
 
 
 class FakePendingRun:
-    def __init__(self, prompt_id, job_ids, candidates, master_may_run, dispatch_to_worker, requeue_as_delegate,
-                 trace_execution_id=None):
+    def __init__(self, prompt_id, job_ids, candidates, master_may_run, prepare_for_worker, send_to_worker,
+                 requeue_as_delegate, trace_execution_id=None):
         self.prompt_id = prompt_id
         self.job_ids = set(job_ids)
         self.candidates = list(candidates)
         self.master_may_run = master_may_run
-        self.dispatch_to_worker = dispatch_to_worker
+        self.prepare_for_worker = prepare_for_worker
+        self.send_to_worker = send_to_worker
         self.requeue_as_delegate = requeue_as_delegate
+        self.unresolved = None
+
+
+class AmbiguousDispatchError(RuntimeError):
+    pass
 
 
 class DeferredLoadBalanceTests(unittest.IsolatedAsyncioTestCase):
@@ -57,6 +69,7 @@ class DeferredLoadBalanceTests(unittest.IsolatedAsyncioTestCase):
         self.q.load_config = lambda: {"workers": [self.worker], "settings": self.settings}
         self.q.select_active_workers = AsyncMock(side_effect=lambda workers, _ws, delegate, **kw: (workers, delegate))
         self.q.select_least_busy_worker = AsyncMock()
+        sys.modules[PKG + ".api.orchestration.dispatch"].AmbiguousDispatchError = AmbiguousDispatchError
         # The real helper queues under the id it is handed; echo it like it does.
         self.q.queue_prompt_payload = AsyncMock(side_effect=lambda *a, **kw: {
             "prompt_id": kw.get("prompt_id", "master-prompt"), "number": 3, "node_errors": {}})
@@ -117,7 +130,9 @@ class DeferredLoadBalanceTests(unittest.IsolatedAsyncioTestCase):
         record = self.lb_queue.records[0]
         self.q.queue_prompt_payload.reset_mock()
 
-        await record.dispatch_to_worker(self.worker)
+        payload = await record.prepare_for_worker(self.worker)
+        self.q.dispatch_worker_prompt.assert_not_awaited()  # preparation submits nothing
+        await record.send_to_worker(self.worker, payload)
         self.q.dispatch_worker_prompt.assert_awaited_once()
         worker, worker_prompt = self.q.dispatch_worker_prompt.call_args.args[:2]
         self.assertEqual(worker["id"], "w1")
@@ -156,6 +171,16 @@ class DeferredLoadBalanceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await self._run()
         self.assertEqual(self.lb_queue.records, [])
+
+    async def test_ambiguous_eager_dispatch_keeps_the_run_on_hold(self):
+        """Lost acknowledgement on the immediate dispatch: report it, but never resend or forget it."""
+        self.select_idle_worker.return_value = (self.worker, 2)
+        self.q.dispatch_worker_prompt.side_effect = AmbiguousDispatchError("ack lost")
+        with self.assertRaises(AmbiguousDispatchError):
+            await self._run()
+        self.assertEqual(len(self.lb_queue.records), 1)
+        self.assertEqual(self.lb_queue.records[0].unresolved["id"], "w1")
+        self.q.queue_prompt_payload.assert_not_awaited()
 
     async def test_orchestrator_only_master_queues_delegate_immediately(self):
         self.settings["master_delegate_only"] = True
