@@ -283,6 +283,15 @@ async def check_file_endpoint(request):
         return await handle_api_error(request, e, 500)
 
 
+def _notify_worker_may_be_free():
+    """A worker just delivered a final result: let waiting load-balanced runs re-probe."""
+    try:
+        from .orchestration.load_balance_queue import get_load_balance_queue
+        get_load_balance_queue().wake()
+    except Exception as exc:  # never fail a result delivery over the dispatcher
+        debug_log(f"Load balance wake skipped: {exc}")
+
+
 async def _enqueue_worker_items(multi_job_id, items):
     """Put decoded items on the job queue, waiting briefly for the master to create it.
 
@@ -295,7 +304,10 @@ async def _enqueue_worker_items(multi_job_id, items):
             if pending is not None:
                 for item in items:
                     await pending.put(item)
-                return pending.qsize()
+                size = pending.qsize()
+                if any(item.get("is_last") for item in items):
+                    _notify_worker_may_be_free()
+                return size
         if time.monotonic() > deadline:
             return None
         await asyncio.sleep(0.05)

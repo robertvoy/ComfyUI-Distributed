@@ -126,8 +126,14 @@ async def queue_prompt_payload(
     include_queue_metadata=False,
     *,
     partial_execution_targets=None,
+    prompt_id=None,
 ):
-    """Validate and queue a prompt, preserving any explicitly requested roots."""
+    """Validate and queue a prompt, preserving any explicitly requested roots.
+
+    ``prompt_id`` lets a caller re-queue a prompt under an id it already
+    handed out (the load-balance dispatcher swaps a waiting prompt for its
+    delegate form without changing the id clients track).
+    """
     targets = (validate_execution_targets(prompt_obj, partial_execution_targets)
                if partial_execution_targets is not None else None)
     payload = {"prompt": prompt_obj}
@@ -140,7 +146,7 @@ async def queue_prompt_payload(
         # requested roots remain authoritative, but must still exist afterwards.
         validate_execution_targets(prompt, targets)
 
-    prompt_id = str(uuid.uuid4())
+    prompt_id = str(prompt_id) if prompt_id else str(uuid.uuid4())
     valid = await execution.validate_prompt(prompt_id, prompt, targets)
     if not valid[0]:
         error_payload = valid[1] if len(valid) > 1 else "Prompt outputs failed validation"

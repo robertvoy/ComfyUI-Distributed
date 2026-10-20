@@ -142,6 +142,46 @@ def _resolve_orchestration_limits(config):
     )
 
 
+def _build_master_prompt(prompt_index, enabled_ids, job_id_map, master_url, delegate_master,
+                         workflow_meta, image_list_mode=False):
+    """Master copy of the prompt; pruned to post-Collector nodes in delegate mode."""
+    master_prompt = apply_participant_overrides(
+        prompt_index.copy_prompt(),
+        "master",
+        enabled_ids,
+        job_id_map,
+        master_url,
+        delegate_master,
+        prompt_index,
+        workflow_meta=workflow_meta,
+    )
+    if delegate_master and not image_list_mode:
+        collector_ids = find_nodes_by_class(master_prompt, "DistributedCollector")
+        upscale_nodes = find_nodes_by_class(master_prompt, "UltimateSDUpscaleDistributed")
+        if upscale_nodes:
+            debug_log(
+                "Delegate-only master mode currently does not support UltimateSDUpscaleDistributed nodes; running full prompt on master."
+            )
+        elif not collector_ids:
+            debug_log(
+                "Delegate-only master mode requested but no collectors found in master prompt. Running full prompt on master."
+            )
+        else:
+            master_prompt = prepare_delegate_master_prompt(master_prompt, collector_ids)
+    return master_prompt
+
+
+def _load_balance_can_wait(prompt_index, workers):
+    """Only plain Collector runs on direct workers can wait for the next free GPU.
+
+    Upscale nodes cannot run in delegate mode, and serverless slots are
+    started through their own manager rather than a worker prompt queue.
+    """
+    if prompt_index.nodes_for_class("UltimateSDUpscaleDistributed"):
+        return False
+    return not any(worker.get("type") == "serverless" for worker in workers)
+
+
 def _is_load_balance_enabled(value):
     if isinstance(value, bool):
         return value
@@ -291,6 +331,71 @@ async def _prepare_worker_payload(
         return worker, worker_prompt
 
 
+def _register_waiting_run(prompt_index, job_id_map, candidates, *, master_may_run, master_url, config,
+                          workflow_meta, client_id, use_websocket, media_sync_timeout_seconds,
+                          execution_trace_id):
+    """Register a load-balanced run that waits for the next free participant.
+
+    Returns the prompt id the master prompt must be queued under. The run's
+    worker prompt is only prepared (media sync included) once a worker frees
+    up, and the master prompt is then re-queued in its delegate form under the
+    same id so clients keep tracking one prompt.
+    """
+    from .orchestration.load_balance_queue import PendingRun, get_load_balance_queue
+
+    prompt_id = str(uuid.uuid4())
+
+    async def dispatch_to_worker(worker):
+        enabled_ids = [worker["id"]]
+        _, worker_prompt = await _prepare_worker_payload(
+            worker,
+            prompt_index,
+            enabled_ids,
+            job_id_map,
+            master_url,
+            config,
+            True,
+            execution_trace_id,
+            asyncio.Semaphore(1),
+            asyncio.Semaphore(1),
+            media_sync_timeout_seconds,
+        )
+        await dispatch_worker_prompt(
+            worker,
+            worker_prompt,
+            workflow_meta,
+            client_id,
+            use_websocket=use_websocket,
+            trace_execution_id=execution_trace_id,
+        )
+
+    async def requeue_as_delegate(worker):
+        delegate_prompt = _build_master_prompt(
+            prompt_index, [worker["id"]], job_id_map, master_url, True, workflow_meta
+        )
+        await queue_prompt_payload(delegate_prompt, workflow_meta, client_id, prompt_id=prompt_id)
+
+    record = PendingRun(
+        prompt_id,
+        job_id_map.values(),
+        candidates,
+        master_may_run,
+        dispatch_to_worker,
+        requeue_as_delegate,
+        trace_execution_id=execution_trace_id,
+    )
+    get_load_balance_queue().register(record)
+    return prompt_id
+
+
+def _discard_waiting_run(prompt_id):
+    from .orchestration.load_balance_queue import get_load_balance_queue
+    queue = get_load_balance_queue()
+    record = queue._records.get(str(prompt_id))
+    if record is not None:
+        queue._remove(record)
+
+
 async def orchestrate_distributed_execution(
     prompt_obj,
     workflow_meta,
@@ -418,6 +523,8 @@ async def orchestrate_distributed_execution(
     else:
         delegate_master = selected_delegate_master
 
+    wait_for_free_participant = False
+    deferred_candidates = []
     if load_balance_requested and not image_list_mode:
         candidate_workers = list(active_workers)
         if not delegate_master:
@@ -432,20 +539,39 @@ async def orchestrate_distributed_execution(
             )
 
         selected_worker = None
-        if candidate_workers:
+        if candidate_workers and _load_balance_can_wait(prompt_index, active_workers):
+            from .orchestration.load_balance_queue import select_idle_worker
+            selected_worker, probed = await select_idle_worker(
+                candidate_workers,
+                trace_execution_id=execution_trace_id,
+                probe_concurrency=worker_probe_concurrency,
+            )
+            if selected_worker is None and probed:
+                # Everyone is busy: keep the run in the master queue and hand it
+                # to whichever participant frees up first.
+                wait_for_free_participant = True
+        elif candidate_workers:
             selected_worker = await select_least_busy_worker(
                 candidate_workers,
                 trace_execution_id=execution_trace_id,
                 probe_concurrency=worker_probe_concurrency,
             )
-        if selected_worker is None and candidate_workers:
+        if selected_worker is None and candidate_workers and not wait_for_free_participant:
             trace_debug(
                 execution_trace_id,
                 "Load-balance selection probe failed; using first available candidate.",
             )
             selected_worker = candidate_workers[0]
 
-        if selected_worker is not None and str(selected_worker.get("id")) == "master":
+        if wait_for_free_participant:
+            deferred_candidates = list(active_workers)
+            active_workers = []
+            trace_debug(
+                execution_trace_id,
+                "Load-balance: all participants busy; run waits in the master queue for the next free one "
+                f"(master_may_run={not delegate_master}, workers={[w.get('id') for w in deferred_candidates]}).",
+            )
+        elif selected_worker is not None and str(selected_worker.get("id")) == "master":
             # Master selected as least busy; run master workload only.
             active_workers = []
             delegate_master = False
@@ -490,31 +616,9 @@ async def orchestrate_distributed_execution(
             queue_result.get("node_errors", {}),
         )
 
-    master_prompt = prompt_index.copy_prompt()
-    master_prompt = apply_participant_overrides(
-        master_prompt,
-        "master",
-        enabled_ids,
-        job_id_map,
-        master_url,
-        delegate_master,
-        prompt_index,
-        workflow_meta=workflow_meta,
+    master_prompt = _build_master_prompt(
+        prompt_index, enabled_ids, job_id_map, master_url, delegate_master, workflow_meta, image_list_mode
     )
-
-    if delegate_master and not image_list_mode:
-        collector_ids = find_nodes_by_class(master_prompt, "DistributedCollector")
-        upscale_nodes = find_nodes_by_class(master_prompt, "UltimateSDUpscaleDistributed")
-        if upscale_nodes:
-            debug_log(
-                "Delegate-only master mode currently does not support UltimateSDUpscaleDistributed nodes; running full prompt on master."
-            )
-        elif not collector_ids:
-            debug_log(
-                "Delegate-only master mode requested but no collectors found in master prompt. Running full prompt on master."
-            )
-        else:
-            master_prompt = prepare_delegate_master_prompt(master_prompt, collector_ids)
 
     if active_workers:
         trace_debug(
@@ -582,6 +686,21 @@ async def orchestrate_distributed_execution(
             ]
         )
 
+    if wait_for_free_participant:
+        target_kwargs["prompt_id"] = _register_waiting_run(
+            prompt_index,
+            job_id_map,
+            deferred_candidates,
+            master_may_run=not delegate_master,
+            master_url=master_url,
+            config=config,
+            workflow_meta=workflow_meta,
+            client_id=client_id,
+            use_websocket=use_websocket,
+            media_sync_timeout_seconds=media_sync_timeout_seconds,
+            execution_trace_id=execution_trace_id,
+        )
+
     try:
         queue_result = await queue_prompt_payload(
             master_prompt,
@@ -591,6 +710,8 @@ async def orchestrate_distributed_execution(
             **target_kwargs,
         )
     except Exception:
+        if wait_for_free_participant:
+            _discard_waiting_run(target_kwargs["prompt_id"])
         if serverless_jobs:
             async with prompt_server.distributed_jobs_lock:
                 for job_id in job_id_map.values():

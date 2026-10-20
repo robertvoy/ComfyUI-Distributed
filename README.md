@@ -97,7 +97,7 @@ Generate multiple images in the time it takes to generate one. Each worker uses 
 1. Open your ComfyUI workflow
 2. Add **Distributed Seed** → connect to sampler's seed
 3. Add **Distributed Collector** → after VAE Decode
-4. Optional: enable `load_balance` on Distributed Collector to run on one least-busy participant
+4. Optional: enable `load_balance` on Distributed Collector to run each queued workflow on one free participant; while all GPUs are busy, queued runs wait and go to whichever GPU frees up next
 5. Enable workers in the UI
 6. Run the workflow!
 
@@ -177,7 +177,7 @@ Use **Distributed Value** when you want per-worker overrides (for example, diffe
 | Node | Description |
 |------|-------------|
 | **Distributed Seed** | Generates unique seeds for each worker |
-| **Distributed Collector** | Collects results (image/video frames and optionally audio) from workers back to the master; `load_balance` can route the run to one least-busy participant |
+| **Distributed Collector** | Collects results (image/video frames and optionally audio) from workers back to the master; `load_balance` routes each run to one free participant, or to the next GPU that frees up when all are busy |
 | **Distributed Value** | Outputs per-worker override values with fallback to default |
 | **Ultimate SD Upscale Distributed** | Distributes upscale tiles across workers |
 | **Image Batch Divider** | Splits image batches for multi-GPU output |

@@ -1,0 +1,348 @@
+"""Hand load-balanced runs to the next participant that frees up.
+
+A Collector workflow queued with ``load_balance`` enabled while every
+participant is busy stays in the master's own ComfyUI prompt queue, so it is
+still visible and cancellable there, and nothing is sent to a worker yet. One
+dispatcher task then watches the candidate workers; as soon as one reports an
+empty queue, the oldest waiting run is taken out of the master queue,
+dispatched to that worker, and re-queued on the master as a delegate prompt
+that only collects the result. When the master participates, its executor
+takes whichever waiting run it reaches first in the normal way: the run's
+prompt is the full workflow, and the Collector claims it for the master.
+
+The claim is atomic through ComfyUI's queue mutex: a run can be removed from
+the queue by the dispatcher or popped by the master executor, never both.
+"""
+import asyncio
+import time
+
+import server
+
+from ...utils.logging import debug_log, log
+from ...utils.network import build_worker_url, probe_worker
+from .dispatch import _extract_queue_remaining
+from .dispatch import _select_idle_round_robin
+
+try:
+    from ...utils.trace_logger import trace_debug
+except ImportError:  # pragma: no cover - optional runtime helper
+    def trace_debug(*_args, **_kwargs):
+        return None
+
+POLL_INTERVAL_SECONDS = 1.0
+# A worker that was just handed a run is treated as busy for this long even if
+# a probe races ahead of the worker enqueueing the prompt.
+RECENT_DISPATCH_TTL_SECONDS = 5.0
+ASSIGNMENT_WAIT_SLICE_SECONDS = 0.5
+
+MASTER = "master"
+
+
+def _worker_key(worker):
+    return str(worker.get("id"))
+
+
+async def probe_worker_queues(workers, probe_concurrency=8, probe_timeout=3.0):
+    """Return ``[{"worker", "queue_remaining"}]`` for every worker that answered."""
+    semaphore = asyncio.Semaphore(max(1, int(probe_concurrency or 1)))
+
+    async def _probe(worker):
+        async with semaphore:
+            if worker.get("type") == "serverless":
+                from .serverless_runtime import get_manager
+                status = await get_manager().health(worker)
+                return {"worker": worker, "queue_remaining": status["queueRemaining"]}
+            payload = await probe_worker(build_worker_url(worker), timeout=probe_timeout)
+            if payload is None:
+                return None
+            return {"worker": worker, "queue_remaining": _extract_queue_remaining(payload)}
+
+    statuses = await asyncio.gather(*[_probe(worker) for worker in workers])
+    return [status for status in statuses if status is not None]
+
+
+async def select_idle_worker(workers, trace_execution_id=None, probe_concurrency=8, probe_timeout=3.0):
+    """Pick one idle participant, round-robin; ``(None, probed)`` when all are busy.
+
+    ``probed`` is how many participants answered the probe, so a caller can
+    tell "everyone is busy" from "nobody answered".
+    """
+    if not workers:
+        return None, 0
+    statuses = await probe_worker_queues(workers, probe_concurrency, probe_timeout)
+    idle = [status for status in statuses if status["queue_remaining"] == 0]
+    if not idle:
+        if trace_execution_id:
+            trace_debug(trace_execution_id, f"No idle participant among {len(statuses)} probed; run will wait for the next free one.")
+        return None, len(statuses)
+    selected = _select_idle_round_robin(idle)["worker"]
+    if trace_execution_id:
+        trace_debug(trace_execution_id, f"Idle participant selected: {selected.get('name')} ({selected.get('id')})")
+    return selected, len(statuses)
+
+
+class PendingRun:
+    """One load-balanced prompt waiting in the master queue for a free participant."""
+
+    def __init__(self, prompt_id, job_ids, candidates, master_may_run,
+                 dispatch_to_worker, requeue_as_delegate, trace_execution_id=None):
+        self.prompt_id = str(prompt_id)
+        self.job_ids = {str(job_id) for job_id in job_ids}
+        self.candidates = list(candidates)
+        self.master_may_run = bool(master_may_run)
+        # async (worker) -> None: prepare and send the worker prompt.
+        self.dispatch_to_worker = dispatch_to_worker
+        # async (worker) -> None: queue the delegate master prompt under prompt_id.
+        self.requeue_as_delegate = requeue_as_delegate
+        self.trace_execution_id = trace_execution_id
+        self.assigned = None  # None | MASTER | worker dict
+        self.claiming = False
+        self.finished_jobs = set()
+        self.created_at = time.monotonic()
+        self._event = asyncio.Event()
+
+    def _assign(self, participant):
+        self.assigned = participant
+        self._event.set()
+
+    @property
+    def assigned_id(self):
+        if self.assigned is None:
+            return None
+        if self.assigned == MASTER:
+            return MASTER
+        return _worker_key(self.assigned)
+
+    def accepts(self, worker):
+        key = _worker_key(worker)
+        return any(_worker_key(candidate) == key for candidate in self.candidates)
+
+
+class LoadBalanceQueue:
+    """Dispatcher that pulls waiting runs for whichever participant frees up next."""
+
+    def __init__(self, prompt_queue_getter):
+        self._prompt_queue_getter = prompt_queue_getter
+        self._records = {}  # prompt_id -> PendingRun, insertion ordered
+        self._by_job = {}  # job_id -> PendingRun
+        self._recent_dispatch = {}  # worker id -> monotonic time
+        self._wake = asyncio.Event()
+        self._cycle_lock = asyncio.Lock()
+        self._task = None
+        self.poll_interval = POLL_INTERVAL_SECONDS
+
+    # ----- registration -------------------------------------------------
+    def register(self, record):
+        self._records[record.prompt_id] = record
+        for job_id in record.job_ids:
+            self._by_job[job_id] = record
+        self._ensure_task()
+        self.wake()
+        return record
+
+    def lookup_job(self, job_id):
+        return self._by_job.get(str(job_id))
+
+    def pending_runs(self):
+        return [record for record in self._records.values() if record.assigned is None]
+
+    def __len__(self):
+        return len(self._records)
+
+    def mark_worker_busy(self, worker_id):
+        self._recent_dispatch[str(worker_id)] = time.monotonic()
+
+    def wake(self):
+        self._wake.set()
+
+    def _remove(self, record):
+        self._records.pop(record.prompt_id, None)
+        for job_id in record.job_ids:
+            if self._by_job.get(job_id) is record:
+                self._by_job.pop(job_id, None)
+
+    # ----- collector side ------------------------------------------------
+    async def wait_for_assignment(self, record, interrupt_check=None):
+        """Return the participant that runs ``record`` (``MASTER`` or a worker dict).
+
+        Called by the master Collector. A run whose prompt is already executing
+        on a participating master is claimed for the master right away; an
+        orchestrator-only master waits here until the dispatcher assigns a
+        worker.
+        """
+        if record.assigned is None and record.master_may_run and not record.claiming:
+            record._assign(MASTER)
+            debug_log(f"Load balance: master took run {record.prompt_id}")
+        while record.assigned is None:
+            if interrupt_check is not None:
+                interrupt_check()
+            self._ensure_task()
+            self.wake()
+            try:
+                await asyncio.wait_for(record._event.wait(), timeout=ASSIGNMENT_WAIT_SLICE_SECONDS)
+            except asyncio.TimeoutError:
+                continue
+        return record.assigned
+
+    def finish_job(self, record, job_id, failed=False):
+        record.finished_jobs.add(str(job_id))
+        if failed or record.finished_jobs >= record.job_ids:
+            self._remove(record)
+
+    # ----- queue inspection ---------------------------------------------
+    def _prompt_queue(self):
+        return self._prompt_queue_getter()
+
+    def _is_running(self, prompt_id):
+        prompt_queue = self._prompt_queue()
+        with prompt_queue.mutex:
+            return any(item[1] == prompt_id for item in prompt_queue.currently_running.values())
+
+    def _is_queued(self, prompt_id):
+        prompt_queue = self._prompt_queue()
+        with prompt_queue.mutex:
+            return any(item[1] == prompt_id for item in prompt_queue.queue)
+
+    def _take_from_queue(self, prompt_id):
+        """Remove the prompt from the master queue; return the item or None."""
+        captured = []
+
+        def _match(item):
+            if item[1] == prompt_id:
+                captured.append(item)
+                return True
+            return False
+
+        if self._prompt_queue().delete_queue_item(_match):
+            return captured[0]
+        return None
+
+    def _restore(self, item):
+        self._prompt_queue().put(item)
+
+    # ----- dispatcher loop ----------------------------------------------
+    def _ensure_task(self):
+        if self._task is not None and not self._task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._task = loop.create_task(self._loop())
+
+    async def _loop(self):
+        try:
+            while self._records:
+                self._wake.clear()
+                try:
+                    await self.run_cycle()
+                except Exception as exc:  # keep the dispatcher alive
+                    log(f"[Distributed] Load-balance dispatcher error: {exc}")
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=self.poll_interval)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self._task = None
+
+    def sweep(self):
+        """Drop runs that left the master queue without being collected."""
+        for record in list(self._records.values()):
+            if record.claiming:
+                continue
+            if self._is_queued(record.prompt_id):
+                continue
+            if self._is_running(record.prompt_id):
+                if record.assigned is None and record.master_may_run:
+                    record._assign(MASTER)
+                    debug_log(f"Load balance: master is running run {record.prompt_id}")
+                continue
+            debug_log(f"Load balance: run {record.prompt_id} left the master queue; dropping it")
+            self._remove(record)
+
+    def _recently_dispatched(self, worker):
+        stamp = self._recent_dispatch.get(_worker_key(worker))
+        if stamp is None:
+            return False
+        if time.monotonic() - stamp > RECENT_DISPATCH_TTL_SECONDS:
+            self._recent_dispatch.pop(_worker_key(worker), None)
+            return False
+        return True
+
+    async def run_cycle(self, probe_concurrency=8, probe_timeout=3.0):
+        """One dispatcher pass: sweep, probe candidates, hand runs to idle workers."""
+        async with self._cycle_lock:
+            return await self._run_cycle(probe_concurrency, probe_timeout)
+
+    async def _run_cycle(self, probe_concurrency, probe_timeout):
+        self.sweep()
+        pending = [record for record in self._records.values()
+                   if record.assigned is None and not record.claiming]
+        if not pending:
+            return []
+        candidates = {}
+        for record in pending:
+            for worker in record.candidates:
+                candidates.setdefault(_worker_key(worker), worker)
+        probe_targets = [worker for worker in candidates.values() if not self._recently_dispatched(worker)]
+        if not probe_targets:
+            return []
+        statuses = await probe_worker_queues(probe_targets, probe_concurrency, probe_timeout)
+        idle_workers = [status["worker"] for status in statuses if status["queue_remaining"] == 0]
+        claims = []
+        for worker in idle_workers:
+            record = next((record for record in pending
+                           if record.assigned is None and not record.claiming and record.accepts(worker)), None)
+            if record is None:
+                continue
+            record.claiming = True
+            self.mark_worker_busy(_worker_key(worker))
+            claims.append((record, worker))
+        if claims:
+            await asyncio.gather(*[self._claim(record, worker) for record, worker in claims])
+        return claims
+
+    async def _claim(self, record, worker):
+        worker_label = f"{worker.get('name')} ({worker.get('id')})"
+        try:
+            item = self._take_from_queue(record.prompt_id)
+            if item is None:
+                if not self._is_running(record.prompt_id):
+                    debug_log(f"Load balance: run {record.prompt_id} is gone; nothing to dispatch")
+                    self._remove(record)
+                    return False
+                if record.master_may_run:
+                    record._assign(MASTER)
+                    return False
+                # Orchestrator-only master: its Collector is already waiting for us.
+            try:
+                await record.dispatch_to_worker(worker)
+            except Exception as exc:
+                log(f"[Distributed] Load balance: dispatch to {worker_label} failed ({exc}); run {record.prompt_id} keeps waiting")
+                if item is not None:
+                    self._restore(item)
+                return False
+            if item is not None:
+                try:
+                    await record.requeue_as_delegate(worker)
+                except Exception as exc:
+                    log(f"[Distributed] Load balance: could not re-queue run {record.prompt_id} after dispatch to {worker_label}: {exc}")
+                    self._remove(record)
+                    return False
+            record._assign(worker)
+            self.mark_worker_busy(_worker_key(worker))
+            trace_debug(record.trace_execution_id, f"Load balance: run {record.prompt_id} dispatched to free worker {worker_label}")
+            log(f"[Distributed] Load balance: {worker_label} freed up; running queued prompt {record.prompt_id[:8]} there")
+            return True
+        finally:
+            record.claiming = False
+
+
+def get_load_balance_queue(server_instance=None):
+    """Process-wide dispatcher stored on the prompt server."""
+    ps = server_instance or server.PromptServer.instance
+    queue = getattr(ps, "distributed_load_balance_queue", None)
+    if queue is None:
+        queue = LoadBalanceQueue(lambda: ps.prompt_queue)
+        ps.distributed_load_balance_queue = queue
+    return queue

@@ -22,7 +22,7 @@ This document describes the **public HTTP API** added to ComfyUI-Distributed to 
   - Probes and dispatches workers through `/distributed/worker_ws` by default.
   - If `settings.websocket_orchestration=false`, probes with `GET /prompt` and dispatches with `POST /prompt` instead.
   - Queues the master workflow in ComfyUI’s prompt queue.
-  - If any `DistributedCollector` has `load_balance=true`, selects one least-busy participant for this run.
+  - If any `DistributedCollector` has `load_balance=true`, runs the prompt on one free participant. When every participant is busy, the prompt waits in the master queue (under the returned `prompt_id`) and is handed to whichever worker frees up first, or taken by the master when it participates. Prompts with `UltimateSDUpscaleDistributed` nodes or serverless workers keep the queue-depth selection instead.
 
 ### What it does *not* add
 
