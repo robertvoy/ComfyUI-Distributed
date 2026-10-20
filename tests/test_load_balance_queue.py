@@ -4,6 +4,7 @@ import heapq
 import importlib.util
 import sys
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -101,9 +102,11 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
 
         self.lb.probe_worker = fake_probe
 
-    def _queue_run(self, prompt_id, master_may_run=True, dispatch_error=None):
-        number = len(self.prompt_queue.queue) + len(self.prompt_queue.currently_running)
-        self.prompt_queue.put((number, prompt_id, {"full": prompt_id}, {}, [], {}))
+    def _queue_run(self, prompt_id, master_may_run=True, dispatch_error=None, requeue_errors=0, queued=True):
+        if queued:
+            number = len(self.prompt_queue.queue) + len(self.prompt_queue.currently_running)
+            self.prompt_queue.put((number, prompt_id, {"full": prompt_id}, {}, [], {}))
+        remaining_requeue_errors = [requeue_errors]
 
         async def dispatch_to_worker(worker):
             if dispatch_error is not None:
@@ -111,13 +114,86 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
             self.dispatched.append((prompt_id, worker["id"]))
 
         async def requeue_as_delegate(worker):
+            if remaining_requeue_errors[0] > 0:
+                remaining_requeue_errors[0] -= 1
+                raise RuntimeError("delegate prompt failed validation")
             self.requeued.append((prompt_id, worker["id"]))
             self.prompt_queue.put((100 + len(self.requeued), prompt_id, {"delegate": worker["id"]}, {}, [], {}))
 
         record = self.lb.PendingRun(prompt_id, [f"job-{prompt_id}"], self.workers, master_may_run,
                                     dispatch_to_worker, requeue_as_delegate)
         self.queue.register(record)
+        if queued:
+            self.queue.mark_queued(record)
         return record
+
+    async def test_run_is_safe_from_sweep_until_its_master_prompt_is_queued(self):
+        # Registered, but the orchestrator is still validating the master prompt.
+        record = self._queue_run("p1", queued=False)
+        self.remaining["w1"] = 0
+        self.queue.sweep()
+        self.assertIs(self.queue.lookup_job("job-p1"), record)
+        await self.queue.run_cycle()
+        self.assertEqual(self.dispatched, [])  # not claimable before it is queued
+        self.assertIsNone(record.assigned)
+        # Now the prompt lands in the queue and the dispatcher may take it.
+        self.prompt_queue.put((0, "p1", {"full": "p1"}, {}, [], {}))
+        self.queue.mark_queued(record)
+        self.queue._recent_dispatch.clear()
+        await self.queue.run_cycle()
+        self.assertEqual(self.dispatched, [("p1", "w1")])
+        self.assertEqual(self.prompt_queue.prompt_ids(), ["p1"])
+
+    async def test_unqueued_run_is_dropped_when_orchestrator_discards_it(self):
+        record = self._queue_run("p1", queued=False)
+        self.queue._remove(record)
+        self.assertEqual(len(self.queue), 0)
+        self.queue.sweep()
+        self.assertEqual(len(self.queue), 0)
+
+    async def test_requeue_failure_keeps_tracking_the_remote_job_and_retries(self):
+        record = self._queue_run("p1", requeue_errors=2)
+        self.remaining["w1"] = 0
+        await self.queue.run_cycle()
+        # Dispatched, master delegate prompt missing, run still tracked.
+        self.assertEqual(self.dispatched, [("p1", "w1")])
+        self.assertEqual(self.requeued, [])
+        self.assertIs(self.queue.lookup_job("job-p1"), record)
+        self.assertEqual(record.assigned_id, "w1")
+        self.assertTrue(record.requeue_pending)
+        self.assertEqual(self.prompt_queue.prompt_ids(), [])
+        # Sweeps never drop it while the requeue is outstanding.
+        self.queue.sweep()
+        self.assertIs(self.queue.lookup_job("job-p1"), record)
+        # Backoff holds the retry, then it is attempted again until it lands.
+        await self.queue.run_cycle()
+        self.assertTrue(record.requeue_pending)
+        record.requeue_retry_at = 0
+        await self.queue.run_cycle()
+        self.assertTrue(record.requeue_pending)  # second failure
+        self.assertEqual(record.requeue_failures, 2)
+        record.requeue_retry_at = 0
+        await self.queue.run_cycle()
+        self.assertFalse(record.requeue_pending)
+        self.assertEqual(self.requeued, [("p1", "w1")])
+        self.assertEqual(self.prompt_queue.prompt_ids(), ["p1"])
+        self.assertEqual(len(self.dispatched), 1)  # the worker was never sent the job twice
+        # Collected on the master: tracking ends only now.
+        self.queue.finish_job(record, "job-p1")
+        self.assertIsNone(self.queue.lookup_job("job-p1"))
+
+    async def test_requeue_backoff_grows_and_caps(self):
+        record = self._queue_run("p1", requeue_errors=10)
+        self.remaining["w1"] = 0
+        await self.queue.run_cycle()
+        delays = []
+        for _ in range(7):
+            record.requeue_retry_at = 0
+            before = time.monotonic()
+            await self.queue.run_cycle()
+            delays.append(round(record.requeue_retry_at - before))
+        self.assertEqual(delays, [2, 4, 8, 16, 30, 30, 30])
+        self.assertIs(self.queue.lookup_job("job-p1"), record)
 
     async def test_busy_workers_leave_runs_waiting(self):
         self._queue_run("p1")

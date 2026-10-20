@@ -34,6 +34,10 @@ POLL_INTERVAL_SECONDS = 1.0
 # a probe races ahead of the worker enqueueing the prompt.
 RECENT_DISPATCH_TTL_SECONDS = 5.0
 ASSIGNMENT_WAIT_SLICE_SECONDS = 0.5
+# A delegate prompt that could not be re-queued after its worker was
+# dispatched is retried with this backoff; the remote job stays tracked.
+REQUEUE_RETRY_MIN_SECONDS = 1.0
+REQUEUE_RETRY_MAX_SECONDS = 30.0
 
 MASTER = "master"
 
@@ -97,6 +101,14 @@ class PendingRun:
         self.trace_execution_id = trace_execution_id
         self.assigned = None  # None | MASTER | worker dict
         self.claiming = False
+        # False until the master prompt is actually in the ComfyUI queue; the
+        # dispatcher never sweeps or claims a run before that.
+        self.queued = False
+        # A worker runs the job but the master's delegate prompt is not queued
+        # yet; the dispatcher keeps retrying so the result is still collected.
+        self.requeue_pending = False
+        self.requeue_failures = 0
+        self.requeue_retry_at = 0.0
         self.finished_jobs = set()
         self.created_at = time.monotonic()
         self._event = asyncio.Event()
@@ -133,12 +145,17 @@ class LoadBalanceQueue:
 
     # ----- registration -------------------------------------------------
     def register(self, record):
+        """Track a run before its master prompt is queued (see ``mark_queued``)."""
         self._records[record.prompt_id] = record
         for job_id in record.job_ids:
             self._by_job[job_id] = record
+        return record
+
+    def mark_queued(self, record):
+        """The master prompt is now in the ComfyUI queue: start dispatching it."""
+        record.queued = True
         self._ensure_task()
         self.wake()
-        return record
 
     def lookup_job(self, job_id):
         return self._by_job.get(str(job_id))
@@ -170,6 +187,9 @@ class LoadBalanceQueue:
         orchestrator-only master waits here until the dispatcher assigns a
         worker.
         """
+        # A Collector only runs once the prompt reached the queue, whatever
+        # the orchestrator managed to report in between.
+        record.queued = True
         if record.assigned is None and record.master_may_run and not record.claiming:
             record._assign(MASTER)
             debug_log(f"Load balance: master took run {record.prompt_id}")
@@ -248,7 +268,7 @@ class LoadBalanceQueue:
     def sweep(self):
         """Drop runs that left the master queue without being collected."""
         for record in list(self._records.values()):
-            if record.claiming:
+            if record.claiming or not record.queued or record.requeue_pending:
                 continue
             if self._is_queued(record.prompt_id):
                 continue
@@ -276,8 +296,9 @@ class LoadBalanceQueue:
 
     async def _run_cycle(self, probe_concurrency, probe_timeout):
         self.sweep()
+        await self._retry_requeues()
         pending = [record for record in self._records.values()
-                   if record.assigned is None and not record.claiming]
+                   if record.queued and record.assigned is None and not record.claiming]
         if not pending:
             return []
         candidates = {}
@@ -302,6 +323,34 @@ class LoadBalanceQueue:
             await asyncio.gather(*[self._claim(record, worker) for record, worker in claims])
         return claims
 
+    async def _requeue(self, record, worker):
+        try:
+            await record.requeue_as_delegate(worker)
+        except Exception as exc:
+            record.requeue_failures += 1
+            delay = min(REQUEUE_RETRY_MIN_SECONDS * (2 ** (record.requeue_failures - 1)), REQUEUE_RETRY_MAX_SECONDS)
+            record.requeue_retry_at = time.monotonic() + delay
+            log(
+                f"[Distributed] Load balance: could not re-queue run {record.prompt_id} on the master after "
+                f"dispatch to {worker.get('name')} ({worker.get('id')}): {exc}. Retrying in {delay:.0f}s; "
+                "the worker's result stays tracked."
+            )
+            return False
+        record.requeue_pending = False
+        record.requeue_failures = 0
+        return True
+
+    async def _retry_requeues(self):
+        now = time.monotonic()
+        for record in list(self._records.values()):
+            if not record.requeue_pending or record.requeue_retry_at > now:
+                continue
+            if record.assigned is None or record.assigned == MASTER:
+                record.requeue_pending = False
+                continue
+            if await self._requeue(record, record.assigned):
+                log(f"[Distributed] Load balance: run {record.prompt_id} is back on the master queue")
+
     async def _claim(self, record, worker):
         worker_label = f"{worker.get('name')} ({worker.get('id')})"
         try:
@@ -322,13 +371,10 @@ class LoadBalanceQueue:
                 if item is not None:
                     self._restore(item)
                 return False
-            if item is not None:
-                try:
-                    await record.requeue_as_delegate(worker)
-                except Exception as exc:
-                    log(f"[Distributed] Load balance: could not re-queue run {record.prompt_id} after dispatch to {worker_label}: {exc}")
-                    self._remove(record)
-                    return False
+            if item is not None and not await self._requeue(record, worker):
+                # The worker is running the job; keep the run tracked and keep
+                # trying to put its collector back on the master queue.
+                record.requeue_pending = True
             record._assign(worker)
             self.mark_worker_busy(_worker_key(worker))
             trace_debug(record.trace_execution_id, f"Load balance: run {record.prompt_id} dispatched to free worker {worker_label}")

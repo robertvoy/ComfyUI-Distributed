@@ -388,6 +388,15 @@ def _register_waiting_run(prompt_index, job_id_map, candidates, *, master_may_ru
     return prompt_id
 
 
+def _waiting_run_queued(prompt_id):
+    """The master prompt is in the queue: the dispatcher may now hand it out."""
+    from .orchestration.load_balance_queue import get_load_balance_queue
+    queue = get_load_balance_queue()
+    record = queue._records.get(str(prompt_id))
+    if record is not None:
+        queue.mark_queued(record)
+
+
 def _discard_waiting_run(prompt_id):
     from .orchestration.load_balance_queue import get_load_balance_queue
     queue = get_load_balance_queue()
@@ -718,6 +727,8 @@ async def orchestrate_distributed_execution(
                     prompt_server.distributed_pending_jobs.pop(job_id, None)
         raise
     prompt_id = queue_result["prompt_id"]
+    if wait_for_free_participant:
+        _waiting_run_queued(prompt_id)
     if manager is not None:
         try:
             await manager.start(execution_trace_id, prompt_id, serverless_jobs)

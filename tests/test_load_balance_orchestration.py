@@ -1,21 +1,27 @@
 """Queue orchestration keeps a load-balanced run waiting when every GPU is busy."""
 import asyncio
+import importlib.util
 import json
 import sys
 import types
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from test_serverless_integration import load_modules, module, PKG
+from test_serverless_integration import load_modules, module, PKG, ROOT
 
 
 class FakeLoadBalanceQueue:
     def __init__(self):
         self.records = []
+        self.queued = []
 
     def register(self, record):
         self.records.append(record)
         return record
+
+    def mark_queued(self, record):
+        assert record in self.records
+        self.queued.append(record)
 
     def _remove(self, record):
         self.records.remove(record)
@@ -78,6 +84,7 @@ class DeferredLoadBalanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.lb_queue.records), 1)
         record = self.lb_queue.records[0]
         self.assertEqual(record.prompt_id, prompt_id)
+        self.assertEqual(self.lb_queue.queued, [record])  # released only after the master prompt is queued
         self.assertTrue(record.master_may_run)
         self.assertEqual([c["id"] for c in record.candidates], ["w1"])
 
@@ -139,6 +146,56 @@ class DeferredLoadBalanceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await self._run()
         self.assertEqual(self.lb_queue.records, [])
+        self.assertEqual(self.lb_queue.queued, [])
+
+    async def test_dispatcher_sweep_during_prompt_validation_keeps_the_run(self):
+        """Regression: validation yields to the loop before the prompt is queued."""
+        from test_load_balance_queue import FakePromptQueue
+        prompt_queue = FakePromptQueue()
+        self.ps.prompt_queue = prompt_queue
+        network = sys.modules[PKG + ".utils.network"]
+        network.build_worker_url = lambda worker, *a: f"http://{worker['id']}"
+        network.probe_worker = AsyncMock(return_value=None)
+        dispatch = sys.modules[PKG + ".api.orchestration.dispatch"]
+        dispatch._extract_queue_remaining = lambda payload: int(payload["exec_info"]["queue_remaining"])
+        dispatch._select_idle_round_robin = lambda statuses: statuses[0]
+        spec = importlib.util.spec_from_file_location(
+            PKG + ".api.orchestration.load_balance_queue", ROOT / "api" / "orchestration" / "load_balance_queue.py")
+        lb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lb)
+        lb.select_idle_worker = AsyncMock(return_value=(None, 1))
+
+        async def always_busy(url, timeout=3.0):
+            return {"exec_info": {"queue_remaining": 1}}
+
+        lb.probe_worker = always_busy
+        sys.modules[PKG + ".api.orchestration.load_balance_queue"] = lb
+        queue = lb.get_load_balance_queue(self.ps)
+        queue.poll_interval = 0.01
+        sweeps = []
+
+        async def slow_validation(prompt, workflow_meta, client_id, include_queue_metadata=False, *, prompt_id=None, **kw):
+            # Yield long enough for the dispatcher task to run its sweep.
+            for _ in range(5):
+                await asyncio.sleep(0.02)
+                queue.sweep()
+                sweeps.append(len(queue))
+            prompt_queue.put((0, prompt_id, prompt, {}, [], {}))
+            return {"prompt_id": prompt_id, "number": 0, "node_errors": {}}
+
+        self.q.queue_prompt_payload = AsyncMock(side_effect=slow_validation)
+        try:
+            prompt_id, *_ = await self._run()
+            self.assertTrue(sweeps and all(count == 1 for count in sweeps))
+            record = queue._records.get(prompt_id)
+            self.assertIsNotNone(record)
+            self.assertTrue(record.queued)
+            self.assertEqual(prompt_queue.prompt_ids(), [prompt_id])
+            queue.sweep()
+            self.assertIs(queue._records.get(prompt_id), record)
+        finally:
+            queue._records.clear()
+            await asyncio.sleep(0.05)
 
     async def test_upscale_prompts_keep_queue_depth_selection(self):
         self.prompt["4"] = {"class_type": "UltimateSDUpscaleDistributed", "inputs": {"upscaled_image": ["1", 0]}}
