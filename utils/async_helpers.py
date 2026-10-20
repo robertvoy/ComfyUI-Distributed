@@ -2,6 +2,7 @@
 Async helper utilities for ComfyUI-Distributed.
 """
 import asyncio
+import contextlib
 import threading
 import time
 import uuid
@@ -79,6 +80,12 @@ def _summarize_node_errors(node_errors: dict) -> str:
     return " | ".join(parts)
 
 
+class QueueInsertionCancelled(RuntimeError):
+    """The prompt was valid but its insertion was refused by ``insert_if``."""
+
+    cancelled_insertion = True
+
+
 class PromptValidationError(RuntimeError):
     """Raised when a prompt fails ComfyUI validation with structured context."""
 
@@ -127,12 +134,17 @@ async def queue_prompt_payload(
     *,
     partial_execution_targets=None,
     prompt_id=None,
+    insert_if=None,
 ):
     """Validate and queue a prompt, preserving any explicitly requested roots.
 
     ``prompt_id`` lets a caller re-queue a prompt under an id it already
     handed out (the load-balance dispatcher swaps a waiting prompt for its
     delegate form without changing the id clients track).
+
+    ``insert_if`` is checked under the queue mutex right before insertion,
+    after validation has yielded to the event loop; when it returns false
+    the prompt is not queued and ``QueueInsertionCancelled`` is raised.
     """
     targets = (validate_execution_targets(prompt_obj, partial_execution_targets)
                if partial_execution_targets is not None else None)
@@ -179,10 +191,15 @@ async def queue_prompt_payload(
         if key in extra_data:
             sensitive[key] = extra_data.pop(key)
 
-    number = getattr(prompt_server, "number", 0)
-    prompt_server.number = number + 1
-    prompt_queue_item = (number, prompt_id, prompt, extra_data, valid[2], sensitive)
-    prompt_server.prompt_queue.put(prompt_queue_item)
+    prompt_queue = prompt_server.prompt_queue
+    mutex = getattr(prompt_queue, "mutex", None)
+    with (mutex if mutex is not None else contextlib.nullcontext()):
+        if insert_if is not None and not insert_if():
+            raise QueueInsertionCancelled(f"Prompt {prompt_id} was cancelled before it could be queued")
+        number = getattr(prompt_server, "number", 0)
+        prompt_server.number = number + 1
+        prompt_queue_item = (number, prompt_id, prompt, extra_data, valid[2], sensitive)
+        prompt_queue.put(prompt_queue_item)
 
     if include_queue_metadata:
         return {

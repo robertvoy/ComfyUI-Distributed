@@ -52,6 +52,7 @@ class FakePendingRun:
         self.send_to_worker = send_to_worker
         self.requeue_as_delegate = requeue_as_delegate
         self.unresolved = None
+        self.cancelled = False
 
 
 class AmbiguousDispatchError(RuntimeError):
@@ -146,6 +147,11 @@ class DeferredLoadBalanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("1", delegate_prompt)
         self.assertEqual(json.loads(delegate_prompt["2"]["inputs"]["enabled_worker_ids"]), ["w1"])
         self.assertTrue(delegate_prompt["2"]["inputs"]["delegate_only"])
+        # The insertion guard follows the run's cancellation flag.
+        insert_if = self.q.queue_prompt_payload.call_args.kwargs["insert_if"]
+        self.assertTrue(insert_if())
+        record.cancelled = True
+        self.assertFalse(insert_if())
 
     async def test_idle_worker_is_dispatched_right_away_and_master_stays_free(self):
         self.select_idle_worker.return_value = (self.worker, 2)

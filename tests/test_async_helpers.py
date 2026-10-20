@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 import types
@@ -63,6 +64,39 @@ async_helpers, prompt_server = _load_async_helpers_module()
 
 
 class QueuePromptPayloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_insert_if_is_checked_at_insertion_after_validation_yields(self):
+        module, prompt_server = _load_async_helpers_module()
+        validating = asyncio.Event()
+        resume = asyncio.Event()
+        state = {"cancelled": False}
+
+        async def slow_validate(prompt_id, prompt, partial_execution_targets):
+            validating.set()
+            await resume.wait()
+            return (True, None, ["9"], {})
+
+        module.execution.validate_prompt = slow_validate
+        task = asyncio.ensure_future(module.queue_prompt_payload(
+            {"9": {"class_type": "SaveImage", "inputs": {}}}, None, "client", prompt_id="run-1",
+            insert_if=lambda: not state["cancelled"],
+        ))
+        await validating.wait()
+        state["cancelled"] = True  # the queue is cleared while validation is in progress
+        resume.set()
+        with self.assertRaises(module.QueueInsertionCancelled):
+            await task
+        self.assertEqual(prompt_server.prompt_queue.items, [])
+        self.assertEqual(prompt_server.number, 12)  # no queue number consumed either
+
+        state["cancelled"] = False
+        resume.set()
+        prompt_id = await module.queue_prompt_payload(
+            {"9": {"class_type": "SaveImage", "inputs": {}}}, None, "client", prompt_id="run-1",
+            insert_if=lambda: not state["cancelled"],
+        )
+        self.assertEqual(prompt_id, "run-1")
+        self.assertEqual([item[1] for item in prompt_server.prompt_queue.items], ["run-1"])
+
     async def test_queue_prompt_payload_includes_create_time_and_client_metadata(self):
         result = await async_helpers.queue_prompt_payload(
             {"1": {"class_type": "Node"}},

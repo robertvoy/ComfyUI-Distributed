@@ -25,9 +25,12 @@ Two lifecycle rules keep a run from executing twice or vanishing:
 
 * A submission whose acceptance is unknown (the transport raised
   ``AmbiguousDispatchError``) is never replayed. The run is held as
-  *unresolved* until the worker delivers, is seen busy (accepted), or is
-  seen idle without delivering (never accepted), and only then is it either
-  collected or put back in the master queue.
+  *unresolved* until the worker delivers, or until the worker's own queue
+  and history are checked for this run's job ids: found there means it was
+  accepted and the result is collected; confirmed absent on consecutive
+  checks means it never arrived and the original prompt goes back. Aggregate
+  queue depth is never used for this, since an idle worker may have run the
+  job and lost the delivery, and a busy worker may be on something else.
 * While a run is out of the master queue for a hand-off, cancellation
   (queue clear, queue delete, interrupting its Collector) is recorded on the
   run itself. Work that was not yet submitted is dropped along with its
@@ -70,6 +73,11 @@ REQUEUE_RETRY_MIN_SECONDS = 1.0
 REQUEUE_RETRY_MAX_SECONDS = 30.0
 # Consecutive failed probes before a dispatched worker counts as gone.
 WORKER_UNREACHABLE_PROBES = 3
+# An unresolved submission is restored only after this many consecutive
+# worker queue+history checks found no trace of its job ids.
+ABSENT_CONFIRMATIONS = 2
+# How far back the worker's history is searched for an unresolved run.
+HISTORY_LOOKBACK_ITEMS = 200
 # Job ids whose result queues were discarded; a late worker must not recreate them.
 CANCELLED_JOB_MEMORY = 512
 
@@ -97,6 +105,64 @@ async def probe_worker_queues(workers, probe_concurrency=8, probe_timeout=3.0):
 
     statuses = await asyncio.gather(*[_probe(worker) for worker in workers])
     return [status for status in statuses if status is not None]
+
+
+def _graph_has_job(graph, job_ids):
+    if not isinstance(graph, dict):
+        return False
+    for node in graph.values():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict) and str(inputs.get("multi_job_id", "")) in job_ids:
+            return True
+    return False
+
+
+async def fetch_worker_job_state(worker, job_ids, timeout=5.0):
+    """Ask the worker itself whether a specific run is there.
+
+    Returns ``"running"`` when a prompt carrying one of ``job_ids`` is in the
+    worker's running or pending queue, ``"finished"`` when it is in the
+    worker's recent history, ``"absent"`` when the worker answered both
+    questions and has no trace of it, and ``None`` when the worker could not
+    be asked. Direct workers only; serverless pools never reach this path.
+    """
+    import aiohttp
+    from ...utils.network import get_client_session
+
+    job_ids = {str(job_id) for job_id in job_ids}
+    base_url = build_worker_url(worker)
+    session = await get_client_session()
+    try:
+        async with session.get(f"{base_url}/queue", timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+            if response.status != 200:
+                return None
+            queue_info = await response.json()
+        if not isinstance(queue_info, dict):
+            return None
+        for key in ("queue_running", "queue_pending"):
+            for item in queue_info.get(key) or []:
+                if isinstance(item, (list, tuple)) and len(item) > 2 and _graph_has_job(item[2], job_ids):
+                    return "running"
+        async with session.get(
+            f"{base_url}/history",
+            params={"max_items": str(HISTORY_LOOKBACK_ITEMS)},
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as response:
+            if response.status != 200:
+                return None
+            history = await response.json()
+        if not isinstance(history, dict):
+            return None
+        for entry in history.values():
+            item = entry.get("prompt") if isinstance(entry, dict) else None
+            if isinstance(item, (list, tuple)) and len(item) > 2 and _graph_has_job(item[2], job_ids):
+                return "finished"
+        return "absent"
+    except Exception as exc:
+        debug_log(f"Load balance: could not check worker {_worker_key(worker)} for a run: {exc}")
+        return None
 
 
 async def select_idle_worker(workers, trace_execution_id=None, probe_concurrency=8, probe_timeout=3.0):
@@ -149,6 +215,10 @@ class PendingRun:
         self.unresolved = None
         self.unresolved_item = None
         self.unresolved_since = 0.0
+        self.absent_checks = 0
+        # No master prompt exists for this run yet (sent straight to a worker
+        # by a participating master): its collector still has to be queued.
+        self.delegate_needed = False
         # A worker runs the job but the master's delegate prompt is not queued
         # yet; the dispatcher keeps retrying so the result is still collected.
         self.requeue_pending = False
@@ -236,6 +306,7 @@ class LoadBalanceQueue:
         """
         self.register(record)
         record.queued = True
+        record.delegate_needed = True
         self._hold_delegate(record, worker)
         self._ensure_task()
         self.wake()
@@ -253,6 +324,7 @@ class LoadBalanceQueue:
         record.unresolved_item = item
         record.unresolved_since = time.monotonic()
         record.missed_probes = 0
+        record.absent_checks = 0
         self.mark_worker_busy(_worker_key(worker))
         self._ensure_task()
         self.wake()
@@ -571,6 +643,11 @@ class LoadBalanceQueue:
         try:
             await record.requeue_as_delegate(worker)
         except Exception as exc:
+            if record.cancelled or getattr(exc, "cancelled_insertion", False):
+                # Cancelled while the delegate prompt was being validated: the
+                # insertion was refused on purpose, nothing to retry.
+                debug_log(f"Load balance: delegate for run {record.prompt_id} not queued, run was cancelled")
+                return False
             record.requeue_failures += 1
             delay = min(REQUEUE_RETRY_MIN_SECONDS * (2 ** (record.requeue_failures - 1)), REQUEUE_RETRY_MAX_SECONDS)
             record.requeue_retry_at = time.monotonic() + delay
@@ -582,6 +659,7 @@ class LoadBalanceQueue:
             return False
         record.requeue_pending = False
         record.requeue_failures = 0
+        record.delegate_needed = False
         return True
 
     async def _probe_one(self, record, worker):
@@ -594,16 +672,29 @@ class LoadBalanceQueue:
         return "idle" if statuses[0]["queue_remaining"] == 0 else "busy"
 
     async def _worker_done_without_result(self, record):
-        """True when the dispatched worker is idle or gone and never delivered."""
+        """True when the worker no longer has this run and never delivered.
+
+        Asks the worker about the run itself: still queued or running means
+        wait; finished (delivery lost) or no trace of it means the collector
+        should be queued so the run can report; unreachable counts up.
+        """
         if time.monotonic() - record.dispatched_at < RECENT_DISPATCH_TTL_SECONDS:
             return False
-        state = await self._probe_one(record, record.assigned)
-        if state == "unreachable":
+        state = await fetch_worker_job_state(record.assigned, record.job_ids)
+        if state is None:
+            record.missed_probes += 1
             return record.missed_probes >= WORKER_UNREACHABLE_PROBES
-        return state == "idle"
+        record.missed_probes = 0
+        return state != "running"
 
     async def _resolve_unresolved(self):
-        """Settle submissions whose acceptance was unknown; never replay them."""
+        """Settle submissions whose acceptance was unknown; never replay them.
+
+        The worker is asked about this run specifically (its job ids in the
+        worker's queue or history). Aggregate idle/busy state is not evidence:
+        an idle worker may have run the job and lost the delivery, a busy one
+        may be on unrelated work.
+        """
         for record in list(self._records.values()):
             worker = record.unresolved
             if worker is None:
@@ -613,16 +704,24 @@ class LoadBalanceQueue:
                 continue
             if time.monotonic() - record.unresolved_since < RECENT_DISPATCH_TTL_SECONDS:
                 continue
-            state = await self._probe_one(record, worker)
-            if state == "busy":
-                self._accept_unresolved(record, "is busy with it")
-            elif state == "idle":
-                self._reject_unresolved(record)
-            elif record.missed_probes in (1, WORKER_UNREACHABLE_PROBES):
-                log(
-                    f"[Distributed] Load balance: worker {_worker_key(worker)} is unreachable; run "
-                    f"{record.prompt_id[:8]} stays on hold until its acceptance can be confirmed."
-                )
+            state = await fetch_worker_job_state(worker, record.job_ids)
+            if state == "running":
+                self._accept_unresolved(record, "has it queued or running")
+            elif state == "finished":
+                self._accept_unresolved(record, "ran it (result not received yet)")
+            elif state == "absent":
+                record.absent_checks += 1
+                record.missed_probes = 0
+                if record.absent_checks >= ABSENT_CONFIRMATIONS:
+                    self._reject_unresolved(record)
+            else:
+                record.absent_checks = 0
+                record.missed_probes += 1
+                if record.missed_probes in (1, WORKER_UNREACHABLE_PROBES):
+                    log(
+                        f"[Distributed] Load balance: worker {_worker_key(worker)} cannot be asked about run "
+                        f"{record.prompt_id[:8]}; it stays on hold until its acceptance can be confirmed."
+                    )
 
     def _accept_unresolved(self, record, how):
         worker, item = record.unresolved, record.unresolved_item
@@ -631,16 +730,22 @@ class LoadBalanceQueue:
         log(f"[Distributed] Load balance: worker {_worker_key(worker)} {how}; run {record.prompt_id[:8]} is confirmed there")
         if record.cancelled:
             record._assign(worker)
-            record.dispatched_at = record.unresolved_since
+            record.dispatched_at = time.monotonic()
             return
-        if item is not None and record.master_may_run:
+        if record.delegate_needed or (item is not None and record.master_may_run):
+            # Participating master: its collector is queued once the worker
+            # delivers (an eager run never had a master prompt at all).
             self._hold_delegate(record, worker)
-        else:
+        elif item is not None:
+            # Orchestrator-only: queue the collector now.
             record._assign(worker)
-            record.dispatched_at = record.unresolved_since
-            if item is not None:
-                record.requeue_pending = True
-                record.requeue_retry_at = 0.0
+            record.dispatched_at = time.monotonic()
+            record.requeue_pending = True
+            record.requeue_retry_at = 0.0
+        else:
+            # The collector is already executing on the master and waiting.
+            record._assign(worker)
+            record.dispatched_at = time.monotonic()
 
     def _reject_unresolved(self, record):
         worker, item = record.unresolved, record.unresolved_item
@@ -735,7 +840,7 @@ class LoadBalanceQueue:
                 # delegate prompt is queued once the worker delivers.
                 self._hold_delegate(record, worker)
             else:
-                if item is not None and not await self._requeue(record, worker):
+                if item is not None and not await self._requeue(record, worker) and not record.cancelled:
                     # The worker is running the job; keep the run tracked and
                     # keep trying to put its collector back on the master queue.
                     record.requeue_pending = True

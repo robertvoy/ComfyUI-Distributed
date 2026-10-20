@@ -20,6 +20,12 @@ def _module(name, **attrs):
     return value
 
 
+class InsertionRefused(RuntimeError):
+    """What queue_prompt_payload raises when insert_if refuses the insertion."""
+
+    cancelled_insertion = True
+
+
 class FakePromptQueue:
     """Just enough of ComfyUI's PromptQueue: a heap, a mutex and currently_running."""
 
@@ -112,9 +118,19 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
             return None if value is None else {"exec_info": {"queue_remaining": value}}
 
         self.lb.probe_worker = fake_probe
+        # What a worker answers when asked about a specific run (its job ids):
+        # "running" | "finished" | "absent" | None (could not be asked).
+        self.job_state = {}
+        self.job_state_queries = []
+
+        async def fake_job_state(worker, job_ids, timeout=5.0):
+            self.job_state_queries.append((worker["id"], set(job_ids)))
+            return self.job_state.get(worker["id"], "absent")
+
+        self.lb.fetch_worker_job_state = fake_job_state
 
     def _queue_run(self, prompt_id, master_may_run=True, dispatch_error=None, requeue_errors=0, queued=True,
-                   prepare_error=None, prepare_gate=None, ambiguous=False):
+                   prepare_error=None, prepare_gate=None, ambiguous=False, requeue_gate=None):
         """Register a run. ``prepare_gate`` (an Event) delays preparation until set;
         ``ambiguous`` makes the send raise AmbiguousDispatchError after the worker
         has in fact accepted the job (its acknowledgement was lost)."""
@@ -141,9 +157,14 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
                 raise self.lb.AmbiguousDispatchError("acknowledgement lost")
 
         async def requeue_as_delegate(worker):
+            if requeue_gate is not None:
+                await requeue_gate.wait()  # prompt validation yielding to the loop
             if remaining_requeue_errors[0] > 0:
                 remaining_requeue_errors[0] -= 1
                 raise RuntimeError("delegate prompt failed validation")
+            # Mirrors queue_prompt_payload(insert_if=lambda: not record.cancelled).
+            if record.cancelled:
+                raise InsertionRefused("cancelled before insertion")
             self.requeued.append((prompt_id, worker["id"]))
             self.prompt_queue.put((100 + len(self.requeued), prompt_id, {"delegate": worker["id"]}, {}, [], {}))
 
@@ -163,69 +184,135 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.fail("hand-off did not start")
 
     # ----- ambiguous acceptance ------------------------------------------------
-    async def test_lost_acknowledgement_never_replays_the_run(self):
-        """Acceptance unknown: the original prompt must not run on the master or elsewhere."""
-        record = self._queue_run("p1", ambiguous=True)
+    async def _ambiguous_run(self, prompt_id="p1", **kwargs):
+        record = self._queue_run(prompt_id, ambiguous=True, **kwargs)
         self.remaining["w1"] = 0
         await self.queue.run_cycle()
-        self.assertEqual(self.dispatched, [("p1", "w1")])
-        self.assertEqual(self.prompt_queue.prompt_ids(), [])  # not restored: the master cannot pick it up
-        self.assertIsNone(record.assigned)
+        self.assertEqual(self.dispatched, [(prompt_id, "w1")])
         self.assertEqual(record.unresolved["id"], "w1")
-        self.assertIs(self.queue.lookup_job("job-p1"), record)
-        # Another free worker must not be handed the same run, and sweeps keep it.
-        self.remaining["w2"] = 0
+        self.assertIsNone(record.assigned)
+        self.assertEqual(self.prompt_queue.prompt_ids(), [])  # not restored: the master cannot pick it up
+        record.unresolved_since = 0  # past the grace period
         self.queue._recent_dispatch.clear()
+        return record
+
+    async def test_lost_acknowledgement_never_replays_the_run(self):
+        """The worker took the job, lost the acknowledgement, ran it and lost the
+        delivery too: it now looks idle. The original prompt must not run again."""
+        record = await self._ambiguous_run()
+        self.remaining["w1"] = 0  # idle again; nothing delivered
+        self.job_state["w1"] = "finished"  # but the worker's history has the run
         await self.queue.run_cycle()
-        self.queue.sweep()
+        self.assertEqual(len(self.dispatched), 1)  # no second submission
+        self.assertEqual(self.prompt_queue.queue, [])  # original prompt never restored
+        self.assertIsNone(record.unresolved)
+        self.assertEqual(record.assigned_id, "w1")
+        self.assertEqual(self.job_state_queries, [("w1", {"job-p1"})])
+        # Nothing else may claim it either.
+        self.remaining["w2"] = 0
+        await self.queue.run_cycle()
         self.assertEqual(len(self.dispatched), 1)
-        self.assertIs(self.queue.lookup_job("job-p1"), record)
-        # The worker had accepted it after all: its result is collected normally.
+        # The lost result is reported through the collector, never by re-running.
+        record.dispatched_at = 0
+        await self.queue.run_cycle()
+        self.assertEqual(self.requeued, [("p1", "w1")])
+        self.assertEqual([item[2] for item in self.prompt_queue.queue], [{"delegate": "w1"}])
+        self.assertEqual(len(self.dispatched), 1)
+
+    async def test_lost_acknowledgement_with_job_still_running_is_collected(self):
+        record = await self._ambiguous_run()
+        self.remaining["w1"] = 0  # aggregate probe says idle (e.g. a race); the job itself is there
+        self.job_state["w1"] = "running"
+        await self.queue.run_cycle()
+        self.assertEqual(record.assigned_id, "w1")
+        self.assertTrue(record.requeue_pending and record.wait_for_result)
+        self.assertEqual(len(self.dispatched), 1)
         self.queue.result_delivered("job-p1")
         await self.queue.run_cycle()
-        self.assertIsNone(record.unresolved)
+        self.assertEqual(self.requeued, [("p1", "w1")])
+        self.queue.finish_job(record, "job-p1")
+        self.assertIsNone(self.queue.lookup_job("job-p1"))
+
+    async def test_lost_acknowledgement_delivery_resolves_it_without_asking(self):
+        record = await self._ambiguous_run()
+        self.queue.result_delivered("job-p1")
+        await self.queue.run_cycle()
         self.assertEqual(record.assigned_id, "w1")
         self.assertEqual(self.requeued, [("p1", "w1")])
-        self.assertEqual(self.prompt_queue.prompt_ids(), ["p1"])
+        self.assertEqual(self.job_state_queries, [])
         self.assertEqual(len(self.dispatched), 1)
 
-    async def test_lost_acknowledgement_is_resolved_by_seeing_the_worker_busy(self):
-        record = self._queue_run("p1", master_may_run=False, ambiguous=True)
-        self.remaining["w1"] = 0
+    async def test_busy_worker_on_unrelated_work_is_not_taken_as_acceptance(self):
+        record = await self._ambiguous_run(master_may_run=False)
+        self.remaining["w1"] = 3  # busy, but with other prompts
+        self.job_state["w1"] = "absent"
         await self.queue.run_cycle()
-        record.unresolved_since = 0  # past the grace period
-        self.remaining["w1"] = 1  # the worker is running it
-        await self.queue.run_cycle()
-        self.assertIsNone(record.unresolved)
-        self.assertEqual(record.assigned_id, "w1")
-        self.assertEqual(self.requeued, [("p1", "w1")])  # orchestrator-only: collector queued at once
-
-    async def test_lost_acknowledgement_restores_run_when_worker_never_took_it(self):
-        record = self._queue_run("p1", ambiguous=True)
-        self.remaining["w1"] = 0
-        await self.queue.run_cycle()
+        self.assertEqual(record.unresolved["id"], "w1")  # one absent check is not enough
         self.assertEqual(self.prompt_queue.prompt_ids(), [])
-        await self.queue.run_cycle()  # within the grace period: still on hold
-        self.assertEqual(self.prompt_queue.prompt_ids(), [])
-        record.unresolved_since = 0
-        await self.queue.run_cycle()  # worker idle, nothing delivered: it never ran the job
-        self.assertIsNone(record.unresolved)
+        await self.queue.run_cycle()
+        self.assertIsNone(record.unresolved)  # confirmed absent: never accepted
         self.assertIsNone(record.assigned)
         self.assertEqual(self.prompt_queue.prompt_ids(), ["p1"])  # original prompt back, same position
         self.assertEqual(self.prompt_queue.queue[0][2], {"full": "p1"})
         self.assertIs(self.queue.lookup_job("job-p1"), record)
+        self.assertEqual(self.requeued, [])
 
-    async def test_lost_acknowledgement_waits_while_worker_is_unreachable(self):
-        record = self._queue_run("p1", ambiguous=True)
-        self.remaining["w1"] = 0
-        await self.queue.run_cycle()
-        record.unresolved_since = 0
-        del self.remaining["w1"]
+    async def test_lost_acknowledgement_stays_on_hold_while_worker_cannot_be_asked(self):
+        record = await self._ambiguous_run()
+        self.job_state["w1"] = None
         for _ in range(self.lb.WORKER_UNREACHABLE_PROBES + 2):
             await self.queue.run_cycle()
         self.assertEqual(record.unresolved["id"], "w1")  # never replayed, never dropped
         self.assertEqual(self.prompt_queue.prompt_ids(), [])
         self.assertEqual(len(self.dispatched), 1)
+        # A single absent answer between failures does not count as confirmation.
+        self.job_state["w1"] = "absent"
+        await self.queue.run_cycle()
+        self.job_state["w1"] = None
+        await self.queue.run_cycle()
+        self.assertEqual(record.absent_checks, 0)
+        self.assertEqual(record.unresolved["id"], "w1")
+
+    async def test_eager_run_with_lost_acknowledgement_is_collected_after_delivery(self):
+        """Sent straight to an idle worker by a participating master, no master prompt exists yet."""
+        record = self._queue_run("p1", master_may_run=False, queued=False)
+        self.queue.register_dispatched(record, self.workers[0])
+        self.queue.mark_unresolved(record, self.workers[0])  # the eager dispatch raised ambiguity
+        self.assertIsNone(record.assigned)
+        await self.queue.run_cycle()
+        self.assertEqual(self.requeued, [])
+        self.queue.result_delivered("job-p1")
+        await self.queue.run_cycle()
+        self.assertEqual(record.assigned_id, "w1")
+        self.assertEqual(self.requeued, [("p1", "w1")])  # a collector is queued for the result
+        self.assertEqual(self.prompt_queue.prompt_ids(), ["p1"])
+        self.assertFalse(record.requeue_pending)
+        self.queue.finish_job(record, "job-p1")
+        self.assertIsNone(self.queue.lookup_job("job-p1"))
+
+    async def test_eager_run_with_lost_acknowledgement_confirmed_running_is_collected(self):
+        record = self._queue_run("p1", master_may_run=False, queued=False)
+        self.queue.register_dispatched(record, self.workers[0])
+        self.queue.mark_unresolved(record, self.workers[0])
+        record.unresolved_since = 0
+        self.job_state["w1"] = "running"
+        await self.queue.run_cycle()
+        self.assertEqual(record.assigned_id, "w1")
+        self.assertTrue(record.requeue_pending)
+        self.queue.result_delivered("job-p1")
+        await self.queue.run_cycle()
+        self.assertEqual(self.requeued, [("p1", "w1")])
+
+    async def test_eager_run_with_lost_acknowledgement_never_accepted_is_dropped(self):
+        record = self._queue_run("p1", master_may_run=False, queued=False)
+        self.queue.register_dispatched(record, self.workers[0])
+        self.queue.mark_unresolved(record, self.workers[0])
+        record.unresolved_since = 0
+        for _ in range(self.lb.ABSENT_CONFIRMATIONS):
+            await self.queue.run_cycle()
+        self.assertIsNone(self.queue.lookup_job("job-p1"))  # nothing to restore: it never existed on the master
+        self.assertNotIn("job-p1", self.pending_jobs)
+        self.assertEqual(self.prompt_queue.prompt_ids(), [])
 
     async def test_definite_failure_before_submission_still_restores_the_run(self):
         record = self._queue_run("p1", dispatch_error=RuntimeError("connection refused"))
@@ -329,10 +416,37 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.prompt_queue.wipe_queue()
         self.assertTrue(record.cancelled)
         record.unresolved_since = 0
-        await self.queue.run_cycle()  # worker idle: never took it; the user cancelled, so do not restore
+        for _ in range(self.lb.ABSENT_CONFIRMATIONS):
+            await self.queue.run_cycle()  # confirmed never taken; the user cancelled, so do not restore
         self.assertEqual(self.prompt_queue.prompt_ids(), [])
         self.assertIsNone(self.queue.lookup_job("job-p1"))
         self.assertNotIn("job-p1", self.pending_jobs)
+
+    async def test_clear_queue_during_delegate_validation_does_not_insert_it(self):
+        """Cancellation that lands while the delegate prompt is being validated."""
+        gate = asyncio.Event()
+        record = self._queue_run("p1", master_may_run=False, requeue_gate=gate)
+        self.remaining["w1"] = 0
+        cycle = asyncio.ensure_future(self.queue.run_cycle())
+        for _ in range(200):
+            if self.dispatched:
+                break
+            await asyncio.sleep(0.005)
+        self.assertEqual(self.dispatched, [("p1", "w1")])  # accepted; delegate now validating
+        self.prompt_queue.wipe_queue()
+        self.assertTrue(record.cancelled)
+        gate.set()
+        await cycle
+        self.assertEqual(self.requeued, [])
+        self.assertEqual(self.prompt_queue.prompt_ids(), [])  # never inserted
+        self.assertEqual(record.requeue_failures, 0)  # refused insertion is not a retryable failure
+        self.assertFalse(record.requeue_pending)
+        self.assertIs(self.queue.lookup_job("job-p1"), record)  # accepted work stays owned
+        self.queue.result_delivered("job-p1")
+        await self.queue.run_cycle()
+        self.assertIsNone(self.queue.lookup_job("job-p1"))
+        self.assertNotIn("job-p1", self.pending_jobs)
+        self.assertEqual(self.prompt_queue.prompt_ids(), [])
 
     # ----- interrupted assignment on an orchestrator-only master ---------------
     async def test_interrupt_during_assignment_cleans_result_queue_and_stops_dispatch(self):
@@ -485,9 +599,9 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(record.requeue_pending and record.wait_for_result)
         self.queue.sweep()
         self.assertIs(self.queue.lookup_job("job-p1"), record)
-        # Still nothing while the worker is busy, even after the dispatch grace.
+        # Still nothing while the worker is running it, even after the dispatch grace.
         record.dispatched_at = 0
-        self.remaining["w2"] = 1
+        self.job_state["w2"] = "running"
         await self.queue.run_cycle()
         self.assertEqual(self.requeued, [])
         # The worker delivers: the collector is queued behind the real work.
@@ -499,13 +613,17 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.queue.finish_job(record, "job-p1")
         self.assertIsNone(self.queue.lookup_job("job-p1"))
 
-    async def test_delegate_is_queued_when_worker_goes_idle_without_delivering(self):
+    async def test_delegate_is_queued_when_worker_finished_without_delivering(self):
         record = self._queue_run("p1")
         self.remaining["w1"] = 0
         await self.queue.run_cycle()
         self.assertEqual(self.requeued, [])
         record.dispatched_at = 0  # past the dispatch grace
-        await self.queue.run_cycle()  # worker idle, nothing delivered: let the collector report it
+        self.job_state["w1"] = "running"
+        await self.queue.run_cycle()  # still running there: keep waiting
+        self.assertEqual(self.requeued, [])
+        self.job_state["w1"] = "finished"
+        await self.queue.run_cycle()  # ran it, nothing delivered: let the collector report it
         self.assertEqual(self.requeued, [("p1", "w1")])
         self.assertFalse(record.wait_for_result)
 
@@ -514,7 +632,7 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.remaining["w1"] = 0
         await self.queue.run_cycle()
         record.dispatched_at = 0
-        del self.remaining["w1"]  # probes fail from now on
+        self.job_state["w1"] = None  # the worker cannot be asked from now on
         for _ in range(self.lb.WORKER_UNREACHABLE_PROBES - 1):
             await self.queue.run_cycle()
             self.assertEqual(self.requeued, [])

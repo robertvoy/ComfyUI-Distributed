@@ -380,7 +380,12 @@ def _register_waiting_run(prompt_index, job_id_map, candidates, *, master_may_ru
         delegate_prompt = _build_master_prompt(
             prompt_index, [worker["id"]], job_id_map, master_url, True, workflow_meta
         )
-        await queue_prompt_payload(delegate_prompt, workflow_meta, client_id, prompt_id=prompt_id)
+        # Validation yields to the loop; a clear or delete that lands meanwhile
+        # must stop the insertion itself, not just the attempt.
+        await queue_prompt_payload(
+            delegate_prompt, workflow_meta, client_id, prompt_id=prompt_id,
+            insert_if=lambda: not record.cancelled,
+        )
 
     record = PendingRun(
         prompt_id,
