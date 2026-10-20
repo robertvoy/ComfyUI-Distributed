@@ -10,6 +10,14 @@ that only collects the result. When the master participates, its executor
 takes whichever waiting run it reaches first in the normal way: the run's
 prompt is the full workflow, and the Collector claims it for the master.
 
+A delegate prompt blocks ComfyUI's single executor while it waits for its
+worker, which would stall every full workflow queued behind it on a
+participating master. So on a participating master the delegate prompt is
+queued only once the worker's final result has arrived (or the worker is
+seen idle or unreachable without delivering, so the Collector can report
+it); an orchestrator-only master has nothing else to run and queues it at
+once.
+
 The claim is atomic through ComfyUI's queue mutex: a run can be removed from
 the queue by the dispatcher or popped by the master executor, never both.
 """
@@ -38,6 +46,8 @@ ASSIGNMENT_WAIT_SLICE_SECONDS = 0.5
 # dispatched is retried with this backoff; the remote job stays tracked.
 REQUEUE_RETRY_MIN_SECONDS = 1.0
 REQUEUE_RETRY_MAX_SECONDS = 30.0
+# Consecutive failed probes before a dispatched worker counts as gone.
+WORKER_UNREACHABLE_PROBES = 3
 
 MASTER = "master"
 
@@ -109,6 +119,12 @@ class PendingRun:
         self.requeue_pending = False
         self.requeue_failures = 0
         self.requeue_retry_at = 0.0
+        # Participating master: hold the delegate prompt back until the worker
+        # delivered, so the master executor is not parked on a waiting collector.
+        self.wait_for_result = False
+        self.delivered_jobs = set()
+        self.dispatched_at = 0.0
+        self.missed_probes = 0
         self.finished_jobs = set()
         self.created_at = time.monotonic()
         self._event = asyncio.Event()
@@ -156,6 +172,35 @@ class LoadBalanceQueue:
         record.queued = True
         self._ensure_task()
         self.wake()
+
+    def register_dispatched(self, record, worker):
+        """Track a run that was sent straight to an idle worker.
+
+        Used on a participating master: the delegate prompt is queued later,
+        when the worker delivers, instead of parking the master executor now.
+        """
+        self.register(record)
+        record.queued = True
+        self._hold_delegate(record, worker)
+        self._ensure_task()
+        self.wake()
+
+    def result_delivered(self, job_id):
+        """A worker posted the final result for ``job_id``."""
+        record = self._by_job.get(str(job_id))
+        if record is None:
+            return False
+        record.delivered_jobs.add(str(job_id))
+        self.wake()
+        return True
+
+    def _hold_delegate(self, record, worker):
+        record._assign(worker)
+        record.requeue_pending = True
+        record.wait_for_result = True
+        record.dispatched_at = time.monotonic()
+        record.missed_probes = 0
+        self.mark_worker_busy(_worker_key(worker))
 
     def lookup_job(self, job_id):
         return self._by_job.get(str(job_id))
@@ -340,16 +385,37 @@ class LoadBalanceQueue:
         record.requeue_failures = 0
         return True
 
+    async def _worker_done_without_result(self, record):
+        """True when the dispatched worker is idle or gone and never delivered."""
+        if time.monotonic() - record.dispatched_at < RECENT_DISPATCH_TTL_SECONDS:
+            return False
+        statuses = await probe_worker_queues([record.assigned])
+        if not statuses:
+            record.missed_probes += 1
+            return record.missed_probes >= WORKER_UNREACHABLE_PROBES
+        record.missed_probes = 0
+        return statuses[0]["queue_remaining"] == 0
+
     async def _retry_requeues(self):
         now = time.monotonic()
         for record in list(self._records.values()):
-            if not record.requeue_pending or record.requeue_retry_at > now:
+            if not record.requeue_pending:
                 continue
             if record.assigned is None or record.assigned == MASTER:
                 record.requeue_pending = False
                 continue
+            if record.wait_for_result and not record.delivered_jobs >= record.job_ids:
+                if not await self._worker_done_without_result(record):
+                    continue
+                log(
+                    f"[Distributed] Load balance: worker {record.assigned_id} is idle or unreachable without "
+                    f"delivering run {record.prompt_id[:8]}; queueing its collector so the run can report."
+                )
+                record.wait_for_result = False
+            if record.requeue_retry_at > now:
+                continue
             if await self._requeue(record, record.assigned):
-                log(f"[Distributed] Load balance: run {record.prompt_id} is back on the master queue")
+                debug_log(f"Load balance: run {record.prompt_id} is on the master queue to collect its result")
 
     async def _claim(self, record, worker):
         worker_label = f"{worker.get('name')} ({worker.get('id')})"
@@ -371,12 +437,17 @@ class LoadBalanceQueue:
                 if item is not None:
                     self._restore(item)
                 return False
-            if item is not None and not await self._requeue(record, worker):
-                # The worker is running the job; keep the run tracked and keep
-                # trying to put its collector back on the master queue.
-                record.requeue_pending = True
-            record._assign(worker)
-            self.mark_worker_busy(_worker_key(worker))
+            if item is not None and record.master_may_run:
+                # Keep the master executor free for full workflows: the
+                # delegate prompt is queued once the worker delivers.
+                self._hold_delegate(record, worker)
+            else:
+                if item is not None and not await self._requeue(record, worker):
+                    # The worker is running the job; keep the run tracked and
+                    # keep trying to put its collector back on the master queue.
+                    record.requeue_pending = True
+                record._assign(worker)
+                self.mark_worker_busy(_worker_key(worker))
             trace_debug(record.trace_execution_id, f"Load balance: run {record.prompt_id} dispatched to free worker {worker_label}")
             log(f"[Distributed] Load balance: {worker_label} freed up; running queued prompt {record.prompt_id[:8]} there")
             return True

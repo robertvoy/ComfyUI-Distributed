@@ -129,7 +129,7 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_is_safe_from_sweep_until_its_master_prompt_is_queued(self):
         # Registered, but the orchestrator is still validating the master prompt.
-        record = self._queue_run("p1", queued=False)
+        record = self._queue_run("p1", master_may_run=False, queued=False)
         self.remaining["w1"] = 0
         self.queue.sweep()
         self.assertIs(self.queue.lookup_job("job-p1"), record)
@@ -152,7 +152,7 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.queue), 0)
 
     async def test_requeue_failure_keeps_tracking_the_remote_job_and_retries(self):
-        record = self._queue_run("p1", requeue_errors=2)
+        record = self._queue_run("p1", master_may_run=False, requeue_errors=2)
         self.remaining["w1"] = 0
         await self.queue.run_cycle()
         # Dispatched, master delegate prompt missing, run still tracked.
@@ -183,7 +183,7 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.queue.lookup_job("job-p1"))
 
     async def test_requeue_backoff_grows_and_caps(self):
-        record = self._queue_run("p1", requeue_errors=10)
+        record = self._queue_run("p1", master_may_run=False, requeue_errors=10)
         self.remaining["w1"] = 0
         await self.queue.run_cycle()
         delays = []
@@ -203,8 +203,8 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.prompt_queue.prompt_ids(), ["p1"])
 
     async def test_first_free_worker_takes_oldest_waiting_run(self):
-        self._queue_run("p1")
-        self._queue_run("p2")
+        self._queue_run("p1", master_may_run=False)
+        self._queue_run("p2", master_may_run=False)
         self.remaining["w2"] = 0
         await self.queue.run_cycle()
         self.assertEqual(self.dispatched, [("p1", "w2")])
@@ -217,6 +217,71 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.remaining["w2"] = 0
         await self.queue.run_cycle()
         self.assertEqual(len(self.dispatched), 1)
+
+    async def test_participating_master_gets_delegate_only_after_worker_delivers(self):
+        """The master executor must not be parked on a collector waiting for a worker."""
+        record = self._queue_run("p1")
+        self._queue_run("p2")
+        self.remaining["w2"] = 0
+        await self.queue.run_cycle()
+        self.assertEqual(self.dispatched, [("p1", "w2")])
+        self.assertEqual(record.assigned_id, "w2")
+        # Nothing collect-only on the master yet: p2 is next for the master executor.
+        self.assertEqual(self.requeued, [])
+        self.assertEqual(self.prompt_queue.prompt_ids(), ["p2"])
+        self.assertTrue(record.requeue_pending and record.wait_for_result)
+        self.queue.sweep()
+        self.assertIs(self.queue.lookup_job("job-p1"), record)
+        # Still nothing while the worker is busy, even after the dispatch grace.
+        record.dispatched_at = 0
+        self.remaining["w2"] = 1
+        await self.queue.run_cycle()
+        self.assertEqual(self.requeued, [])
+        # The worker delivers: the collector is queued behind the real work.
+        self.assertTrue(self.queue.result_delivered("job-p1"))
+        await self.queue.run_cycle()
+        self.assertEqual(self.requeued, [("p1", "w2")])
+        self.assertEqual(self.prompt_queue.prompt_ids(), ["p2", "p1"])
+        self.assertFalse(record.requeue_pending)
+        self.queue.finish_job(record, "job-p1")
+        self.assertIsNone(self.queue.lookup_job("job-p1"))
+
+    async def test_delegate_is_queued_when_worker_goes_idle_without_delivering(self):
+        record = self._queue_run("p1")
+        self.remaining["w1"] = 0
+        await self.queue.run_cycle()
+        self.assertEqual(self.requeued, [])
+        record.dispatched_at = 0  # past the dispatch grace
+        await self.queue.run_cycle()  # worker idle, nothing delivered: let the collector report it
+        self.assertEqual(self.requeued, [("p1", "w1")])
+        self.assertFalse(record.wait_for_result)
+
+    async def test_delegate_is_queued_when_worker_becomes_unreachable(self):
+        record = self._queue_run("p1")
+        self.remaining["w1"] = 0
+        await self.queue.run_cycle()
+        record.dispatched_at = 0
+        del self.remaining["w1"]  # probes fail from now on
+        for _ in range(self.lb.WORKER_UNREACHABLE_PROBES - 1):
+            await self.queue.run_cycle()
+            self.assertEqual(self.requeued, [])
+        await self.queue.run_cycle()
+        self.assertEqual(self.requeued, [("p1", "w1")])
+
+    async def test_eagerly_dispatched_run_is_tracked_until_its_result_is_collected(self):
+        record = self._queue_run("p1", queued=False)
+        self.queue.register_dispatched(record, self.workers[1])
+        self.assertEqual(record.assigned_id, "w2")
+        self.assertTrue(record.requeue_pending)
+        self.queue.sweep()
+        self.assertIs(self.queue.lookup_job("job-p1"), record)
+        await self.queue.run_cycle()
+        self.assertEqual(self.requeued, [])
+        self.queue.result_delivered("job-p1")
+        await self.queue.run_cycle()
+        self.assertEqual(self.requeued, [("p1", "w2")])
+        self.assertEqual(self.prompt_queue.prompt_ids(), ["p1"])
+        self.assertFalse(self.queue.result_delivered("job-unknown"))
 
     async def test_faster_worker_keeps_pulling_until_queue_drains(self):
         for index in range(4):

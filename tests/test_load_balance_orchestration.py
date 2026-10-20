@@ -23,6 +23,10 @@ class FakeLoadBalanceQueue:
         assert record in self.records
         self.queued.append(record)
 
+    def register_dispatched(self, record, worker):
+        self.records.append(record)
+        record.dispatched_worker = worker
+
     def _remove(self, record):
         self.records.remove(record)
 
@@ -128,18 +132,49 @@ class DeferredLoadBalanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(delegate_prompt["2"]["inputs"]["enabled_worker_ids"]), ["w1"])
         self.assertTrue(delegate_prompt["2"]["inputs"]["delegate_only"])
 
-    async def test_idle_worker_is_still_dispatched_right_away(self):
+    async def test_idle_worker_is_dispatched_right_away_and_master_stays_free(self):
         self.select_idle_worker.return_value = (self.worker, 2)
+        prompt_id, _, worker_count, _ = await self._run()
+        self.assertEqual(worker_count, 1)
+        self.q.dispatch_worker_prompt.assert_awaited_once()
+        # Participating master: no collect-only prompt parked on its executor.
+        self.q.queue_prompt_payload.assert_not_awaited()
+        self.assertEqual(len(self.lb_queue.records), 1)
+        record = self.lb_queue.records[0]
+        self.assertEqual(record.prompt_id, prompt_id)
+        self.assertEqual(record.dispatched_worker["id"], "w1")
+        self.assertFalse(record.master_may_run)
+        # Delivered later: the delegate prompt is queued under the same id.
+        await record.requeue_as_delegate(self.worker)
+        delegate_prompt = self.q.queue_prompt_payload.call_args.args[0]
+        self.assertEqual(self.q.queue_prompt_payload.call_args.kwargs["prompt_id"], prompt_id)
+        self.assertEqual(json.loads(delegate_prompt["2"]["inputs"]["enabled_worker_ids"]), ["w1"])
+
+    async def test_failed_dispatch_of_held_run_discards_it(self):
+        self.select_idle_worker.return_value = (self.worker, 2)
+        self.q.dispatch_worker_prompt.side_effect = RuntimeError("worker refused")
+        with self.assertRaises(RuntimeError):
+            await self._run()
+        self.assertEqual(self.lb_queue.records, [])
+
+    async def test_orchestrator_only_master_queues_delegate_immediately(self):
+        self.settings["master_delegate_only"] = True
+        self.select_idle_worker.return_value = (self.worker, 1)
         _, _, worker_count, _ = await self._run()
         self.assertEqual(worker_count, 1)
         self.q.dispatch_worker_prompt.assert_awaited_once()
+        self.q.queue_prompt_payload.assert_awaited_once()
         self.assertEqual(self.lb_queue.records, [])
 
     async def test_unreachable_probe_falls_back_to_first_candidate(self):
         self.select_idle_worker.return_value = (None, 0)
         _, _, worker_count, _ = await self._run()
         self.assertEqual(worker_count, 1)
-        self.assertEqual(self.lb_queue.records, [])
+        self.q.dispatch_worker_prompt.assert_awaited_once()
+        # Sent to the first worker; the participating master still holds the delegate back.
+        self.assertEqual(len(self.lb_queue.records), 1)
+        self.assertEqual(self.lb_queue.records[0].dispatched_worker["id"], "w1")
+        self.q.queue_prompt_payload.assert_not_awaited()
 
     async def test_master_queue_failure_discards_the_waiting_run(self):
         self.q.queue_prompt_payload.side_effect = RuntimeError("validation failed")

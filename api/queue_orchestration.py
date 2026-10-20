@@ -333,13 +333,18 @@ async def _prepare_worker_payload(
 
 def _register_waiting_run(prompt_index, job_id_map, candidates, *, master_may_run, master_url, config,
                           workflow_meta, client_id, use_websocket, media_sync_timeout_seconds,
-                          execution_trace_id):
-    """Register a load-balanced run that waits for the next free participant.
+                          execution_trace_id, dispatched_worker=None):
+    """Register a load-balanced run with the next-free-GPU dispatcher.
 
-    Returns the prompt id the master prompt must be queued under. The run's
-    worker prompt is only prepared (media sync included) once a worker frees
-    up, and the master prompt is then re-queued in its delegate form under the
-    same id so clients keep tracking one prompt.
+    Returns the prompt id the run is tracked under. Without ``dispatched_worker``
+    the run waits for a free participant: its master prompt must be queued
+    under that id, the worker prompt is only prepared (media sync included)
+    once a worker frees up, and the master prompt is then re-queued in its
+    delegate form under the same id so clients keep tracking one prompt.
+
+    With ``dispatched_worker`` the run is already being sent to that worker
+    while the master participates: nothing is queued on the master now, and
+    the dispatcher queues the delegate prompt once the worker delivers.
     """
     from .orchestration.load_balance_queue import PendingRun, get_load_balance_queue
 
@@ -384,7 +389,10 @@ def _register_waiting_run(prompt_index, job_id_map, candidates, *, master_may_ru
         requeue_as_delegate,
         trace_execution_id=execution_trace_id,
     )
-    get_load_balance_queue().register(record)
+    if dispatched_worker is not None:
+        get_load_balance_queue().register_dispatched(record, dispatched_worker)
+    else:
+        get_load_balance_queue().register(record)
     return prompt_id
 
 
@@ -534,6 +542,10 @@ async def orchestrate_distributed_execution(
 
     wait_for_free_participant = False
     deferred_candidates = []
+    # Participating master handed the run to an idle worker: queue the master's
+    # collect-only prompt once the worker delivers, not now, so the master
+    # executor stays free for the next full workflow.
+    hold_delegate_for_worker = None
     if load_balance_requested and not image_list_mode:
         candidate_workers = list(active_workers)
         if not delegate_master:
@@ -548,7 +560,8 @@ async def orchestrate_distributed_execution(
             )
 
         selected_worker = None
-        if candidate_workers and _load_balance_can_wait(prompt_index, active_workers):
+        can_wait = bool(candidate_workers) and _load_balance_can_wait(prompt_index, active_workers)
+        if can_wait:
             from .orchestration.load_balance_queue import select_idle_worker
             selected_worker, probed = await select_idle_worker(
                 candidate_workers,
@@ -590,6 +603,8 @@ async def orchestrate_distributed_execution(
             )
         elif selected_worker is not None:
             active_workers = [selected_worker]
+            if can_wait and not delegate_master:
+                hold_delegate_for_worker = selected_worker
             # Worker selected as least busy; keep master orchestrator-only for this run.
             delegate_master = True
             trace_debug(
@@ -680,20 +695,51 @@ async def orchestrate_distributed_execution(
         for job_id in job_id_map.values():
             await _ensure_distributed_queue(job_id)
 
-    if regular_payloads:
-        await asyncio.gather(
-            *[
-                dispatch_worker_prompt(
-                    worker,
-                    wprompt,
-                    workflow_meta,
-                    client_id,
-                    use_websocket=use_websocket,
-                    trace_execution_id=execution_trace_id,
-                )
-                for worker, wprompt in regular_payloads
-            ]
+    held_prompt_id = None
+    if hold_delegate_for_worker is not None:
+        # Register before dispatching so the worker's result is never missed.
+        held_prompt_id = _register_waiting_run(
+            prompt_index,
+            job_id_map,
+            [hold_delegate_for_worker],
+            master_may_run=False,
+            master_url=master_url,
+            config=config,
+            workflow_meta=workflow_meta,
+            client_id=client_id,
+            use_websocket=use_websocket,
+            media_sync_timeout_seconds=media_sync_timeout_seconds,
+            execution_trace_id=execution_trace_id,
+            dispatched_worker=hold_delegate_for_worker,
         )
+
+    if regular_payloads:
+        try:
+            await asyncio.gather(
+                *[
+                    dispatch_worker_prompt(
+                        worker,
+                        wprompt,
+                        workflow_meta,
+                        client_id,
+                        use_websocket=use_websocket,
+                        trace_execution_id=execution_trace_id,
+                    )
+                    for worker, wprompt in regular_payloads
+                ]
+            )
+        except Exception:
+            if held_prompt_id is not None:
+                _discard_waiting_run(held_prompt_id)
+            raise
+
+    if held_prompt_id is not None:
+        trace_debug(
+            execution_trace_id,
+            f"Orchestration complete: prompt_id={held_prompt_id} runs on worker "
+            f"{hold_delegate_for_worker.get('id')}; master collector queued when it delivers.",
+        )
+        return held_prompt_id, getattr(prompt_server, "number", 0), len(worker_payloads), {}
 
     if wait_for_free_participant:
         target_kwargs["prompt_id"] = _register_waiting_run(

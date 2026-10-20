@@ -283,13 +283,15 @@ async def check_file_endpoint(request):
         return await handle_api_error(request, e, 500)
 
 
-def _notify_worker_may_be_free():
-    """A worker just delivered a final result: let waiting load-balanced runs re-probe."""
+def _notify_worker_result(multi_job_id):
+    """A worker delivered a final result: its run can be collected and the worker re-probed."""
     try:
         from .orchestration.load_balance_queue import get_load_balance_queue
-        get_load_balance_queue().wake()
+        queue = get_load_balance_queue()
+        queue.result_delivered(multi_job_id)
+        queue.wake()
     except Exception as exc:  # never fail a result delivery over the dispatcher
-        debug_log(f"Load balance wake skipped: {exc}")
+        debug_log(f"Load balance notify skipped: {exc}")
 
 
 async def _enqueue_worker_items(multi_job_id, items):
@@ -306,7 +308,7 @@ async def _enqueue_worker_items(multi_job_id, items):
                     await pending.put(item)
                 size = pending.qsize()
                 if any(item.get("is_last") for item in items):
-                    _notify_worker_may_be_free()
+                    _notify_worker_result(multi_job_id)
                 return size
         if time.monotonic() > deadline:
             return None
