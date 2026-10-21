@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 PKG = "dist_lb_queue_testpkg"
+# The running test case; the dispatch stub's probe reads its ``remaining`` table.
+_ACTIVE = {"case": None}
 
 
 def _module(name, **attrs):
@@ -84,9 +86,15 @@ def _load_module(prompt_queue):
     sys.modules[PKG + ".utils.network"] = _module(
         "network", build_worker_url=lambda worker, *a: f"http://{worker['id']}", probe_worker=AsyncMock(return_value=None)
     )
+    async def _probe_worker_queue(worker, semaphore, probe_timeout):
+        async with semaphore:
+            case = _ACTIVE["case"]
+            value = case.remaining.get(worker["id"]) if case is not None else None
+            return None if value is None else {"worker": worker, "queue_remaining": value}
+
     sys.modules[PKG + ".api.orchestration.dispatch"] = _module(
         "dispatch",
-        _extract_queue_remaining=lambda payload: int(payload.get("exec_info", {}).get("queue_remaining", 0)),
+        _probe_worker_queue=_probe_worker_queue,
         _select_idle_round_robin=lambda statuses: statuses[0],
     )
     spec = importlib.util.spec_from_file_location(
@@ -111,35 +119,37 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.dispatched = []
         self.prepared = []
         self.requeued = []
-
-        async def fake_probe(url, timeout=3.0):
-            worker_id = url.rsplit("/", 1)[-1]
-            value = self.remaining.get(worker_id)
-            return None if value is None else {"exec_info": {"queue_remaining": value}}
-
-        self.lb.probe_worker = fake_probe
+        _ACTIVE["case"] = self
         # What a worker answers when asked about a specific run (its job ids):
         # "running" | "finished" | "absent" | None (could not be asked).
         self.job_state = {}
         self.job_state_queries = []
+        self.snapshots_taken = []
+        self.real_snapshot_class = self.lb.WorkerSnapshot
+        case = self
 
-        async def fake_job_state(worker, job_ids, timeout=5.0):
-            self.job_state_queries.append((worker["id"], set(job_ids)))
-            return self.job_state.get(worker["id"], "absent")
+        class FakeSnapshot:
+            def __init__(self, worker, timeout=5.0):
+                self.worker = worker
+                case.snapshots_taken.append(worker["id"])
 
-        self.fetch_worker_job_state = self.lb.fetch_worker_job_state
-        self.lb.fetch_worker_job_state = fake_job_state
+            async def job_state(self, job_ids):
+                case.job_state_queries.append((self.worker["id"], set(job_ids)))
+                return case.job_state.get(self.worker["id"], "absent")
+
+        self.lb.WorkerSnapshot = FakeSnapshot
 
     def _queue_run(self, prompt_id, master_may_run=True, dispatch_error=None, requeue_errors=0, queued=True,
                    prepare_error=None, prepare_gate=None, ambiguous=False, requeue_gate=None):
         """Register a run. ``prepare_gate`` (an Event) delays preparation until set;
-        ``ambiguous`` makes the send raise AmbiguousDispatchError after the worker
-        has in fact accepted the job (its acknowledgement was lost)."""
+        ``ambiguous`` makes the first send raise AmbiguousDispatchError after the
+        worker has in fact accepted the job (its acknowledgement was lost)."""
         if queued:
             number = len(self.prompt_queue.queue) + len(self.prompt_queue.currently_running)
             self.prompt_queue.put((number, prompt_id, {"full": prompt_id}, {}, [], {}))
         self.pending_jobs[f"job-{prompt_id}"] = asyncio.Queue()
         remaining_requeue_errors = [requeue_errors]
+        ambiguous_sends_left = [1 if ambiguous else 0]
 
         async def prepare_for_worker(worker):
             if prepare_gate is not None:
@@ -154,7 +164,8 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
             if dispatch_error is not None:
                 raise dispatch_error
             self.dispatched.append((prompt_id, worker["id"]))
-            if ambiguous:
+            if ambiguous_sends_left[0] > 0:
+                ambiguous_sends_left[0] -= 1
                 raise self.lb.AmbiguousDispatchError("acknowledgement lost")
 
         async def requeue_as_delegate(worker):
@@ -193,7 +204,7 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.unresolved["id"], "w1")
         self.assertIsNone(record.assigned)
         self.assertEqual(self.prompt_queue.prompt_ids(), [])  # not restored: the master cannot pick it up
-        record.unresolved_since = 0  # past the grace period
+        record.unresolved_since = time.monotonic() - self.lb.RECENT_DISPATCH_TTL_SECONDS - 1  # past the grace period
         self.queue._recent_dispatch.clear()
         return record
 
@@ -275,7 +286,7 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError(f"Unexpected request: {url}")
 
         network = sys.modules[PKG + ".utils.network"]
-        self.lb.fetch_worker_job_state = self.fetch_worker_job_state
+        self.lb.WorkerSnapshot = self.real_snapshot_class
         with patch.object(network, "get_client_session", AsyncMock(return_value=Session()), create=True):
             for _ in range(5):
                 self.queue._recent_dispatch.clear()
@@ -522,6 +533,113 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.queue.lookup_job("job-p1"))
         self.assertNotIn("job-p1", self.pending_jobs)
         self.assertEqual(self.prompt_queue.prompt_ids(), [])
+
+    # ----- audit regressions ---------------------------------------------------
+    async def test_clear_queue_leaves_an_executing_head_run_alone(self):
+        """ComfyUI's clear removes pending prompts only; the running one, whose Collector
+        is waiting for a worker, keeps its hand-off."""
+        gate = asyncio.Event()
+        record = self._queue_run("p1", master_may_run=False, prepare_gate=gate)
+        self.prompt_queue.start_next()
+        waiter = asyncio.ensure_future(self.queue.wait_for_assignment(record))
+        await asyncio.sleep(0)
+        self.remaining["w1"] = 0
+        cycle = asyncio.ensure_future(self.queue.run_cycle())
+        for _ in range(200):
+            if record.claiming:
+                break
+            await asyncio.sleep(0.005)
+        self.assertTrue(record.claiming)
+        self.prompt_queue.wipe_queue()
+        self.prompt_queue.delete_queue_item(lambda item: item[1] == "p1")
+        self.assertFalse(record.cancelled)
+        gate.set()
+        await cycle
+        self.assertEqual(self.dispatched, [("p1", "w1")])
+        assignment = await asyncio.wait_for(waiter, timeout=2)
+        self.assertEqual(assignment["id"], "w1")
+        self.assertIs(self.queue.lookup_job("job-p1"), record)
+
+    async def test_sweep_drops_assigned_run_whose_delegate_left_the_queue(self):
+        record = self._queue_run("p1", master_may_run=False)
+        self.remaining["w1"] = 0
+        await self.queue.run_cycle()
+        self.assertEqual(self.prompt_queue.prompt_ids(), ["p1"])  # delegate queued
+        self.assertEqual(record.assigned_id, "w1")
+        # The delegate prompt is gone without its Collector ever finishing
+        # (an execution error before the Collector node, for example).
+        self.prompt_queue.queue = []
+        self.queue.sweep()
+        self.assertIsNone(self.queue.lookup_job("job-p1"))
+        self.assertNotIn("job-p1", self.pending_jobs)
+        self.assertEqual(len(self.queue), 0)
+
+    async def test_sweep_keeps_runs_whose_delegate_is_executing_or_still_held(self):
+        running = self._queue_run("p1", master_may_run=False)
+        held = self._queue_run("p2")
+        self.remaining = {"w1": 0, "w2": 0}
+        await self.queue.run_cycle()
+        self.assertEqual(sorted(self.dispatched), [("p1", "w1"), ("p2", "w2")])
+        self.prompt_queue.start_next()  # p1's delegate executes
+        self.queue.sweep()
+        self.assertIs(self.queue.lookup_job("job-p1"), running)
+        self.assertIs(self.queue.lookup_job("job-p2"), held)  # delegate held until delivery
+
+    async def test_master_run_completion_releases_its_result_queues(self):
+        record = self._queue_run("p1")
+        self.prompt_queue.start_next()
+        self.assertEqual(await self.queue.wait_for_assignment(record), self.lb.MASTER)
+        self.assertIn("job-p1", self.pending_jobs)
+        self.queue.finish_job(record, "job-p1")
+        self.assertIsNone(self.queue.lookup_job("job-p1"))
+        self.assertNotIn("job-p1", self.pending_jobs)
+        self.assertFalse(self.queue.is_cancelled_job("job-p1"))  # a normal completion, not a cancel
+
+    async def test_one_worker_snapshot_serves_every_run_in_a_cycle(self):
+        first = self._queue_run("p1")
+        second = self._queue_run("p2")
+        self.remaining["w1"] = 0
+        await self.queue.run_cycle()
+        self.queue._recent_dispatch.clear()
+        await self.queue.run_cycle()
+        self.assertEqual(sorted(self.dispatched), [("p1", "w1"), ("p2", "w1")])
+        first.dispatched_at = second.dispatched_at = 0
+        self.job_state["w1"] = "running"
+        self.snapshots_taken.clear()
+        self.job_state_queries.clear()
+        await self.queue.run_cycle()
+        self.assertEqual(self.snapshots_taken, ["w1"])  # one fetch, two questions
+        self.assertEqual(sorted(query[1] for query in self.job_state_queries), [{"job-p1"}, {"job-p2"}])
+        self.assertEqual(self.requeued, [])
+
+    async def test_worker_snapshot_reads_queue_then_history_lazily(self):
+        calls = []
+
+        class Snapshot(self.real_snapshot_class):
+            async def _fetch(self, endpoint, params=None):
+                calls.append(endpoint)
+                if endpoint == "/queue":
+                    return {"queue_running": [[1, "x", {"n": {"inputs": {"multi_job_id": "job-a"}}}]],
+                            "queue_pending": []}
+                return {"h1": {"prompt": [0, "y", {"n": {"inputs": {"multi_job_id": "job-b"}}}]}}
+
+        snapshot = Snapshot({"id": "w1"})
+        self.assertEqual(await snapshot.job_state({"job-a"}), "running")
+        self.assertEqual(calls, ["/queue"])
+        self.assertEqual(await snapshot.job_state({"job-b"}), "finished")
+        self.assertEqual(calls, ["/queue", "/history"])
+        self.assertEqual(await snapshot.job_state({"job-c"}), "absent")
+        self.assertEqual(calls, ["/queue", "/history"])  # both cached
+
+        class Broken(self.real_snapshot_class):
+            async def _fetch(self, endpoint, params=None):
+                calls.append(endpoint)
+                raise RuntimeError("connection refused")
+
+        broken = Broken({"id": "w2"})
+        self.assertIsNone(await broken.job_state({"job-a"}))
+        self.assertIsNone(await broken.job_state({"job-a"}))
+        self.assertEqual(calls.count("/queue"), 2)  # a failed worker is not asked again this cycle
 
     # ----- interrupted assignment on an orchestrator-only master ---------------
     async def test_interrupt_during_assignment_cleans_result_queue_and_stops_dispatch(self):

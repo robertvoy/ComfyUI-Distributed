@@ -196,6 +196,19 @@ class ExplicitTargetTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0]['partial_execution_targets'], ['9'])
         self.assertNotIn('partial_execution_targets', calls[1])
 
+    async def test_websocket_connect_timeout_is_a_definite_failure(self):
+        """A timeout before anything was sent must not read as ambiguous acceptance."""
+        never = asyncio.Event()
+
+        async def hang(*_args, **_kwargs):
+            await never.wait()
+
+        session = types.SimpleNamespace(ws_connect=hang)
+        with patch.object(dispatch, "get_client_session", AsyncMock(return_value=session)):
+            with self.assertRaisesRegex(RuntimeError, "nothing was sent") as caught:
+                await dispatch._dispatch_via_websocket("http://worker", {"prompt": {}}, "client", timeout=0.05)
+        self.assertNotIsInstance(caught.exception, dispatch.AmbiguousDispatchError)
+
     async def test_websocket_sends_targets_all_the_way_to_wire(self):
         import json
         sent = []

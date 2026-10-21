@@ -188,6 +188,14 @@ class DeferredLoadBalanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.lb_queue.records[0].unresolved["id"], "w1")
         self.q.queue_prompt_payload.assert_not_awaited()
 
+    async def test_master_selected_alone_creates_no_result_queues(self):
+        self.select_idle_worker.return_value = ({"id": "master", "name": "Master", "type": "local"}, 2)
+        _, _, worker_count, _ = await self._run()
+        self.assertEqual(worker_count, 0)
+        self.q.queue_prompt_payload.assert_awaited_once()
+        self.assertEqual(self.ps.distributed_pending_jobs, {})
+        self.assertEqual(self.lb_queue.records, [])
+
     async def test_orchestrator_only_master_queues_delegate_immediately(self):
         self.settings["master_delegate_only"] = True
         self.select_idle_worker.return_value = (self.worker, 1)
@@ -223,18 +231,17 @@ class DeferredLoadBalanceTests(unittest.IsolatedAsyncioTestCase):
         network.build_worker_url = lambda worker, *a: f"http://{worker['id']}"
         network.probe_worker = AsyncMock(return_value=None)
         dispatch = sys.modules[PKG + ".api.orchestration.dispatch"]
-        dispatch._extract_queue_remaining = lambda payload: int(payload["exec_info"]["queue_remaining"])
+
+        async def always_busy_probe(worker, semaphore, probe_timeout):
+            return {"worker": worker, "queue_remaining": 1}
+
+        dispatch._probe_worker_queue = always_busy_probe
         dispatch._select_idle_round_robin = lambda statuses: statuses[0]
         spec = importlib.util.spec_from_file_location(
             PKG + ".api.orchestration.load_balance_queue", ROOT / "api" / "orchestration" / "load_balance_queue.py")
         lb = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(lb)
         lb.select_idle_worker = AsyncMock(return_value=(None, 1))
-
-        async def always_busy(url, timeout=3.0):
-            return {"exec_info": {"queue_remaining": 1}}
-
-        lb.probe_worker = always_busy
         sys.modules[PKG + ".api.orchestration.load_balance_queue"] = lb
         queue = lb.get_load_balance_queue(self.ps)
         queue.poll_interval = 0.01

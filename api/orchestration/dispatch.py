@@ -98,6 +98,12 @@ async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
     try:
         async with asyncio.timeout_at(deadline):
             ws = await session.ws_connect(ws_url, heartbeat=20)
+    except asyncio.TimeoutError as exc:
+        # Nothing was sent: a definite failure the caller may retry elsewhere.
+        raise RuntimeError("Worker websocket connect timed out before dispatch; nothing was sent") from exc
+
+    try:
+        async with asyncio.timeout_at(deadline):
             await ws.send_json(ws_payload)
             while True:
                 msg = await ws.receive()
