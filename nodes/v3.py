@@ -122,7 +122,7 @@ class DistributedCollector(io.ComfyNode):
         return io.Schema(
             node_id='DistributedCollector', display_name='Distributed Collector', category='image',
             inputs=[io.Boolean.Input('load_balance', default=False,
-                                     tooltip='Run this workflow on one least-busy participant (master included when participating).'),
+                                     tooltip='Run this workflow on one free participant (master included when participating). When every GPU is busy, the run waits in the queue and goes to whichever GPU frees up first.'),
                     io.Image.Input('images', optional=True), io.Audio.Input('audio', optional=True),
                     io.Combo.Input('transfer_format', options=list(_transfer_codec.TRANSFER_FORMATS),
                                    default=_transfer_codec.DEFAULT_TRANSFER_FORMAT, optional=True,

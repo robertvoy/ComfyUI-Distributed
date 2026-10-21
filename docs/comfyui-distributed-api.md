@@ -22,7 +22,9 @@ This document describes the **public HTTP API** added to ComfyUI-Distributed to 
   - Probes and dispatches workers through `/distributed/worker_ws` by default.
   - If `settings.websocket_orchestration=false`, probes with `GET /prompt` and dispatches with `POST /prompt` instead.
   - Queues the master workflow in ComfyUI’s prompt queue.
-  - If any `DistributedCollector` has `load_balance=true`, selects one least-busy participant for this run.
+  - If any `DistributedCollector` has `load_balance=true`, runs the prompt on one free participant. When every participant is busy, the prompt waits in the master queue (under the returned `prompt_id`) and is handed to whichever worker frees up first, or taken by the master when it participates. When a participating master hands a run to a worker, the master's collect-only prompt is queued only once the worker's result arrives, so the master GPU keeps running other queued prompts meanwhile; until then the `prompt_id` is not in `/queue` or `/history`. Prompts with `UltimateSDUpscaleDistributed` nodes or serverless workers keep the queue-depth selection instead.
+
+If a load-balanced worker submission loses its acknowledgement, the master holds the run until a result arrives or that job is found in the worker's queue/history. Missing history—even on repeated checks—does not prove rejection: history may have been truncated, cleared, or lost on restart. Such a run is **not automatically retried or dropped** and may remain on hold indefinitely; the master logs this condition. Check the worker's actual execution/output before manually submitting a replacement, which could otherwise duplicate completed work.
 
 ### What it does *not* add
 

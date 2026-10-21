@@ -31,6 +31,15 @@ except ImportError:
 _least_busy_rr_index = 0
 
 
+class AmbiguousDispatchError(RuntimeError):
+    """The worker may or may not have accepted the prompt.
+
+    Raised when the transport fails after the request could have reached the
+    worker (acknowledgement lost, timeout, unreadable acknowledgement). A
+    caller must not simply resend: the job may already be running there.
+    """
+
+
 async def worker_is_active(worker):
     """Ping worker's /prompt endpoint to confirm it's reachable."""
     url = build_worker_url(worker)
@@ -106,9 +115,9 @@ async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
                             error_text = f"{error_text} | node_errors={node_errors}"
                         raise RuntimeError(error_text)
                 elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
-                    raise RuntimeError(f"Worker websocket closed before acknowledgement: {msg.type}; submission status is ambiguous")
+                    raise AmbiguousDispatchError(f"Worker websocket closed before acknowledgement: {msg.type}; submission status is ambiguous")
     except asyncio.TimeoutError as exc:
-        raise RuntimeError(
+        raise AmbiguousDispatchError(
             "Worker websocket dispatch timed out before dispatch_ack; submission status is ambiguous."
         ) from exc
     finally:
@@ -170,22 +179,34 @@ async def dispatch_worker_prompt(
             raise
 
     session = await get_client_session()
-    async with session.post(
-        url,
-        json=payload,
-        timeout=aiohttp.ClientTimeout(total=60),
-    ) as resp:
-        resp.raise_for_status()
-        if not return_prompt_id:
-            return None
-        try:
-            response_data = await resp.json()
-        except Exception as exc:
-            raise RuntimeError("Worker /prompt response did not contain JSON acknowledgement") from exc
-        prompt_id = response_data.get("prompt_id") if isinstance(response_data, dict) else None
-        if not isinstance(prompt_id, str) or not prompt_id:
-            raise RuntimeError("Worker /prompt response omitted prompt_id")
-        return prompt_id if return_prompt_id else None
+    try:
+        async with session.post(
+            url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            resp.raise_for_status()
+            if not return_prompt_id:
+                return None
+            try:
+                response_data = await resp.json()
+            except Exception as exc:
+                raise AmbiguousDispatchError(
+                    "Worker /prompt response did not contain JSON acknowledgement; submission status is ambiguous"
+                ) from exc
+            prompt_id = response_data.get("prompt_id") if isinstance(response_data, dict) else None
+            if not isinstance(prompt_id, str) or not prompt_id:
+                raise AmbiguousDispatchError("Worker /prompt response omitted prompt_id; submission status is ambiguous")
+            return prompt_id if return_prompt_id else None
+    except aiohttp.ClientConnectorError:
+        # Never reached the worker: a definite failure the caller may retry.
+        raise
+    except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+        if isinstance(exc, getattr(aiohttp, "ClientResponseError", ())):
+            raise  # the worker answered with an error status: definite rejection
+        raise AmbiguousDispatchError(
+            f"Worker /prompt request failed after it may have been received ({exc}); submission status is ambiguous"
+        ) from exc
 
 
 async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0, *,

@@ -161,6 +161,10 @@ async def prepare_job_endpoint(request):
             return await handle_api_error(request, "Missing multi_job_id", 400)
 
         ensure_distributed_state()
+        if _job_was_cancelled(multi_job_id):
+            # A cancelled load-balanced run's result queue is gone; a late
+            # worker must not recreate it.
+            return await handle_api_error(request, "job was cancelled", 410)
         async with prompt_server.distributed_jobs_lock:
             if multi_job_id not in prompt_server.distributed_pending_jobs:
                 prompt_server.distributed_pending_jobs[multi_job_id] = asyncio.Queue()
@@ -283,6 +287,25 @@ async def check_file_endpoint(request):
         return await handle_api_error(request, e, 500)
 
 
+def _job_was_cancelled(multi_job_id):
+    try:
+        from .orchestration.load_balance_queue import get_load_balance_queue
+        return get_load_balance_queue().is_cancelled_job(multi_job_id)
+    except Exception:
+        return False
+
+
+def _notify_worker_result(multi_job_id):
+    """A worker delivered a final result: its run can be collected and the worker re-probed."""
+    try:
+        from .orchestration.load_balance_queue import get_load_balance_queue
+        queue = get_load_balance_queue()
+        queue.result_delivered(multi_job_id)
+        queue.wake()
+    except Exception as exc:  # never fail a result delivery over the dispatcher
+        debug_log(f"Load balance notify skipped: {exc}")
+
+
 async def _enqueue_worker_items(multi_job_id, items):
     """Put decoded items on the job queue, waiting briefly for the master to create it.
 
@@ -295,7 +318,10 @@ async def _enqueue_worker_items(multi_job_id, items):
             if pending is not None:
                 for item in items:
                     await pending.put(item)
-                return pending.qsize()
+                size = pending.qsize()
+                if any(item.get("is_last") for item in items):
+                    _notify_worker_result(multi_job_id)
+                return size
         if time.monotonic() > deadline:
             return None
         await asyncio.sleep(0.05)
