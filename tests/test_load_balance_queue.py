@@ -127,6 +127,7 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
             self.job_state_queries.append((worker["id"], set(job_ids)))
             return self.job_state.get(worker["id"], "absent")
 
+        self.fetch_worker_job_state = self.lb.fetch_worker_job_state
         self.lb.fetch_worker_job_state = fake_job_state
 
     def _queue_run(self, prompt_id, master_may_run=True, dispatch_error=None, requeue_errors=0, queued=True,
@@ -242,18 +243,81 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.job_state_queries, [])
         self.assertEqual(len(self.dispatched), 1)
 
+    async def _assert_missing_history_never_replays(self, history):
+        """Exercise the real queue/history lookup, not a mocked 'absent' answer."""
+        record = await self._ambiguous_run()
+        self.remaining = {"w1": 0, "w2": 0}
+        requests = []
+
+        class Response:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def json(self):
+                return self.payload
+
+        class Session:
+            def get(self, url, **kwargs):
+                requests.append(url)
+                if url.endswith("/queue"):
+                    return Response({"queue_running": [], "queue_pending": []})
+                if url.endswith("/history"):
+                    limit = int(kwargs["params"]["max_items"])
+                    return Response(dict(list(history.items())[-limit:]))
+                raise AssertionError(f"Unexpected request: {url}")
+
+        network = sys.modules[PKG + ".utils.network"]
+        self.lb.fetch_worker_job_state = self.fetch_worker_job_state
+        with patch.object(network, "get_client_session", AsyncMock(return_value=Session()), create=True):
+            for _ in range(5):
+                self.queue._recent_dispatch.clear()
+                await self.queue.run_cycle()
+                self.assertEqual(self.dispatched, [("p1", "w1")])
+                self.assertEqual(self.prompt_queue.prompt_ids(), [])
+                self.assertEqual(self.requeued, [])
+                self.assertIsNone(record.assigned)
+                self.assertEqual(record.unresolved["id"], "w1")
+                self.assertIs(self.queue.lookup_job("job-p1"), record)
+                self.assertIn("job-p1", self.pending_jobs)
+        self.assertEqual(requests.count("http://w1/history"), 5)
+        # Missing history must not discard ownership: a late result still collects.
+        self.queue.result_delivered("job-p1")
+        await self.queue.run_cycle()
+        self.assertEqual(self.requeued, [("p1", "w1")])
+        self.assertEqual(self.dispatched, [("p1", "w1")])
+
+    async def test_lost_acknowledgement_outside_history_window_never_replays(self):
+        history = {"accepted": {"prompt": [0, "accepted", {
+            "collector": {"inputs": {"multi_job_id": "job-p1"}}
+        }]}}
+        for index in range(self.lb.HISTORY_LOOKBACK_ITEMS):
+            history[f"newer-{index}"] = {"prompt": [index + 1, f"newer-{index}", {}]}
+        await self._assert_missing_history_never_replays(history)
+
+    async def test_lost_acknowledgement_cleared_history_never_replays(self):
+        await self._assert_missing_history_never_replays({})
+
     async def test_busy_worker_on_unrelated_work_is_not_taken_as_acceptance(self):
         record = await self._ambiguous_run(master_may_run=False)
         self.remaining["w1"] = 3  # busy, but with other prompts
         self.job_state["w1"] = "absent"
         await self.queue.run_cycle()
-        self.assertEqual(record.unresolved["id"], "w1")  # one absent check is not enough
+        self.assertEqual(record.unresolved["id"], "w1")
         self.assertEqual(self.prompt_queue.prompt_ids(), [])
-        await self.queue.run_cycle()
-        self.assertIsNone(record.unresolved)  # confirmed absent: never accepted
+        for _ in range(5):
+            await self.queue.run_cycle()
+        self.assertEqual(record.unresolved["id"], "w1")  # repeated absence still proves nothing
         self.assertIsNone(record.assigned)
-        self.assertEqual(self.prompt_queue.prompt_ids(), ["p1"])  # original prompt back, same position
-        self.assertEqual(self.prompt_queue.queue[0][2], {"full": "p1"})
+        self.assertEqual(self.prompt_queue.prompt_ids(), [])
+        self.assertEqual(self.dispatched, [("p1", "w1")])
         self.assertIs(self.queue.lookup_job("job-p1"), record)
         self.assertEqual(self.requeued, [])
 
@@ -265,7 +329,7 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.unresolved["id"], "w1")  # never replayed, never dropped
         self.assertEqual(self.prompt_queue.prompt_ids(), [])
         self.assertEqual(len(self.dispatched), 1)
-        # A single absent answer between failures does not count as confirmation.
+        # Neither missing history nor failed probes establishes rejection.
         self.job_state["w1"] = "absent"
         await self.queue.run_cycle()
         self.job_state["w1"] = None
@@ -303,16 +367,20 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         await self.queue.run_cycle()
         self.assertEqual(self.requeued, [("p1", "w1")])
 
-    async def test_eager_run_with_lost_acknowledgement_never_accepted_is_dropped(self):
+    async def test_eager_run_with_lost_acknowledgement_missing_history_stays_tracked(self):
         record = self._queue_run("p1", master_may_run=False, queued=False)
         self.queue.register_dispatched(record, self.workers[0])
         self.queue.mark_unresolved(record, self.workers[0])
         record.unresolved_since = 0
-        for _ in range(self.lb.ABSENT_CONFIRMATIONS):
+        for _ in range(5):
             await self.queue.run_cycle()
-        self.assertIsNone(self.queue.lookup_job("job-p1"))  # nothing to restore: it never existed on the master
-        self.assertNotIn("job-p1", self.pending_jobs)
+        self.assertIs(self.queue.lookup_job("job-p1"), record)
+        self.assertIn("job-p1", self.pending_jobs)
+        self.assertEqual(record.unresolved["id"], "w1")
         self.assertEqual(self.prompt_queue.prompt_ids(), [])
+        self.queue.result_delivered("job-p1")
+        await self.queue.run_cycle()
+        self.assertEqual(self.requeued, [("p1", "w1")])
 
     async def test_definite_failure_before_submission_still_restores_the_run(self):
         record = self._queue_run("p1", dispatch_error=RuntimeError("connection refused"))
@@ -409,18 +477,25 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.queue.lookup_job("job-p1"))
         self.assertNotIn("job-p1", self.pending_jobs)
 
-    async def test_ambiguous_then_cleared_run_is_dropped_or_discarded_never_restored(self):
+    async def test_ambiguous_then_cleared_run_stays_tracked_until_delivery_never_restored(self):
         record = self._queue_run("p1", ambiguous=True)
         self.remaining["w1"] = 0
         await self.queue.run_cycle()
         self.prompt_queue.wipe_queue()
         self.assertTrue(record.cancelled)
         record.unresolved_since = 0
-        for _ in range(self.lb.ABSENT_CONFIRMATIONS):
-            await self.queue.run_cycle()  # confirmed never taken; the user cancelled, so do not restore
+        for _ in range(5):
+            await self.queue.run_cycle()
         self.assertEqual(self.prompt_queue.prompt_ids(), [])
+        self.assertEqual(self.dispatched, [("p1", "w1")])
+        self.assertIs(self.queue.lookup_job("job-p1"), record)
+        self.assertIn("job-p1", self.pending_jobs)
+        self.queue.result_delivered("job-p1")
+        await self.queue.run_cycle()  # late result is discarded, never collected or replayed
         self.assertIsNone(self.queue.lookup_job("job-p1"))
         self.assertNotIn("job-p1", self.pending_jobs)
+        self.assertEqual(self.requeued, [])
+        self.assertEqual(self.prompt_queue.prompt_ids(), [])
 
     async def test_clear_queue_during_delegate_validation_does_not_insert_it(self):
         """Cancellation that lands while the delegate prompt is being validated."""

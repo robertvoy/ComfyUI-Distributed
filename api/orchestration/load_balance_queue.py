@@ -27,10 +27,11 @@ Two lifecycle rules keep a run from executing twice or vanishing:
   ``AmbiguousDispatchError``) is never replayed. The run is held as
   *unresolved* until the worker delivers, or until the worker's own queue
   and history are checked for this run's job ids: found there means it was
-  accepted and the result is collected; confirmed absent on consecutive
-  checks means it never arrived and the original prompt goes back. Aggregate
-  queue depth is never used for this, since an idle worker may have run the
-  job and lost the delivery, and a busy worker may be on something else.
+  accepted and the result is collected. Absence is not proof of rejection:
+  history is bounded and can be cleared or lost on restart. Without positive
+  evidence the run stays unresolved rather than risking duplicate execution.
+  Aggregate queue depth is never used for this, since an idle worker may have
+  run the job and lost the delivery, and a busy worker may be on something else.
 * While a run is out of the master queue for a hand-off, cancellation
   (queue clear, queue delete, interrupting its Collector) is recorded on the
   run itself. Work that was not yet submitted is dropped along with its
@@ -73,9 +74,7 @@ REQUEUE_RETRY_MIN_SECONDS = 1.0
 REQUEUE_RETRY_MAX_SECONDS = 30.0
 # Consecutive failed probes before a dispatched worker counts as gone.
 WORKER_UNREACHABLE_PROBES = 3
-# An unresolved submission is restored only after this many consecutive
-# worker queue+history checks found no trace of its job ids.
-ABSENT_CONFIRMATIONS = 2
+
 # How far back the worker's history is searched for an unresolved run.
 HISTORY_LOOKBACK_ITEMS = 200
 # Job ids whose result queues were discarded; a late worker must not recreate them.
@@ -124,9 +123,10 @@ async def fetch_worker_job_state(worker, job_ids, timeout=5.0):
 
     Returns ``"running"`` when a prompt carrying one of ``job_ids`` is in the
     worker's running or pending queue, ``"finished"`` when it is in the
-    worker's recent history, ``"absent"`` when the worker answered both
-    questions and has no trace of it, and ``None`` when the worker could not
-    be asked. Direct workers only; serverless pools never reach this path.
+    worker's recent history, ``"absent"`` when neither snapshot contains it,
+    and ``None`` when the worker could not be asked. Absence is not proof that
+    a submission was rejected: history can be truncated, cleared or lost on
+    restart. Direct workers only; serverless pools never reach this path.
     """
     import aiohttp
     from ...utils.network import get_client_session
@@ -211,7 +211,7 @@ class PendingRun:
         # re-queued for it; accepted remote work is discarded when it ends.
         self.cancelled = False
         # Submission whose acceptance is unknown: worker dict, the master
-        # queue item to restore if it turns out rejected, and when it happened.
+        # queue item identifying its collector hand-off, and when it happened.
         self.unresolved = None
         self.unresolved_item = None
         self.unresolved_since = 0.0
@@ -314,8 +314,8 @@ class LoadBalanceQueue:
     def mark_unresolved(self, record, worker, item=None):
         """The submission to ``worker`` may or may not have been accepted.
 
-        The run is neither replayed nor dropped until the worker delivers, is
-        seen busy, or is seen idle without delivering.
+        The run is neither replayed nor dropped. Only delivery or positive
+        job-specific evidence in the worker's queue/history confirms acceptance.
         """
         record.assigned = None
         record.requeue_pending = False
@@ -693,7 +693,8 @@ class LoadBalanceQueue:
         The worker is asked about this run specifically (its job ids in the
         worker's queue or history). Aggregate idle/busy state is not evidence:
         an idle worker may have run the job and lost the delivery, a busy one
-        may be on unrelated work.
+        may be on unrelated work. Missing history is not rejection evidence,
+        even on repeated checks: accepted work may have aged out or been cleared.
         """
         for record in list(self._records.values()):
             worker = record.unresolved
@@ -712,8 +713,12 @@ class LoadBalanceQueue:
             elif state == "absent":
                 record.absent_checks += 1
                 record.missed_probes = 0
-                if record.absent_checks >= ABSENT_CONFIRMATIONS:
-                    self._reject_unresolved(record)
+                if record.absent_checks == 1:
+                    log(
+                        f"[Distributed] Load balance: run {record.prompt_id[:8]} was not found in worker "
+                        f"{_worker_key(worker)}'s queue/recent history, but it may already have executed. "
+                        "Holding it without automatic retry to avoid duplicate execution."
+                    )
             else:
                 record.absent_checks = 0
                 record.missed_probes += 1
@@ -746,21 +751,6 @@ class LoadBalanceQueue:
             # The collector is already executing on the master and waiting.
             record._assign(worker)
             record.dispatched_at = time.monotonic()
-
-    def _reject_unresolved(self, record):
-        worker, item = record.unresolved, record.unresolved_item
-        record.unresolved = None
-        record.unresolved_item = None
-        if record.cancelled:
-            self._discard(record)
-            return
-        if item is None:
-            # Nothing to put back: the run only ever existed on that worker.
-            log(f"[Distributed] Load balance: worker {_worker_key(worker)} never took run {record.prompt_id[:8]}; dropping it")
-            self._discard(record)
-            return
-        self._restore(item)
-        log(f"[Distributed] Load balance: worker {_worker_key(worker)} never took run {record.prompt_id[:8]}; back in the master queue")
 
     async def _retry_requeues(self):
         now = time.monotonic()
