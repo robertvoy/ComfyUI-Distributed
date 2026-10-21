@@ -14,9 +14,9 @@ A delegate prompt blocks ComfyUI's single executor while it waits for its
 worker, which would stall every full workflow queued behind it on a
 participating master. So on a participating master the delegate prompt is
 queued only once the worker's final result has arrived (or the worker is
-seen idle or unreachable without delivering, so the Collector can report
-it); an orchestrator-only master has nothing else to run and queues it at
-once.
+seen to have finished or lost the run without delivering, so the Collector
+can report it); an orchestrator-only master has nothing else to run and
+queues it at once.
 
 The claim is atomic through ComfyUI's queue mutex: a run can be removed from
 the queue by the dispatcher or popped by the master executor, never both.
@@ -37,7 +37,8 @@ Two lifecycle rules keep a run from executing twice or vanishing:
   run itself. Work that was not yet submitted is dropped along with its
   result queues; work a worker already accepted stays tracked until its
   result arrives or the worker is seen done, and is then discarded instead
-  of reappearing.
+  of reappearing. A run whose master prompt is currently executing is left
+  alone by clears and deletes, exactly as ComfyUI leaves the running prompt.
 """
 import asyncio
 import threading
@@ -47,8 +48,8 @@ from collections import OrderedDict
 import server
 
 from ...utils.logging import debug_log, log
-from ...utils.network import build_worker_url, probe_worker
-from .dispatch import _extract_queue_remaining
+from ...utils.network import build_worker_url
+from .dispatch import _probe_worker_queue
 from .dispatch import _select_idle_round_robin
 
 try:
@@ -74,7 +75,6 @@ REQUEUE_RETRY_MIN_SECONDS = 1.0
 REQUEUE_RETRY_MAX_SECONDS = 30.0
 # Consecutive failed probes before a dispatched worker counts as gone.
 WORKER_UNREACHABLE_PROBES = 3
-
 # How far back the worker's history is searched for an unresolved run.
 HISTORY_LOOKBACK_ITEMS = 200
 # Job ids whose result queues were discarded; a late worker must not recreate them.
@@ -90,19 +90,9 @@ def _worker_key(worker):
 async def probe_worker_queues(workers, probe_concurrency=8, probe_timeout=3.0):
     """Return ``[{"worker", "queue_remaining"}]`` for every worker that answered."""
     semaphore = asyncio.Semaphore(max(1, int(probe_concurrency or 1)))
-
-    async def _probe(worker):
-        async with semaphore:
-            if worker.get("type") == "serverless":
-                from .serverless_runtime import get_manager
-                status = await get_manager().health(worker)
-                return {"worker": worker, "queue_remaining": status["queueRemaining"]}
-            payload = await probe_worker(build_worker_url(worker), timeout=probe_timeout)
-            if payload is None:
-                return None
-            return {"worker": worker, "queue_remaining": _extract_queue_remaining(payload)}
-
-    statuses = await asyncio.gather(*[_probe(worker) for worker in workers])
+    statuses = await asyncio.gather(
+        *[_probe_worker_queue(worker, semaphore, probe_timeout) for worker in workers]
+    )
     return [status for status in statuses if status is not None]
 
 
@@ -118,51 +108,100 @@ def _graph_has_job(graph, job_ids):
     return False
 
 
-async def fetch_worker_job_state(worker, job_ids, timeout=5.0):
-    """Ask the worker itself whether a specific run is there.
+class WorkerSnapshot:
+    """What one worker says about the runs it holds, fetched at most once.
 
-    Returns ``"running"`` when a prompt carrying one of ``job_ids`` is in the
-    worker's running or pending queue, ``"finished"`` when it is in the
-    worker's recent history, ``"absent"`` when neither snapshot contains it,
-    and ``None`` when the worker could not be asked. Absence is not proof that
-    a submission was rejected: history can be truncated, cleared or lost on
-    restart. Direct workers only; serverless pools never reach this path.
+    The queue (running and pending prompts) is fetched on first use; the
+    history, which is larger, only when a run is not found in the queue.
+    One snapshot serves every run on that worker within a dispatcher cycle.
+    Direct workers only; serverless pools never reach this path.
     """
-    import aiohttp
-    from ...utils.network import get_client_session
 
-    job_ids = {str(job_id) for job_id in job_ids}
-    base_url = build_worker_url(worker)
-    session = await get_client_session()
-    try:
-        async with session.get(f"{base_url}/queue", timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-            if response.status != 200:
-                return None
-            queue_info = await response.json()
-        if not isinstance(queue_info, dict):
-            return None
-        for key in ("queue_running", "queue_pending"):
-            for item in queue_info.get(key) or []:
-                if isinstance(item, (list, tuple)) and len(item) > 2 and _graph_has_job(item[2], job_ids):
-                    return "running"
+    def __init__(self, worker, timeout=5.0):
+        self.worker = worker
+        self.timeout = timeout
+        self._queue_graphs = None
+        self._history_graphs = None
+        # Tracked per endpoint: a failed /history must not hide runs that the
+        # successfully fetched /queue shows as running. A failed endpoint is
+        # not retried within the snapshot's cycle.
+        self.queue_failed = False
+        self.history_failed = False
+
+    async def _fetch(self, endpoint, params=None):
+        import aiohttp
+        from ...utils.network import get_client_session
+
+        session = await get_client_session()
         async with session.get(
-            f"{base_url}/history",
-            params={"max_items": str(HISTORY_LOOKBACK_ITEMS)},
-            timeout=aiohttp.ClientTimeout(total=timeout),
+            f"{build_worker_url(self.worker)}{endpoint}",
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
         ) as response:
             if response.status != 200:
-                return None
-            history = await response.json()
-        if not isinstance(history, dict):
+                raise RuntimeError(f"{endpoint} returned HTTP {response.status}")
+            payload = await response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{endpoint} returned a non-object body")
+        return payload
+
+    async def _queue(self):
+        if self._queue_graphs is None:
+            queue_info = await self._fetch("/queue")
+            graphs = []
+            for key in ("queue_running", "queue_pending"):
+                for item in queue_info.get(key) or []:
+                    if isinstance(item, (list, tuple)) and len(item) > 2:
+                        graphs.append(item[2])
+            self._queue_graphs = graphs
+        return self._queue_graphs
+
+    async def _history(self):
+        if self._history_graphs is None:
+            history = await self._fetch("/history", params={"max_items": str(HISTORY_LOOKBACK_ITEMS)})
+            graphs = []
+            for entry in history.values():
+                item = entry.get("prompt") if isinstance(entry, dict) else None
+                if isinstance(item, (list, tuple)) and len(item) > 2:
+                    graphs.append(item[2])
+            self._history_graphs = graphs
+        return self._history_graphs
+
+    async def job_state(self, job_ids):
+        """``"running"`` (in the worker's queue), ``"finished"`` (in its recent
+        history), ``"absent"`` (in neither), or ``None`` when the worker could
+        not be asked.
+
+        Absence is not proof that a submission was rejected: history can be
+        truncated, cleared or lost on restart.
+        """
+        job_ids = {str(job_id) for job_id in job_ids}
+        if self.queue_failed:
             return None
-        for entry in history.values():
-            item = entry.get("prompt") if isinstance(entry, dict) else None
-            if isinstance(item, (list, tuple)) and len(item) > 2 and _graph_has_job(item[2], job_ids):
-                return "finished"
+        try:
+            queue_graphs = await self._queue()
+        except Exception as exc:
+            self.queue_failed = True
+            debug_log(f"Load balance: could not read worker {_worker_key(self.worker)}'s queue: {exc}")
+            return None
+        if any(_graph_has_job(graph, job_ids) for graph in queue_graphs):
+            return "running"
+        if self.history_failed:
+            return None
+        try:
+            history_graphs = await self._history()
+        except Exception as exc:
+            self.history_failed = True
+            debug_log(f"Load balance: could not read worker {_worker_key(self.worker)}'s history: {exc}")
+            return None
+        if any(_graph_has_job(graph, job_ids) for graph in history_graphs):
+            return "finished"
         return "absent"
-    except Exception as exc:
-        debug_log(f"Load balance: could not check worker {_worker_key(worker)} for a run: {exc}")
-        return None
+
+
+async def fetch_worker_job_state(worker, job_ids, timeout=5.0):
+    """Ask the worker itself whether a specific run is there (see ``WorkerSnapshot``)."""
+    return await WorkerSnapshot(worker, timeout).job_state(job_ids)
 
 
 async def select_idle_worker(workers, trace_execution_id=None, probe_concurrency=8, probe_timeout=3.0):
@@ -260,6 +299,11 @@ class PendingRun:
         """Out of the master queue for a hand-off: cancellation must be recorded here."""
         return self.claiming or self.on_worker
 
+    @property
+    def collector_unqueued(self):
+        """Out of the master queue on purpose: being handed off, held unresolved, or awaiting its delegate."""
+        return self.claiming or self.unresolved is not None or self.requeue_pending
+
     def accepts(self, worker):
         key = _worker_key(worker)
         return any(_worker_key(candidate) == key for candidate in self.candidates)
@@ -275,6 +319,7 @@ class LoadBalanceQueue:
         self._by_job = {}  # job_id -> PendingRun
         self._recent_dispatch = {}  # worker id -> monotonic time
         self._cancelled_jobs = OrderedDict()
+        self._snapshots = {}  # worker id -> WorkerSnapshot, valid for one cycle
         self._wake = asyncio.Event()
         self._cycle_lock = asyncio.Lock()
         self._task = None
@@ -377,13 +422,17 @@ class LoadBalanceQueue:
             if self._by_job.get(job_id) is record:
                 self._by_job.pop(job_id, None)
 
+    def _release_result_queues(self, record):
+        pending_jobs = self._pending_jobs_getter()
+        if isinstance(pending_jobs, dict):
+            for job_id in record.job_ids:
+                pending_jobs.pop(job_id, None)
+
     def _discard(self, record):
         """Drop the run and the result queues nobody will consume any more."""
         self._remove(record)
-        pending_jobs = self._pending_jobs_getter()
+        self._release_result_queues(record)
         for job_id in record.job_ids:
-            if isinstance(pending_jobs, dict):
-                pending_jobs.pop(job_id, None)
             self._cancelled_jobs[job_id] = True
             self._cancelled_jobs.move_to_end(job_id)
         while len(self._cancelled_jobs) > CANCELLED_JOB_MEMORY:
@@ -430,10 +479,15 @@ class LoadBalanceQueue:
         self._hooks_installed = True
 
     def cancel_matching(self, predicate):
-        """Cancel in-flight runs whose queue item ``predicate`` would have deleted."""
+        """Cancel in-flight runs whose queue item ``predicate`` would have deleted.
+
+        A run whose master prompt is currently executing is left alone, as
+        ComfyUI's clear and delete leave the running prompt alone.
+        """
         cancelled = []
+        running = self._running_ids()
         for record in list(self._records.values()):
-            if record.cancelled or not record.in_flight:
+            if record.cancelled or not record.in_flight or record.prompt_id in running:
                 continue
             item = record.unresolved_item or (0, record.prompt_id, {}, {}, [])
             try:
@@ -503,6 +557,8 @@ class LoadBalanceQueue:
         On failure or interruption the run is cancelled: a hand-off still in
         flight is stopped before submission, and work a worker already
         accepted is discarded when it ends, so no result queue is left behind.
+        On success the run is forgotten once every job finished, including the
+        result queues a master-run never needed.
         """
         if failed:
             if record.prompt_id in self._records:
@@ -511,20 +567,27 @@ class LoadBalanceQueue:
         record.finished_jobs.add(str(job_id))
         if record.finished_jobs >= record.job_ids:
             self._remove(record)
+            self._release_result_queues(record)
 
     # ----- queue inspection ---------------------------------------------
     def _prompt_queue(self):
         return self._prompt_queue_getter()
 
-    def _is_running(self, prompt_id):
+    def _running_ids(self):
         prompt_queue = self._prompt_queue()
         with prompt_queue.mutex:
-            return any(item[1] == prompt_id for item in prompt_queue.currently_running.values())
+            return {item[1] for item in prompt_queue.currently_running.values()}
+
+    def _queued_ids(self):
+        prompt_queue = self._prompt_queue()
+        with prompt_queue.mutex:
+            return {item[1] for item in prompt_queue.queue}
+
+    def _is_running(self, prompt_id):
+        return prompt_id in self._running_ids()
 
     def _is_queued(self, prompt_id):
-        prompt_queue = self._prompt_queue()
-        with prompt_queue.mutex:
-            return any(item[1] == prompt_id for item in prompt_queue.queue)
+        return prompt_id in self._queued_ids()
 
     def _take_from_queue(self, prompt_id):
         """Remove the prompt from the master queue; return the item or None."""
@@ -579,13 +642,20 @@ class LoadBalanceQueue:
             self._task = None
 
     def sweep(self):
-        """Drop runs that left the master queue without being collected."""
+        """Drop runs that left the master queue without being collected.
+
+        Runs that are out of the queue on purpose (being handed off, held
+        unresolved, or waiting for their delegate prompt to be queued) and
+        cancelled runs are left to the dispatcher's own bookkeeping.
+        """
+        queued = self._queued_ids()
+        running = self._running_ids()
         for record in list(self._records.values()):
-            if not record.queued or record.in_flight or record.cancelled:
+            if not record.queued or record.collector_unqueued or record.cancelled:
                 continue
-            if self._is_queued(record.prompt_id):
+            if record.prompt_id in queued:
                 continue
-            if self._is_running(record.prompt_id):
+            if record.prompt_id in running:
                 if record.assigned is None and record.master_may_run:
                     record._assign(MASTER)
                     debug_log(f"Load balance: master is running run {record.prompt_id}")
@@ -605,7 +675,11 @@ class LoadBalanceQueue:
     async def run_cycle(self, probe_concurrency=8, probe_timeout=3.0):
         """One dispatcher pass: sweep, resolve, retry, then hand runs to idle workers."""
         async with self._cycle_lock:
-            return await self._run_cycle(probe_concurrency, probe_timeout)
+            self._snapshots = {}
+            try:
+                return await self._run_cycle(probe_concurrency, probe_timeout)
+            finally:
+                self._snapshots = {}
 
     async def _run_cycle(self, probe_concurrency, probe_timeout):
         self.sweep()
@@ -662,14 +736,14 @@ class LoadBalanceQueue:
         record.delegate_needed = False
         return True
 
-    async def _probe_one(self, record, worker):
-        """Return 'unreachable', 'idle' or 'busy' for the worker running ``record``."""
-        statuses = await probe_worker_queues([worker])
-        if not statuses:
-            record.missed_probes += 1
-            return "unreachable"
-        record.missed_probes = 0
-        return "idle" if statuses[0]["queue_remaining"] == 0 else "busy"
+    async def _job_state(self, record, worker):
+        """Ask ``worker`` about ``record``'s jobs, sharing one snapshot per worker per cycle."""
+        key = _worker_key(worker)
+        snapshot = self._snapshots.get(key)
+        if snapshot is None:
+            snapshot = WorkerSnapshot(worker)
+            self._snapshots[key] = snapshot
+        return await snapshot.job_state(record.job_ids)
 
     async def _worker_done_without_result(self, record):
         """True when the worker no longer has this run and never delivered.
@@ -680,7 +754,7 @@ class LoadBalanceQueue:
         """
         if time.monotonic() - record.dispatched_at < RECENT_DISPATCH_TTL_SECONDS:
             return False
-        state = await fetch_worker_job_state(record.assigned, record.job_ids)
+        state = await self._job_state(record, record.assigned)
         if state is None:
             record.missed_probes += 1
             return record.missed_probes >= WORKER_UNREACHABLE_PROBES
@@ -695,7 +769,9 @@ class LoadBalanceQueue:
         an idle worker may have run the job and lost the delivery, a busy one
         may be on unrelated work. Missing history is not rejection evidence,
         even on repeated checks: accepted work may have aged out or been cleared.
+        A worker that cannot be asked keeps the run on hold as well.
         """
+        now = time.monotonic()
         for record in list(self._records.values()):
             worker = record.unresolved
             if worker is None:
@@ -703,9 +779,9 @@ class LoadBalanceQueue:
             if record.delivered:
                 self._accept_unresolved(record, "delivered its result")
                 continue
-            if time.monotonic() - record.unresolved_since < RECENT_DISPATCH_TTL_SECONDS:
+            if now - record.unresolved_since < RECENT_DISPATCH_TTL_SECONDS:
                 continue
-            state = await fetch_worker_job_state(worker, record.job_ids)
+            state = await self._job_state(record, worker)
             if state == "running":
                 self._accept_unresolved(record, "has it queued or running")
             elif state == "finished":
@@ -764,8 +840,8 @@ class LoadBalanceQueue:
                 if not await self._worker_done_without_result(record):
                     continue
                 log(
-                    f"[Distributed] Load balance: worker {record.assigned_id} is idle or unreachable without "
-                    f"delivering run {record.prompt_id[:8]}; queueing its collector so the run can report."
+                    f"[Distributed] Load balance: worker {record.assigned_id} no longer has run "
+                    f"{record.prompt_id[:8]} and never delivered it; queueing its collector so the run can report."
                 )
                 record.wait_for_result = False
             if record.requeue_retry_at > now:

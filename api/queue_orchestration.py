@@ -566,6 +566,9 @@ async def orchestrate_distributed_execution(
     # collect-only prompt once the worker delivers, not now, so the master
     # executor stays free for the next full workflow.
     hold_delegate_for_worker = None
+    # Load balance picked the master alone: no worker will ever deliver, so
+    # no result queues are needed for this run.
+    master_runs_alone = False
     if load_balance_requested and not image_list_mode:
         candidate_workers = list(active_workers)
         if not delegate_master:
@@ -617,6 +620,7 @@ async def orchestrate_distributed_execution(
             # Master selected as least busy; run master workload only.
             active_workers = []
             delegate_master = False
+            master_runs_alone = True
             trace_debug(
                 execution_trace_id,
                 "Load-balance selected master for execution (workers skipped).",
@@ -711,7 +715,7 @@ async def orchestrate_distributed_execution(
         manager.ensure_capacity(len(serverless_jobs))
 
     # Do not leave collector queues behind when offline compilation/media validation fails.
-    if not image_list_mode:
+    if not image_list_mode and not master_runs_alone:
         for job_id in job_id_map.values():
             await _ensure_distributed_queue(job_id)
 
