@@ -5,9 +5,10 @@ This avoids sharing mutable instance state through V3's sanitized class clones.
 """
 import comfy.samplers
 from comfy_api.v0_0_2 import io
+from comfy_execution.graph_utils import ExecutionBlocker
 
 from . import utilities as _utilities
-from .collector import DistributedCollectorNode as _CollectorRuntime
+from .collector import DistributedCollectorNode as _CollectorRuntime, PER_GPU_OUTPUT_NAMES
 from ..utils import transfer_codec as _transfer_codec
 from .distributed_upscale import UltimateSDUpscaleDistributed as _UpscaleRuntime
 from .image_list import DistributedImageListEnd, DistributedImageListStart, DistributedImageListGetValue
@@ -130,7 +131,13 @@ class DistributedCollector(io.ComfyNode):
                     io.Int.Input('transfer_quality', default=_transfer_codec.DEFAULT_TRANSFER_QUALITY,
                                  min=1, max=100, step=1, optional=True,
                                  tooltip=_transfer_codec.TRANSFER_QUALITY_TOOLTIP)],
-            outputs=[io.Image.Output(display_name='images'), io.Audio.Output(display_name='audio')],
+            # Per-GPU outputs are appended so saved links to images/audio keep their slots.
+            outputs=[io.Image.Output(display_name='images'), io.Audio.Output(display_name='audio')] + [
+                io.Image.Output(id=name, display_name=name,
+                                tooltip='Images produced by this GPU only, for previewing. '
+                                        'worker_N is the Nth worker in the Distributed panel. '
+                                        'Nodes attached to a GPU that did not take part are skipped.')
+                for name in PER_GPU_OUTPUT_NAMES],
             is_input_list=True, accept_all_inputs=True,
         )
 
@@ -140,12 +147,16 @@ class DistributedCollector(io.ComfyNode):
                 worker_id='', pass_through=False, delegate_only=False,
                 transfer_format=_transfer_codec.DEFAULT_TRANSFER_FORMAT,
                 transfer_quality=_transfer_codec.DEFAULT_TRANSFER_QUALITY):
-        return io.NodeOutput(*_CollectorRuntime().run(
+        runtime = _CollectorRuntime()
+        result = runtime.run(
             images=images, load_balance=load_balance, audio=audio, multi_job_id=multi_job_id,
             is_worker=is_worker, master_url=master_url, enabled_worker_ids=enabled_worker_ids,
             worker_batch_size=worker_batch_size, worker_id=worker_id,
             pass_through=pass_through, delegate_only=delegate_only,
-            transfer_format=transfer_format, transfer_quality=transfer_quality))
+            transfer_format=transfer_format, transfer_quality=transfer_quality)
+        # A silent blocker skips previews wired to a GPU that produced nothing.
+        per_gpu = [runtime.participant_images.get(name, ExecutionBlocker(None)) for name in PER_GPU_OUTPUT_NAMES]
+        return io.NodeOutput(*result, *per_gpu)
 
 
 class UltimateSDUpscaleDistributed(io.ComfyNode):
