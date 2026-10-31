@@ -7,6 +7,7 @@ const WORKERS_CHANGED_EVENT = "distributed:workers-changed";
 
 const trackedNodes = new Set();
 let workers = [];
+let workersPromise = null;
 let listenerAttached = false;
 
 async function fetchWorkers() {
@@ -20,13 +21,30 @@ async function fetchWorkers() {
     }
 }
 
+// Collectors created together (a workflow load) share one config fetch.
+function loadWorkers() {
+    if (!workersPromise) {
+        workersPromise = fetchWorkers().then((list) => {
+            workers = list;
+            if (list.length === 0) workersPromise = null;
+            return list;
+        });
+    }
+    return workersPromise;
+}
+
 // Only the displayed label changes; slot names stay fixed so links survive.
+// Unnamed slots drop the label so saved workflows carry no redundant copies.
 function labelWorkerOutputs(node, configWorkers) {
     for (const output of node.outputs || []) {
         if (!output?.name?.startsWith(WORKER_OUTPUT_PREFIX)) continue;
         const index = parseInt(output.name.slice(WORKER_OUTPUT_PREFIX.length), 10) - 1;
         const worker = configWorkers[index];
-        output.label = worker?.name ? `${output.name} (${worker.name})` : output.name;
+        if (worker?.name) {
+            output.label = `${output.name} (${worker.name})`;
+        } else {
+            delete output.label;
+        }
     }
     node.setDirtyCanvas?.(true, true);
 }
@@ -67,7 +85,7 @@ app.registerExtension({
                 return originalOnRemoved ? originalOnRemoved.call(this) : undefined;
             };
 
-            if (workers.length === 0) workers = await fetchWorkers();
+            if (workers.length === 0) await loadWorkers();
             labelWorkerOutputs(node, workers);
         } catch (error) {
             console.error("Error in DistributedCollector outputs extension:", error);

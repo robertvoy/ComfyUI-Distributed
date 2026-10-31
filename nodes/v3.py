@@ -136,7 +136,9 @@ class DistributedCollector(io.ComfyNode):
                 io.Image.Output(id=name, display_name=name,
                                 tooltip='Images produced by this GPU only, for previewing. '
                                         'worker_N is the Nth worker in the Distributed panel. '
-                                        'Nodes attached to a GPU that did not take part are skipped.')
+                                        'Nodes attached to a GPU that did not take part are skipped. '
+                                        'After Ultimate SD Upscale Distributed every GPU contributes '
+                                        'tiles, so only the combined images output is available.')
                 for name in PER_GPU_OUTPUT_NAMES],
             is_input_list=True, accept_all_inputs=True,
         )

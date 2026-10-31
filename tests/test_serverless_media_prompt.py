@@ -424,3 +424,21 @@ assert graph[bindings[0]["node_id"]]["class_type"] == "MediaExportV1"
 '''
     result = subprocess.run([sys.executable, "-c", script, str(ROOT)], text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_links_from_collector_preview_outputs_are_pruned_not_rejected():
+    # Per-GPU preview sockets follow images/audio; a pool never returns them,
+    # but a workflow previewing them must still compile for typed pools.
+    prompt = _prompt()
+    prompt["preview:1"] = _node("PreviewImage", images=["collector:1", 2])
+    prompt["preview:2"] = _node("PreviewImage", images=["collector:1", legacy.COLLECTOR_OUTPUT_COUNT - 1])
+    graph, bindings = _run(prompt)
+    assert [binding["socket"] for binding in bindings] == ["images"]
+    assert not any(node["class_type"] == "PreviewImage" for node in graph.values())
+
+
+def test_rejects_collector_output_slots_beyond_the_schema():
+    prompt = _prompt()
+    prompt["preview:1"] = _node("PreviewImage", images=["collector:1", legacy.COLLECTOR_OUTPUT_COUNT])
+    with pytest.raises(ValueError, match="invalid output slot"):
+        _run(prompt)

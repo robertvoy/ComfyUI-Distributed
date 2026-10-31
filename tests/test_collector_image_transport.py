@@ -283,3 +283,68 @@ def test_undistributed_run_previews_everything_as_master(media_modules):
     pass_through = module.DistributedCollectorNode()
     pass_through.run(images=[images], multi_job_id=["job"], pass_through=[True])
     assert pass_through.participant_images == {}
+
+
+def test_empty_worker_batch_keeps_master_preview_and_combined_result(media_modules):
+    module, _ = media_modules
+    module.load_config = lambda: {"workers": [{"id": "worker-a"}]}
+    module.prompt_server.distributed_jobs_lock = asyncio.Lock()
+    queue = asyncio.Queue()
+    queue.put_nowait({"worker_id": "worker-a", "image_index": 0,
+                      "tensor": torch.empty(0, 8, 12, 3), "is_last": True})
+    module.prompt_server.distributed_pending_jobs = {"image-test": queue}
+    master = torch.zeros(1, 8, 12, 3)
+    collector = module.DistributedCollectorNode()
+
+    combined, _ = asyncio.run(collector.execute(
+        master, None, multi_job_id="image-test", enabled_worker_ids='["worker-a"]'))
+
+    assert combined.shape[0] == 1
+    assert list(collector.participant_images) == ["master"]
+
+
+def test_serverless_pool_jobs_share_their_pools_preview_slot(media_modules):
+    module, _ = media_modules
+    module.load_config = lambda: {"workers": [{"id": "gpu-a"}, {"id": "pool", "type": "serverless"}]}
+    module.prompt_server.distributed_jobs_lock = asyncio.Lock()
+    queue = asyncio.Queue()
+    for job, value in ((2, 0.75), (1, 0.5)):
+        queue.put_nowait({"worker_id": f"serverless:pool:{job}", "image_index": 0,
+                          "tensor": torch.full((1, 8, 12, 3), value), "is_last": True})
+    module.prompt_server.distributed_pending_jobs = {"image-test": queue}
+    collector = module.DistributedCollectorNode()
+
+    asyncio.run(collector.execute(
+        torch.zeros(1, 8, 12, 3), None, multi_job_id="image-test",
+        enabled_worker_ids='["serverless:pool:1", "serverless:pool:2"]'))
+
+    previews = collector.participant_images
+    assert set(previews) == {"master", "worker_2"}
+    # Pool jobs appear in their enabled order, not delivery order.
+    assert previews["worker_2"][:, 0, 0, 0].tolist() == [0.5, 0.75]
+
+
+def test_serverless_validators_accept_every_collector_output(media_modules):
+    module, _ = media_modules
+    legacy = _load_file("serverless_prompt_slot_check", ROOT / "api/orchestration/serverless_prompt.py")
+    assert legacy.COLLECTOR_OUTPUT_COUNT == 2 + len(module.PER_GPU_OUTPUT_NAMES)
+    assert legacy._REMOVED_NODE_OUTPUTS["DistributedCollector"] == set(range(legacy.COLLECTOR_OUTPUT_COUNT))
+
+
+def test_worker_previews_are_views_of_the_combined_batch(media_modules):
+    module, _ = media_modules
+    module.load_config = lambda: {"workers": [{"id": "worker-a"}]}
+    module.prompt_server.distributed_jobs_lock = asyncio.Lock()
+    queue = asyncio.Queue()
+    for index in range(2):
+        queue.put_nowait({"worker_id": "worker-a", "image_index": index,
+                          "tensor": torch.full((1, 8, 12, 3), 0.5), "is_last": index == 1})
+    module.prompt_server.distributed_pending_jobs = {"image-test": queue}
+    collector = module.DistributedCollectorNode()
+
+    combined, _ = asyncio.run(collector.execute(
+        torch.zeros(1, 8, 12, 3), None, multi_job_id="image-test", enabled_worker_ids='["worker-a"]'))
+
+    preview = collector.participant_images["worker_1"]
+    assert preview.shape == (2, 8, 12, 3) and preview.is_contiguous()
+    assert preview.data_ptr() == combined[1:].data_ptr()
