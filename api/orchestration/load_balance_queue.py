@@ -122,7 +122,11 @@ class WorkerSnapshot:
         self.timeout = timeout
         self._queue_graphs = None
         self._history_graphs = None
-        self.failed = False
+        # Tracked per endpoint: a failed /history must not hide runs that the
+        # successfully fetched /queue shows as running. A failed endpoint is
+        # not retried within the snapshot's cycle.
+        self.queue_failed = False
+        self.history_failed = False
 
     async def _fetch(self, endpoint, params=None):
         import aiohttp
@@ -171,19 +175,28 @@ class WorkerSnapshot:
         Absence is not proof that a submission was rejected: history can be
         truncated, cleared or lost on restart.
         """
-        if self.failed:
-            return None
         job_ids = {str(job_id) for job_id in job_ids}
-        try:
-            if any(_graph_has_job(graph, job_ids) for graph in await self._queue()):
-                return "running"
-            if any(_graph_has_job(graph, job_ids) for graph in await self._history()):
-                return "finished"
-            return "absent"
-        except Exception as exc:
-            self.failed = True
-            debug_log(f"Load balance: could not check worker {_worker_key(self.worker)} for a run: {exc}")
+        if self.queue_failed:
             return None
+        try:
+            queue_graphs = await self._queue()
+        except Exception as exc:
+            self.queue_failed = True
+            debug_log(f"Load balance: could not read worker {_worker_key(self.worker)}'s queue: {exc}")
+            return None
+        if any(_graph_has_job(graph, job_ids) for graph in queue_graphs):
+            return "running"
+        if self.history_failed:
+            return None
+        try:
+            history_graphs = await self._history()
+        except Exception as exc:
+            self.history_failed = True
+            debug_log(f"Load balance: could not read worker {_worker_key(self.worker)}'s history: {exc}")
+            return None
+        if any(_graph_has_job(graph, job_ids) for graph in history_graphs):
+            return "finished"
+        return "absent"
 
 
 async def fetch_worker_job_state(worker, job_ids, timeout=5.0):

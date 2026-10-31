@@ -641,6 +641,55 @@ class LoadBalanceQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await broken.job_state({"job-a"}))
         self.assertEqual(calls.count("/queue"), 2)  # a failed worker is not asked again this cycle
 
+    async def test_history_failure_keeps_cached_queue_evidence(self):
+        calls = []
+
+        class HistoryDown(self.real_snapshot_class):
+            async def _fetch(self, endpoint, params=None):
+                calls.append(endpoint)
+                if endpoint == "/queue":
+                    return {"queue_running": [[1, "b", {"n": {"inputs": {"multi_job_id": "job-b"}}}]],
+                            "queue_pending": []}
+                raise RuntimeError("history unavailable")
+
+        snapshot = HistoryDown({"id": "w1"})
+        self.assertIsNone(await snapshot.job_state({"job-a"}))  # needs history, which fails
+        self.assertEqual(await snapshot.job_state({"job-b"}), "running")  # queue evidence still counts
+        self.assertIsNone(await snapshot.job_state({"job-a"}))
+        self.assertEqual(calls, ["/queue", "/history"])  # neither endpoint is retried this cycle
+
+    async def test_history_failure_does_not_queue_delegate_for_a_run_still_running(self):
+        """Two held runs on one worker: A needs history (which fails), B is in the queue.
+        B must not collect missed probes or have its delegate queued before delivery."""
+        run_a = self._queue_run("pa")
+        run_b = self._queue_run("pb")
+        self.remaining["w1"] = 0
+        await self.queue.run_cycle()
+        self.queue._recent_dispatch.clear()
+        await self.queue.run_cycle()
+        self.assertEqual(sorted(self.dispatched), [("pa", "w1"), ("pb", "w1")])
+        self.assertTrue(run_a.wait_for_result and run_b.wait_for_result)
+        run_a.dispatched_at = run_b.dispatched_at = 0
+
+        class HistoryDown(self.real_snapshot_class):
+            async def _fetch(self, endpoint, params=None):
+                if endpoint == "/queue":
+                    return {"queue_running": [[1, "x", {"n": {"inputs": {"multi_job_id": "job-pb"}}}]],
+                            "queue_pending": []}
+                raise RuntimeError("history unavailable")
+
+        self.lb.WorkerSnapshot = HistoryDown
+        # A is checked first in every cycle (insertion order), so its history
+        # failure always happens before B is asked.
+        for _ in range(self.lb.WORKER_UNREACHABLE_PROBES + 2):
+            await self.queue.run_cycle()
+        self.assertEqual(run_b.missed_probes, 0)
+        self.assertTrue(run_b.wait_for_result)
+        self.assertNotIn(("pb", "w1"), self.requeued)
+        self.queue.result_delivered("job-pb")
+        await self.queue.run_cycle()
+        self.assertIn(("pb", "w1"), self.requeued)  # collected once it actually delivered
+
     # ----- interrupted assignment on an orchestrator-only master ---------------
     async def test_interrupt_during_assignment_cleans_result_queue_and_stops_dispatch(self):
         gate = asyncio.Event()
