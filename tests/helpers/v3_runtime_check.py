@@ -43,6 +43,11 @@ ADDED_OPTIONAL_INPUTS = {
     },
 }
 
+# Outputs appended after the V1 baseline outputs, so saved links keep their slots.
+ADDED_OUTPUTS = {
+    'DistributedCollector': ['master'] + [f'worker_{index + 1}' for index in range(8)],
+}
+
 # Nodes added after the V1 baseline; not part of saved-workflow contracts.
 # DistributedWorkerSink is internal (dev-only) and only inserted by the master.
 ADDED_NODES = {'DistributedWorkerSink', 'DistributedImageListStart', 'DistributedImageListEnd',
@@ -374,7 +379,8 @@ async def main():
         assert nodes.NODE_CLASS_MAPPINGS[node_id] is mapping[node_id]
     assert 'DistributedMediaCollector' not in mapping
     collector_info = mapping['DistributedCollector'].GET_NODE_INFO_V1()
-    assert collector_info['output'] == ['IMAGE', 'AUDIO'], collector_info
+    assert collector_info['output'] == ['IMAGE', 'AUDIO'] + ['IMAGE'] * 9, collector_info
+    assert collector_info['output_name'][:2] == ['images', 'audio'], collector_info
     assert not any(collector_info['output_is_list']), collector_info
     assert list(collector_info['input']['optional']) == [
         'images', 'audio', 'transfer_format', 'transfer_quality']
@@ -393,6 +399,11 @@ async def main():
             assert old['output'] == ['*'] * 10
             old['output'] = ['IMAGE' if node_id == 'ImageBatchDivider' else 'AUDIO'] * 10
         new = json.loads(json.dumps(cls.GET_NODE_INFO_V1()))
+        added_outputs = ADDED_OUTPUTS.get(node_id, [])
+        if added_outputs:
+            assert new['output_name'][len(old['output']):] == added_outputs, (node_id, new['output_name'])
+            for key in ('output', 'output_name', 'output_is_list'):
+                new[key] = new[key][:len(old['output'])]
         for group in ('required', 'optional'):
             old_inputs = old['input'].get(group, {})
             new_inputs = dict(new['input'].get(group, {}))

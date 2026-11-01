@@ -16,6 +16,7 @@ from graphlib import CycleError, TopologicalSorter
 from ...serverless_bridge.contract import SOCKET_KINDS, VALUE_SOCKETS, identifier, validate_bindings
 from ...serverless_bridge.image_transfer import DEFAULT_FORMAT, validate_options
 from .serverless_prompt import (
+    COLLECTOR_OUTPUT_COUNT,
     _PRIMITIVE_NODES,
     _REMOVED_SCALAR_NODES,
     _is_link,
@@ -99,7 +100,7 @@ def _validate_prompt(prepared_prompt, *, require_collectors=True):
             if source_class in _REMOVED_SCALAR_NODES or source_class in _PRIMITIVE_NODES:
                 if slot != 0:
                     raise ValueError(f"invalid output slot {slot} for scalar node {source_id!r}")
-            elif source_class == _COLLECTOR and slot >= len(COLLECTOR_SOCKETS):
+            elif source_class == _COLLECTOR and slot >= COLLECTOR_OUTPUT_COUNT:
                 raise ValueError(f"invalid output slot {slot} for collector {source_id!r}")
             parents.add(source_id)
         dependencies[node_id] = parents

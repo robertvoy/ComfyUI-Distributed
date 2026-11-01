@@ -13,6 +13,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PKG = "dist_v3_transfer_testpkg"
+PER_GPU_OUTPUT_NAMES = ("master", "worker_1", "worker_2")
 
 
 class _Field:
@@ -51,9 +52,19 @@ def v3(monkeypatch):
     calls = []
 
     class CollectorRuntime:
+        participant_images_for_run = {}
+
+        def __init__(self):
+            self.participant_images = {}
+
         def run(self, **kwargs):
             calls.append(kwargs)
+            self.participant_images = dict(self.participant_images_for_run)
             return (kwargs["images"], kwargs["audio"])
+
+    class ExecutionBlocker:
+        def __init__(self, message):
+            self.message = message
 
     def module(name, **attrs):
         mod = types.ModuleType(name)
@@ -68,13 +79,16 @@ def v3(monkeypatch):
     module(f"{PKG}.utils", __path__=[])
     module(f"{PKG}.nodes.utilities")
     module(f"{PKG}.nodes.distributed_upscale", UltimateSDUpscaleDistributed=object)
-    module(f"{PKG}.nodes.collector", DistributedCollectorNode=CollectorRuntime)
+    module(f"{PKG}.nodes.collector", DistributedCollectorNode=CollectorRuntime,
+           PER_GPU_OUTPUT_NAMES=PER_GPU_OUTPUT_NAMES)
     module(f"{PKG}.nodes.image_list", DistributedImageListStart=object, DistributedImageListEnd=object,
            DistributedImageListGetValue=object)
     module("comfy", __path__=[])
     module("comfy.samplers", KSampler=types.SimpleNamespace(SAMPLERS=["euler"], SCHEDULERS=["normal"]))
     module("comfy_api", __path__=[])
     module("comfy_api.v0_0_2", io=_fake_io())
+    module("comfy_execution", __path__=[])
+    module("comfy_execution.graph_utils", ExecutionBlocker=ExecutionBlocker)
 
     codec_spec = importlib.util.spec_from_file_location(f"{PKG}.utils.transfer_codec", ROOT / "utils" / "transfer_codec.py")
     codec = importlib.util.module_from_spec(codec_spec)
@@ -85,6 +99,7 @@ def v3(monkeypatch):
     mod = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, f"{PKG}.nodes.v3", mod)
     spec.loader.exec_module(mod)
+    mod._TestRuntime = CollectorRuntime
     return mod, codec, calls
 
 
@@ -127,3 +142,24 @@ def test_registered_collector_defaults_to_legacy_transfer(v3):
 
     assert calls[-1]["transfer_format"] == "legacy_png"
     assert calls[-1]["transfer_quality"] == 90
+
+
+def test_registered_collector_appends_per_gpu_outputs_after_combined_outputs(v3):
+    mod, _, _ = v3
+    schema = mod.DistributedCollector.define_schema()
+
+    assert [field.kind for field in schema.outputs] == ["Image", "Audio", "Image", "Image", "Image"]
+    assert [field.kwargs["display_name"] for field in schema.outputs] == [
+        "images", "audio", "master", "worker_1", "worker_2"]
+
+
+def test_registered_collector_blocks_per_gpu_outputs_without_images(v3):
+    mod, _, _ = v3
+    mod._TestRuntime.participant_images_for_run = {"master": "m", "worker_2": "w2"}
+
+    _, values, _ = mod.DistributedCollector.execute(images=["img"], audio=["aud"])
+
+    assert values[:2] == (["img"], ["aud"])
+    assert values[2] == "m"
+    assert type(values[3]).__name__ == "ExecutionBlocker" and values[3].message is None
+    assert values[4] == "w2"

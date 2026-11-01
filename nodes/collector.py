@@ -21,6 +21,11 @@ from ..utils import transfer_codec
 
 prompt_server = _server.PromptServer.instance
 
+# Per-GPU preview outputs follow the combined images/audio outputs. worker_N is
+# the Nth worker in the config, so a slot keeps its GPU when others are toggled.
+MAX_WORKER_OUTPUTS = 8
+PER_GPU_OUTPUT_NAMES = ("master",) + tuple(f"worker_{i + 1}" for i in range(MAX_WORKER_OUTPUTS))
+
 
 def _encode_all_chunks(frames, fmt, quality, max_chunk_bytes, max_frame_bytes):
     """Materialize every transfer chunk (runs in an executor)."""
@@ -113,7 +118,12 @@ class DistributedCollectorNode:
     RETURN_NAMES = ("images", "audio")
     FUNCTION = "run"
     CATEGORY = "image"
-    
+
+    def __init__(self):
+        # Image batch each participant produced in this run, keyed by
+        # PER_GPU_OUTPUT_NAMES slot. Runtime instances are per-execution.
+        self.participant_images = {}
+
     @staticmethod
     def _unwrap_list_input(value):
         """Unwrap scalar inputs when ComfyUI passes them via INPUT_IS_LIST."""
@@ -159,6 +169,9 @@ class DistributedCollectorNode:
                 # RGB is opaque; never discard alpha from another participant.
                 tensor = torch.cat((tensor, torch.ones_like(tensor[..., :1])), dim=-1)
             normalized.append(ensure_contiguous(tensor))
+        if len(normalized) == 1:
+            # torch.cat would copy a single batch for nothing.
+            return normalized[0]
         return ensure_contiguous(torch.cat(normalized, dim=0))
 
     def _normalize_images_input(self, images):
@@ -232,6 +245,9 @@ class DistributedCollectorNode:
         if not multi_job_id or pass_through:
             if pass_through:
                 debug_log("Collector: pass-through mode enabled, returning images unchanged")
+            elif images is not None:
+                # Not distributed: everything was produced on this GPU.
+                self.participant_images = {"master": images}
             return (images, audio if audio is not None else empty_audio)
 
         # Use async helper to run in server loop
@@ -655,6 +671,28 @@ class DistributedCollectorNode:
             worker_audio[worker_id] = self._normalize_audio_input(media["audio"])
         return stored
 
+    @staticmethod
+    def _ordered_worker_frames(worker_images, worker_order):
+        """Yield (worker_id, image_index, tensor) in combined-batch order.
+
+        Expected workers come in ``worker_order``; any unexpected worker ids
+        follow in sorted order.
+        """
+        seen = set()
+        for worker_id_str in [str(worker_id) for worker_id in (worker_order or [])]:
+            seen.add(worker_id_str)
+            frames = worker_images.get(worker_id_str)
+            if not frames:
+                continue
+            for idx in sorted(frames):
+                yield worker_id_str, idx, frames[idx]
+        for worker_id_str in sorted(worker_images):
+            if worker_id_str in seen:
+                continue
+            frames = worker_images[worker_id_str]
+            for idx in sorted(frames):
+                yield worker_id_str, idx, frames[idx]
+
     def _reorder_and_combine_tensors(
         self,
         worker_images: dict,
@@ -672,23 +710,9 @@ class DistributedCollectorNode:
                 ordered_tensors.append(images_on_cpu[i:i+1])
                 sources.append(f"master image {i}")
 
-        ordered_worker_ids = [str(worker_id) for worker_id in (worker_order or [])]
-        seen = set()
-        for worker_id_str in ordered_worker_ids:
-            seen.add(worker_id_str)
-            if worker_id_str not in worker_images:
-                continue
-            for idx in sorted(worker_images[worker_id_str].keys()):
-                ordered_tensors.append(worker_images[worker_id_str][idx])
-                sources.append(f"worker {worker_id_str!r} image {idx}")
-
-        # Append any unexpected worker ids deterministically.
-        for worker_id_str in sorted(worker_images.keys()):
-            if worker_id_str in seen:
-                continue
-            for idx in sorted(worker_images[worker_id_str].keys()):
-                ordered_tensors.append(worker_images[worker_id_str][idx])
-                sources.append(f"worker {worker_id_str!r} image {idx}")
+        for worker_id_str, idx, tensor in self._ordered_worker_frames(worker_images, worker_order):
+            ordered_tensors.append(tensor)
+            sources.append(f"worker {worker_id_str!r} image {idx}")
 
         cpu_tensors = []
         for t in ordered_tensors:
@@ -702,6 +726,79 @@ class DistributedCollectorNode:
         if fallback_images is not None:
             return self._combine_image_tensors([fallback_images], ["master fallback"])
         return None
+
+    @staticmethod
+    def _config_worker_id(participant_id):
+        """Config entry a participant belongs to.
+
+        Serverless pools run as ``serverless:<pool id>:<job>`` participants
+        (see queue_orchestration) and all preview on their pool's slot.
+        """
+        if participant_id.startswith("serverless:"):
+            return participant_id[len("serverless:"):].rsplit(":", 1)[0]
+        return participant_id
+
+    @staticmethod
+    def _worker_output_slots(participant_ids):
+        """Map participant ids to worker_N preview slots (many-to-one).
+
+        Configured workers keep their config position; participants outside
+        the config take the free slots after the configured workers.
+        """
+        try:
+            config_ids = [str(worker.get("id")) for worker in load_config().get("workers", [])]
+        except Exception as e:
+            debug_log(f"Collector - Could not read worker order for preview outputs: {e}")
+            config_ids = []
+        slots = {}
+        overflow = {}
+        for participant_id in participant_ids:
+            config_id = DistributedCollectorNode._config_worker_id(participant_id)
+            if config_id in config_ids:
+                index = config_ids.index(config_id)
+            else:
+                index = overflow.setdefault(config_id, len(config_ids) + len(overflow))
+            if index < MAX_WORKER_OUTPUTS:
+                slots[participant_id] = PER_GPU_OUTPUT_NAMES[index + 1]
+            else:
+                debug_log(f"Collector - No preview output for {participant_id}; only in the combined images")
+        return slots
+
+    def _split_participant_images(self, worker_images, worker_order, master_images, combined, master_frames):
+        """Return each participant's own images keyed by preview slot.
+
+        ``combined`` holds the master's ``master_frames`` frames and then the
+        worker frames in ``_ordered_worker_frames`` order, so worker previews
+        are views into it rather than a second copy of every frame.
+        """
+        participants = {}
+        if master_images is not None:
+            participants["master"] = master_images
+        frames = list(self._ordered_worker_frames(worker_images, worker_order))
+        slots = self._worker_output_slots(list(dict.fromkeys(worker_id for worker_id, _, _ in frames)))
+        segments = {}  # slot -> [start, end) frame runs within combined
+        offset = master_frames
+        for worker_id, _idx, tensor in frames:
+            count = tensor.shape[0]
+            # Empty placeholders were dropped from the combined batch too.
+            if count == 0:
+                continue
+            slot = slots.get(worker_id)
+            if slot is not None:
+                runs = segments.setdefault(slot, [])
+                if runs and runs[-1][1] == offset:
+                    runs[-1][1] = offset + count
+                else:
+                    runs.append([offset, offset + count])
+            offset += count
+        if offset != combined.shape[0]:
+            # Never attribute frames to the wrong GPU; the combined output is unaffected.
+            log(f"Master - Per-GPU previews skipped: expected {offset} combined frames, got {combined.shape[0]}")
+            return participants
+        for slot, runs in segments.items():
+            views = [combined[start:end] for start, end in runs]
+            participants[slot] = views[0] if len(views) == 1 else torch.cat(views, dim=0)
+        return participants
 
     async def execute(self, images, audio, load_balance=False, multi_job_id="", is_worker=False, master_url="", enabled_worker_ids="[]", worker_batch_size=1, worker_id="", delegate_only=False, transfer_format=transfer_codec.DEFAULT_TRANSFER_FORMAT, transfer_quality=transfer_codec.DEFAULT_TRANSFER_QUALITY):
         if is_worker:
@@ -781,6 +878,8 @@ class DistributedCollectorNode:
             exact_requested = False
         num_workers = len(expected_workers)
         if num_workers == 0:
+            if images is not None:
+                self.participant_images = {"master": images}
             return (images, audio if audio is not None else self.EMPTY_AUDIO)
 
         # Create the queue before any expensive local work to avoid job_complete race.
@@ -1021,6 +1120,11 @@ class DistributedCollectorNode:
                 else:
                     debug_log(f"Master - Job {multi_job_id} complete. Combined {combined.shape[0]} images total "
                               f"(master: {master_batch_size}, workers: {combined.shape[0] - master_batch_size})")
+                    master_frames = 0 if delegate_mode or images_on_cpu is None else master_batch_size
+                    self.participant_images = self._split_participant_images(
+                        worker_images, enabled_workers, images_on_cpu if master_frames else None,
+                        combined, master_frames,
+                    )
                 return (combined, combined_audio)
             except Exception as e:
                 if serverless_results or exact_requested:
