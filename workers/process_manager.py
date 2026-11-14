@@ -1,4 +1,5 @@
 from .process import ComfyRootDiscovery, LaunchCommandBuilder, ProcessLifecycle, ProcessPersistence
+from .process.lifecycle import worker_log_dir
 
 
 class WorkerProcessManager:
@@ -14,6 +15,10 @@ class WorkerProcessManager:
 
     def find_comfy_root(self):
         return self._root_discovery.find_comfy_root()
+
+    def get_worker_log_dir(self):
+        """Directory holding the log files of UI-launched workers."""
+        return worker_log_dir(self.find_comfy_root())
 
     def _find_windows_terminal(self):
         return self._launch_builder._find_windows_terminal()
@@ -47,5 +52,5 @@ class WorkerProcessManager:
     def _check_worker_process(self, worker_id, proc_info):
         return self._lifecycle._check_worker_process(worker_id, proc_info)
 
-    def _kill_process_tree(self, pid):
-        return self._lifecycle._kill_process_tree(pid)
+    def _kill_process_tree(self, pid, expected_create_time=None):
+        return self._lifecycle._kill_process_tree(pid, expected_create_time=expected_create_time)

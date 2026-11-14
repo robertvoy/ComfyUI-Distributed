@@ -143,5 +143,116 @@ class ConfigRoutesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("debug", " ".join(response.payload.get("error", [])).lower())
 
 
+def _server_config():
+    return {
+        "workers": [],
+        "master": {"host": ""},
+        "settings": {"debug": False, "worker_timeout_seconds": 60},
+        "tunnel": {"status": "running", "pid": 4242, "log_file": "logs/tunnel.log"},
+        "managed_processes": {
+            "w1": {"pid": 5151, "started_at": 1.0, "config": {}, "log_file": "logs/w1.log"},
+        },
+    }
+
+
+class BulkConfigServerOwnedStateTests(unittest.IsolatedAsyncioTestCase):
+    """Bulk POST /distributed/config must not let clients plant PIDs or log paths."""
+
+    async def _post(self, cfg, payload):
+        with patch.object(config_routes, "load_config", return_value=cfg), patch.object(
+            config_routes, "save_config", return_value=True
+        ):
+            return await config_routes.update_config_endpoint(_FakeRequest(payload))
+
+    async def test_client_managed_processes_and_tunnel_are_ignored(self):
+        cfg = _server_config()
+        expected_tunnel = copy.deepcopy(cfg["tunnel"])
+        expected_processes = copy.deepcopy(cfg["managed_processes"])
+
+        response = await self._post(cfg, {
+            "debug": True,
+            "managed_processes": {"evil": {"pid": 4, "log_file": "C:/Windows/System32/x.log"}},
+            "tunnel": {"status": "running", "pid": 4, "log_file": "C:/Windows/win.ini"},
+        })
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(cfg["settings"]["debug"])
+        self.assertEqual(cfg["tunnel"], expected_tunnel)
+        self.assertEqual(cfg["managed_processes"], expected_processes)
+        self.assertEqual(response.payload["config"]["tunnel"], expected_tunnel)
+        self.assertEqual(response.payload["config"]["managed_processes"], expected_processes)
+
+    async def test_round_tripped_get_payload_keeps_server_state(self):
+        cfg = _server_config()
+        echoed = copy.deepcopy(cfg)
+        echoed["tunnel"]["pid"] = 1
+        echoed["managed_processes"]["w1"]["pid"] = 1
+
+        response = await self._post(cfg, echoed)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(cfg["tunnel"]["pid"], 4242)
+        self.assertEqual(cfg["managed_processes"]["w1"]["pid"], 5151)
+
+    async def test_settings_object_with_wrong_type_is_rejected(self):
+        cfg = _server_config()
+
+        response = await self._post(cfg, {"settings": {"worker_timeout_seconds": "abc"}})
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("worker_timeout_seconds", response.payload["message"])
+        self.assertEqual(cfg["settings"]["worker_timeout_seconds"], 60)
+
+    async def test_bool_is_not_accepted_for_integer_field(self):
+        cfg = _server_config()
+
+        response = await self._post(cfg, {"worker_timeout_seconds": True})
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(cfg["settings"]["worker_timeout_seconds"], 60)
+
+
+class UpdateSettingValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def _post(self, cfg, key, value):
+        with patch.object(config_routes, "load_config", return_value=cfg), patch.object(
+            config_routes, "save_config", return_value=True
+        ):
+            return await config_routes.update_setting_endpoint(
+                _FakeRequest({"key": key, "value": value})
+            )
+
+    async def test_rejects_wrong_type_for_known_setting(self):
+        for key, value in [
+            ("worker_timeout_seconds", "abc"),
+            ("worker_timeout_seconds", "120"),
+            ("worker_timeout_seconds", 1.5),
+            ("worker_timeout_seconds", True),
+            ("worker_timeout_seconds", 0),
+            ("worker_timeout_seconds", -5),
+            ("debug", "yes"),
+            ("master_delegate_only", 1),
+        ]:
+            with self.subTest(key=key, value=value):
+                cfg = _server_config()
+                before = copy.deepcopy(cfg["settings"])
+                response = await self._post(cfg, key, value)
+                self.assertEqual(response.status, 400)
+                self.assertIn(key, response.payload["message"])
+                self.assertEqual(cfg["settings"], before)
+
+    async def test_accepts_valid_values(self):
+        for key, value in [
+            ("worker_timeout_seconds", 120),
+            ("debug", True),
+            ("debug", False),
+            ("has_auto_populated_workers", True),
+        ]:
+            with self.subTest(key=key, value=value):
+                cfg = _server_config()
+                response = await self._post(cfg, key, value)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(cfg["settings"][key], value)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1055,5 +1055,73 @@ class ApplyOverridesValueTests(unittest.TestCase):
         self.assertEqual(result["1"]["inputs"]["worker_id"], "")
 
 
+class ApplyOverridesValueByWorkerIdTests(unittest.TestCase):
+    """The editor numbers enabled workers; a run numbers the participants."""
+
+    def _prompt(self, worker_values):
+        return {"1": {"class_type": "DistributedValue", "inputs": {
+            "default_value": "default",
+            "worker_values": json.dumps(worker_values),
+        }}}
+
+    def _resolved(self, result):
+        inputs = result["1"]["inputs"]
+        index = int(inputs["worker_id"].split("_")[1])
+        return json.loads(inputs["worker_values"]).get(str(index + 1))
+
+    # Editor view: gpu-a (1), gpu-b (2), gpu-c (3), all enabled.
+    SAVED = {"_type": "STRING", "1": "for-a", "2": "for-b", "3": "for-c",
+             "_by_worker_id": {"gpu-a": "for-a", "gpu-b": "for-b", "gpu-c": "for-c"}}
+
+    def test_offline_worker_does_not_shift_later_workers_onto_neighbour_values(self):
+        # gpu-b failed its health check, so gpu-c is participant index 1.
+        result = _apply(self._prompt(self.SAVED), "gpu-c", enabled_worker_ids=["gpu-a", "gpu-c"])
+        self.assertEqual(result["1"]["inputs"]["worker_id"], "worker_1")
+        self.assertEqual(self._resolved(result), "for-c")
+
+    def test_serverless_slots_map_back_to_their_pool_value(self):
+        saved = {"_type": "STRING", "1": "for-pool", "2": "for-a",
+                 "_by_worker_id": {"pool": "for-pool", "gpu-a": "for-a"}}
+        enabled = ["serverless:pool:1", "serverless:pool:2", "gpu-a"]
+        self.assertEqual(self._resolved(_apply(self._prompt(saved), "gpu-a", enabled_worker_ids=enabled)), "for-a")
+        self.assertEqual(
+            self._resolved(_apply(self._prompt(saved), "serverless:pool:2", enabled_worker_ids=enabled)),
+            "for-pool",
+        )
+
+    def test_worker_without_saved_value_falls_back_to_default(self):
+        saved = {"_type": "STRING", "1": "for-a", "_by_worker_id": {"gpu-a": "for-a"}}
+        # gpu-b sits at participant index 0 but never had a value of its own.
+        result = _apply(self._prompt(saved), "gpu-b", enabled_worker_ids=["gpu-b", "gpu-a"])
+        self.assertIsNone(self._resolved(result))
+
+    def test_map_saved_for_other_workers_keeps_positional_values(self):
+        # Exported from another setup, or workers re-created since it was saved.
+        saved = {"_type": "STRING", "1": "first", "2": "second",
+                 "_by_worker_id": {"old-a": "first", "old-b": "second"}}
+        result = _apply(self._prompt(saved), "gpu-b", enabled_worker_ids=["gpu-a", "gpu-b"])
+        self.assertEqual(json.loads(result["1"]["inputs"]["worker_values"]), saved)
+        self.assertEqual(self._resolved(result), "second")
+
+    def test_positional_only_workflows_are_left_unchanged(self):
+        saved = {"_type": "STRING", "1": "first", "2": "second"}
+        result = _apply(self._prompt(saved), "gpu-b", enabled_worker_ids=["gpu-a", "gpu-b"])
+        self.assertEqual(json.loads(result["1"]["inputs"]["worker_values"]), saved)
+
+    def test_wired_worker_values_input_is_left_unchanged(self):
+        prompt = {"1": {"class_type": "DistributedValue", "inputs": {"worker_values": ["9", 0]}}}
+        result = _apply(prompt, "gpu-a", enabled_worker_ids=["gpu-a"])
+        self.assertEqual(result["1"]["inputs"]["worker_values"], ["9", 0])
+
+    def test_node_returns_the_pinned_value_for_the_shifted_worker(self):
+        # End to end with the node's own lookup rule (worker_N -> key N + 1).
+        result = _apply(self._prompt(self.SAVED), "gpu-c", enabled_worker_ids=["gpu-a", "gpu-c"])
+        inputs = result["1"]["inputs"]
+        values = json.loads(inputs["worker_values"])
+        index = int(inputs["worker_id"].split("_")[1])
+        self.assertEqual(values.get(str(index + 1)), "for-c")
+        self.assertEqual(values["_by_worker_id"], self.SAVED["_by_worker_id"])
+
+
 if __name__ == "__main__":
     unittest.main()

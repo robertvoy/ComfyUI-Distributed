@@ -200,6 +200,10 @@ def _encode_video(frames, fmt, quality, height, width, limit):
         options.update(preset="fast", **{"x265-params": "log-level=error:pools=none:frame-threads=1"})
     elif fmt == "av1":
         options.update(preset="8", **{"svtav1-params": "lp=1"})
+        # libsvtav1 treats crf=0 as "unset" and falls back to its default
+        # (CRF 35), so quality 100 would encode worse than quality 95.
+        if "crf" in options:
+            options["crf"] = str(max(1, int(options["crf"])))
     else:
         options.update(level="3", slicecrc="1")
     try:

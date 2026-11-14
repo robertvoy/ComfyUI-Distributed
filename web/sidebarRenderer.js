@@ -71,15 +71,18 @@ export async function renderSidebarContent(extension, el) {
             <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="40 40"/>
         </svg>`;
         el.appendChild(loadingDiv);
-        // Add rotation animation
-        const style = document.createElement('style');
-        style.textContent = `
-            @keyframes rotate {
-                from { transform: rotate(0deg); }
-                to { transform: rotate(360deg); }
-            }
-        `;
-        document.head.appendChild(style);
+        // Add rotation animation once; every render used to append another copy.
+        if (!document.getElementById('distributed-rotate-keyframes')) {
+            const style = document.createElement('style');
+            style.id = 'distributed-rotate-keyframes';
+            style.textContent = `
+                @keyframes rotate {
+                    from { transform: rotate(0deg); }
+                    to { transform: rotate(360deg); }
+                }
+            `;
+            document.head.appendChild(style);
+        }
         loadingDiv.querySelector('svg').style.animation = 'rotate 1s linear infinite';
         // Preload data outside render
         await Promise.all([extension.loadConfig(), loadManagedWorkers(extension), extension.refreshTunnelStatus()]);

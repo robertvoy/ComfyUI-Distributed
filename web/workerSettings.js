@@ -268,9 +268,13 @@ export async function saveWorkerSettings(extension, workerId) {
             return;
         }
 
-        // Check if port conflicts with other local workers
+        // Check if port conflicts with other local workers. Auto-populated
+        // local workers are saved with host "localhost", so classify by worker
+        // type/host rules instead of treating any host as remote.
         const localPortConflict = extension.config.workers.some(
-            (w) => w.id !== workerId && w.port === port && !w.host // local workers have no host or host is null
+            (w) => w.id !== workerId
+                && Number(w.port) === port
+                && !isRemoteWorker(extension, w)
         );
 
         if (localPortConflict) {

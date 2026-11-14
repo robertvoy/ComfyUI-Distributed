@@ -27,6 +27,8 @@ def initialize():
     from ..image_list import runtime as image_list_runtime
     from ..image_list.lifecycle import install_lifecycle
     install_lifecycle(server.PromptServer.instance, image_list_runtime)
+    from ..api.orchestration.collector_queues import install_collector_queue_sweeper
+    install_collector_queue_sweeper(server.PromptServer.instance)
 
     if not os.environ.get('COMFYUI_IS_WORKER'):
         atexit.register(sync_cleanup)

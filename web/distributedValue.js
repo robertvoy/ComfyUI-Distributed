@@ -203,19 +203,33 @@ function setRawDefaultValue(node, value) {
 }
 
 function serializeWorkerStoreFromWidgets(node, inputType, comboOptions) {
+    const previousByWorkerId = readWorkerStore(node)._by_worker_id;
     const nextStore = { _type: inputType };
     if (inputType === "COMBO" && Array.isArray(comboOptions)) {
         nextStore._options = comboOptions;
     }
     const valuesByWorkerId = {};
+    const shownWorkerIds = new Set();
 
     for (const widget of getDynamicWorkerWidgets(node)) {
         const key = widget.name.slice(DYNAMIC_WORKER_WIDGET_PREFIX.length);
+        if (widget._dvWorkerId) {
+            shownWorkerIds.add(String(widget._dvWorkerId));
+        }
         if (widget.value !== "" && widget.value !== null && widget.value !== undefined) {
             const value = String(widget.value);
             nextStore[key] = value;
             if (widget._dvWorkerId) {
                 valuesByWorkerId[widget._dvWorkerId] = value;
+            }
+        }
+    }
+    // Only enabled workers get a widget. Keep the saved values of the others
+    // so disabling a worker and enabling it again does not erase its value.
+    if (previousByWorkerId && typeof previousByWorkerId === "object" && !Array.isArray(previousByWorkerId)) {
+        for (const [workerId, value] of Object.entries(previousByWorkerId)) {
+            if (!shownWorkerIds.has(workerId) && value != null && value !== "") {
+                valuesByWorkerId[workerId] = String(value);
             }
         }
     }

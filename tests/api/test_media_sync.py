@@ -185,6 +185,15 @@ class FindMediaReferencesTests(unittest.TestCase):
         refs = ms._find_media_references(prompt)
         self.assertEqual(refs, [])
 
+    def test_skips_absolute_paths_that_cannot_be_uploaded(self):
+        prompt = {
+            "1": {"class_type": "VHS_LoadVideoPath", "inputs": {"video": "D:\\clips\\a.mp4"}},
+            "2": {"class_type": "VHS_LoadVideoPath", "inputs": {"video": "/mnt/clips/b.mp4"}},
+            "3": {"class_type": "LoadImage", "inputs": {"image": "\\\\nas\\share\\c.png"}},
+            "4": {"class_type": "LoadImage", "inputs": {"image": "sub/d.png [output]"}},
+        }
+        self.assertEqual(ms._find_media_references(prompt), ["sub/d.png [output]"])
+
     def test_ignores_node_link_values(self):
         """Inputs that are [node_id, slot] lists should be ignored."""
         prompt = {"1": {"class_type": "Anything", "inputs": {"image": ["2", 0]}}}

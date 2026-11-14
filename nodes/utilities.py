@@ -113,7 +113,12 @@ class DistributedValue:
     def _coerce(value, value_type):
         """Convert a string value to the requested type."""
         if value_type == "INT":
-            return int(float(value))
+            # Parse integers exactly first; float() loses precision above 2**53,
+            # which corrupts large seeds such as 18446744073709551615.
+            try:
+                return int(str(value).strip())
+            except ValueError:
+                return int(float(value))
         if value_type == "FLOAT":
             return float(value)
         return value  # STRING and COMBO stay as strings

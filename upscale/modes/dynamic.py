@@ -62,7 +62,8 @@ class DynamicModeMixin:
             # Try to get an image to process
             image_idx = run_async_in_server_loop(
                 self._get_next_image_index(multi_job_id),
-                timeout=5.0  # Short timeout to allow frequent checks
+                timeout=5.0,  # Short timeout to allow frequent checks
+                cancel_on_timeout=True,
             )
 
             if image_idx is not None:
@@ -239,7 +240,8 @@ class DynamicModeMixin:
             # Request an image to process
             image_idx, estimated_remaining = run_async_in_server_loop(
                 self._request_image_from_master(multi_job_id, master_url, worker_id),
-                timeout=TILE_WAIT_TIMEOUT
+                timeout=TILE_WAIT_TIMEOUT,
+                cancel_on_timeout=True,
             )
 
             if image_idx is None:

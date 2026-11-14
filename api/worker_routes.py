@@ -42,10 +42,14 @@ except ImportError:
             self.node_errors = node_errors if isinstance(node_errors, dict) else {}
 
 
+WORKER_WS_MAX_MSG_SIZE = 100 * 1024 * 1024
+
+
 @server.PromptServer.instance.routes.get("/distributed/worker_ws")
 async def worker_ws_endpoint(request):
     """WebSocket endpoint for worker prompt dispatch."""
-    ws = web.WebSocketResponse(heartbeat=30)
+    # Match ComfyUI's HTTP upload limit so large prompts are not closed with 1009.
+    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=WORKER_WS_MAX_MSG_SIZE)
     await ws.prepare(request)
 
     async for msg in ws:
@@ -313,33 +317,53 @@ def _collect_network_info_sync():
     }
 
 
+# Upper bound on how much of a large log one tail request reads.
+MAX_LOG_TAIL_BYTES = 8 * 1024 * 1024
+
+
+def _count_line_breaks(data):
+    r"""Line breaks as ``str.splitlines`` counts them: \n, \r and \r\n each end a line.
+
+    Progress bars (tqdm) separate their updates with a bare \r.
+    """
+    return data.count(b"\n") + data.count(b"\r") - data.count(b"\r\n")
+
+
 def _read_worker_log_sync(log_file, lines_to_read):
     """Read worker log content from disk in a threadpool worker."""
     file_size = os.path.getsize(log_file)
 
-    with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
-        if lines_to_read > 0 and file_size > 1024 * 1024:
-            # Read last N lines efficiently from end of file.
-            lines = []
-            f.seek(0, 2)
-            file_length = f.tell()
-            chunk_size = min(CHUNK_SIZE, file_length)
+    if lines_to_read > 0 and file_size > 1024 * 1024:
+        # Read the tail in binary so seek offsets and read sizes are both bytes,
+        # then decode once (text-mode reads count characters, not bytes).
+        with open(log_file, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            position = f.tell()
+            chunks = []  # newest first
+            breaks = 0
+            bytes_read = 0
+            while position > 0 and breaks <= lines_to_read and bytes_read < MAX_LOG_TAIL_BYTES:
+                read_size = min(CHUNK_SIZE, position)
+                position -= read_size
+                f.seek(position)
+                chunk = f.read(read_size)
+                breaks += _count_line_breaks(chunk)
+                if chunks and chunk.endswith(b"\r") and chunks[-1].startswith(b"\n"):
+                    breaks -= 1  # one \r\n split across the chunk boundary
+                chunks.append(chunk)
+                bytes_read += read_size
+        tail = b"".join(reversed(chunks))
 
-            while len(lines) < lines_to_read and f.tell() > 0:
-                current_pos = max(0, f.tell() - chunk_size)
-                f.seek(current_pos)
-                chunk = f.read(chunk_size)
-                chunk_lines = chunk.splitlines()
-                if current_pos > 0:
-                    chunk_lines = chunk_lines[1:]
-                lines = chunk_lines + lines
-                f.seek(current_pos)
-
-            content = '\n'.join(lines[-lines_to_read:])
-            truncated = len(lines) > lines_to_read
-        else:
+        lines = tail.decode('utf-8', errors='replace').splitlines()
+        if position > 0 and lines:
+            # The first line (and possibly a multi-byte character) may be cut off.
+            lines = lines[1:]
+        content = '\n'.join(lines[-lines_to_read:])
+        truncated = position > 0 or len(lines) > lines_to_read
+    else:
+        with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
-            truncated = False
+        truncated = False
 
     return {
         "content": content,
@@ -359,6 +383,27 @@ def _parse_positive_int_query(value, default, minimum=1, maximum=10000):
     if maximum is not None:
         parsed = min(maximum, parsed)
     return parsed
+
+
+def _contained_worker_log_path(wm, log_file):
+    """Return the resolved log path if it lies inside the worker log directory, else None."""
+    get_log_dir = getattr(wm, "get_worker_log_dir", None)
+    if not log_file or not callable(get_log_dir):
+        return None
+    try:
+        log_dir = get_log_dir()
+        if not log_dir:
+            return None
+        base = os.path.realpath(log_dir)
+        target = os.path.realpath(log_file)
+        if os.path.normcase(target) == os.path.normcase(base):
+            return None
+        if os.path.normcase(os.path.commonpath([base, target])) != os.path.normcase(base):
+            return None
+    except (OSError, ValueError):
+        # ValueError: different drives on Windows, or mixed absolute/relative paths.
+        return None
+    return target
 
 
 def _find_worker_by_id(config, worker_id):
@@ -484,14 +529,15 @@ async def launch_worker_endpoint(request):
             proc_info = wm.processes[worker_id_str]
             process = proc_info.get('process')
             
-            # Check if still running
+            # Check if still running. A restored PID (no subprocess object) only
+            # counts when it is verified to still be the launched worker, not a
+            # reused PID.
             is_running = False
             if process:
                 is_running = process.poll() is None
             else:
-                # Restored process without subprocess object
-                is_running = wm._is_process_running(proc_info['pid'])
-            
+                is_running, _ = wm._check_worker_process(worker_id_str, proc_info)
+
             if is_running:
                 return await handle_api_error(request, "Worker already running (managed by UI)", 409)
             else:
@@ -651,8 +697,16 @@ async def get_worker_log_endpoint(request):
         
         proc_info = wm.processes[worker_id]
         log_file = proc_info.get('log_file')
-        
-        if not log_file or not os.path.exists(log_file):
+        if not log_file:
+            return await handle_api_error(request, "Log file not found", 404)
+
+        # Serve only files inside the extension's worker log directory: the
+        # recorded path comes from persisted state and must not reach other files.
+        log_file = _contained_worker_log_path(wm, log_file)
+        if log_file is None:
+            return await handle_api_error(request, "Log file is outside the worker log directory", 403)
+
+        if not os.path.isfile(log_file):
             return await handle_api_error(request, "Log file not found", 404)
         
         # Read last N lines (or full file if small)

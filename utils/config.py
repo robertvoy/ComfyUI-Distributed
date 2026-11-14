@@ -6,6 +6,10 @@ import copy
 import os
 import json
 import math
+import stat
+import tempfile
+import threading
+import time
 from contextlib import asynccontextmanager
 from .logging import log
 from .secret_fields import is_secret_field_name as _is_secret_field_name
@@ -17,6 +21,32 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "gpu_conf
 _config_cache = None
 _config_mtime = 0.0
 _config_lock = asyncio.Lock()
+# Serialises every config file read/write in this process, across threads (route
+# handlers on the event loop, executor threads, timer threads) and the async
+# config_transaction. Re-entrant so a transaction (or a signal handler running on
+# a thread that already holds it) can call load_config/save_config.
+_config_io_lock = threading.RLock()
+
+# os.replace on Windows fails while another handle has the target open
+# (ERROR_ACCESS_DENIED=5, ERROR_SHARING_VIOLATION=32), e.g. another process
+# reading gpu_config.json. Retry briefly before giving up. Saves often run on
+# the event loop thread while holding _config_io_lock, so the whole retry
+# budget stays short (about a third of a second) to bound how long a stuck
+# file can stall the server.
+_REPLACE_RETRY_WINERRORS = (5, 32)
+_REPLACE_RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.15)
+_IO_LOCK_POLL_INTERVAL = 0.005
+
+
+def _read_umask():
+    # os.umask can only be read by setting it; done once, at import.
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+# Permissions open() would give a newly created file.
+_NEW_FILE_MODE = 0o666 & ~_read_umask()
 
 _SERVERLESS_OBSOLETE_WORKER_FIELDS = {"host", "port", "listen_port", "cuda_device", "extra_args"}
 
@@ -127,66 +157,119 @@ def load_config():
     global _config_cache, _config_mtime
     path = _config_path()
 
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        if _config_cache is None:
-            _config_cache = get_default_config()
+    with _config_io_lock:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            if _config_cache is None:
+                _config_cache = get_default_config()
+            return _config_cache
+
+        if _config_cache is None or mtime != _config_mtime:
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                _config_cache = _merge_with_defaults(loaded, get_default_config())
+            except Exception as e:
+                log(f"Error loading config, using defaults: {e}")
+                _config_cache = get_default_config()
+            _config_mtime = mtime
+
         return _config_cache
 
-    if _config_cache is None or mtime != _config_mtime:
+
+def _replace_with_retry(src, dst):
+    """os.replace, retrying briefly on transient Windows sharing/access errors."""
+    for delay in _REPLACE_RETRY_DELAYS:
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-            _config_cache = _merge_with_defaults(loaded, get_default_config())
-        except Exception as e:
-            log(f"Error loading config, using defaults: {e}")
-            _config_cache = get_default_config()
-        _config_mtime = mtime
+            os.replace(src, dst)
+            return
+        except PermissionError as e:
+            if getattr(e, "winerror", None) not in _REPLACE_RETRY_WINERRORS:
+                raise
+            time.sleep(delay)
+    os.replace(src, dst)
 
-    return _config_cache
 
-def save_config(config):
-    """Saves normalized configuration without allowing API keys in the config file."""
-    tmp_path = f"{_config_path()}.tmp"
+def _write_config_file(path, saved_config):
+    """Atomically write JSON via a unique temp file in the target directory."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f"{os.path.basename(path)}.", suffix=".tmp", dir=directory
+    )
     try:
-        saved_config = _validated_config_for_save(config)
-        with open(tmp_path, 'w', encoding='utf-8') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(saved_config, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, _config_path())
-        invalidate_config_cache()
-        return True
-    except Exception as e:
+        # mkstemp creates 0600 files: keep the existing file's permissions,
+        # or give a new file the usual ones.
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            mode = _NEW_FILE_MODE
+        try:
+            os.chmod(tmp_path, mode)
+        except OSError:
+            pass
+        _replace_with_retry(tmp_path, path)
+    except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
-        log(f"Error saving config: {e}")
-        return False
+        raise
+
+
+def save_config(config):
+    """Saves normalized configuration without allowing API keys in the config file."""
+    with _config_io_lock:
+        try:
+            saved_config = _validated_config_for_save(config)
+            _write_config_file(_config_path(), saved_config)
+            invalidate_config_cache()
+            return True
+        except Exception as e:
+            log(f"Error saving config: {e}")
+            return False
+
+
+async def _acquire_config_io_lock():
+    """Take the thread lock without blocking the event loop while a thread holds it."""
+    while not _config_io_lock.acquire(blocking=False):
+        await asyncio.sleep(_IO_LOCK_POLL_INTERVAL)
 
 
 @asynccontextmanager
 async def config_transaction():
-    """Acquire config lock, yield loaded config, and save if changed."""
+    """Acquire config lock, yield loaded config, and save if changed.
+
+    The load -> mutate -> save sequence holds both the asyncio lock (other
+    coroutines) and the module thread lock (executor/timer threads calling
+    load_config/save_config), so no other save can land in between. The body
+    must not await work on another thread that itself loads or saves config.
+    """
     async with _config_lock:
-        config = load_config()
-        original_config = copy.deepcopy(config)
-        original_snapshot = json.dumps(config, sort_keys=True)
+        await _acquire_config_io_lock()
         try:
-            yield config
-        except BaseException:
-            if isinstance(config, dict):
-                config.clear()
-                config.update(original_config)
-            raise
-        updated_snapshot = json.dumps(config, sort_keys=True)
-        if updated_snapshot != original_snapshot and not save_config(config):
-            if isinstance(config, dict):
-                config.clear()
-                config.update(original_config)
-            raise RuntimeError("Failed to save config")
+            config = load_config()
+            original_config = copy.deepcopy(config)
+            original_snapshot = json.dumps(config, sort_keys=True)
+            try:
+                yield config
+            except BaseException:
+                if isinstance(config, dict):
+                    config.clear()
+                    config.update(original_config)
+                raise
+            updated_snapshot = json.dumps(config, sort_keys=True)
+            if updated_snapshot != original_snapshot and not save_config(config):
+                if isinstance(config, dict):
+                    config.clear()
+                    config.update(original_config)
+                raise RuntimeError("Failed to save config")
+        finally:
+            _config_io_lock.release()
 
 def ensure_config_exists():
     """Creates default config file if it doesn't exist. Used by __init__.py"""

@@ -41,13 +41,37 @@ prompt_server = server.PromptServer.instance
 #   frame) and sends one raw tensor part per frame; values are not quantized.
 
 
+def _resolve_media_path(name):
+    """Resolve a media name inside ComfyUI's input, output or temp folder.
+
+    ``folder_paths.get_annotated_filepath`` only joins paths, so a name such as
+    ``../../secret.png`` or an absolute path would otherwise reach any file on
+    the machine. Apply the same containment check as ComfyUI's ``/view``.
+    """
+    import folder_paths
+
+    full_path = os.path.abspath(folder_paths.get_annotated_filepath(name))
+    roots = (
+        folder_paths.get_input_directory(),
+        folder_paths.get_output_directory(),
+        folder_paths.get_temp_directory(),
+    )
+    for root in roots:
+        root = os.path.abspath(root)
+        try:
+            if os.path.commonpath((root, full_path)) == root:
+                return full_path
+        except ValueError:
+            continue  # Different drive on Windows.
+    raise PermissionError("Path is outside ComfyUI's input, output and temp folders")
+
+
 def _decode_image_sync(image_path):
     """Decode image/video file and compute hash in a threadpool worker."""
     import base64
     import hashlib
-    import folder_paths
 
-    full_path = folder_paths.get_annotated_filepath(image_path)
+    full_path = _resolve_media_path(image_path)
     if not os.path.exists(full_path):
         raise FileNotFoundError(image_path)
 
@@ -90,9 +114,8 @@ def _decode_image_sync(image_path):
 def _check_file_sync(filename, expected_hash):
     """Check file presence and hash in a threadpool worker."""
     import hashlib
-    import folder_paths
 
-    full_path = folder_paths.get_annotated_filepath(filename)
+    full_path = _resolve_media_path(filename)
     if not os.path.exists(full_path):
         return {
             "status": "success",
@@ -266,6 +289,8 @@ async def load_image_endpoint(request):
         return web.json_response(payload)
     except FileNotFoundError:
         return await handle_api_error(request, f"File not found: {image_path}", 404)
+    except PermissionError as e:
+        return await handle_api_error(request, e, 403)
     except Exception as e:
         return await handle_api_error(request, e, 500)
 
@@ -282,7 +307,9 @@ async def check_file_endpoint(request):
         loop = asyncio.get_running_loop()
         payload = await loop.run_in_executor(None, _check_file_sync, filename, expected_hash)
         return web.json_response(payload)
-        
+
+    except PermissionError as e:
+        return await handle_api_error(request, e, 403)
     except Exception as e:
         return await handle_api_error(request, e, 500)
 
@@ -322,7 +349,9 @@ async def _enqueue_worker_items(multi_job_id, items):
                 if any(item.get("is_last") for item in items):
                     _notify_worker_result(multi_job_id)
                 return size
-        if time.monotonic() > deadline:
+        # A cancelled run's queue is gone for good; do not hold the request
+        # (and its decoded tensors) for the whole grace period.
+        if time.monotonic() > deadline or _job_was_cancelled(multi_job_id):
             return None
         await asyncio.sleep(0.05)
 

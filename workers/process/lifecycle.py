@@ -19,12 +19,120 @@ except ImportError:
     log("psutil not available, using fallback process management")
     PSUTIL_AVAILABLE = False
 
+# Two readings of one process's creation time can differ slightly: Linux derives
+# it from the boot time in whole seconds, which can move by a second between
+# readings (or when the clock is adjusted), and the value round-trips through
+# JSON. A process that reused the PID started after the saved one exited, so
+# it only falls inside this window if the saved process died within seconds.
+_CREATE_TIME_TOLERANCE_SECONDS = 2.0
+
+
+def get_process_create_time(pid):
+    """Return the OS creation time of ``pid`` (identifies it with the PID), or None."""
+    if not PSUTIL_AVAILABLE or not pid:
+        return None
+    try:
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception:
+        return None
+
+
+def create_times_match(actual, expected):
+    try:
+        return abs(float(actual) - float(expected)) <= _CREATE_TIME_TOLERANCE_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
+def open_verified_process(pid, expected_create_time=None, cmdline_check=None):
+    """Return a psutil handle for ``pid`` only if it is provably the expected process.
+
+    psutil also refuses to signal the returned handle if the PID is reused later.
+    """
+    if not PSUTIL_AVAILABLE or not pid:
+        return None
+    try:
+        proc = psutil.Process(int(pid))
+        if expected_create_time is not None:
+            return proc if create_times_match(proc.create_time(), expected_create_time) else None
+        if cmdline_check is not None and cmdline_check(list(proc.cmdline() or [])):
+            return proc
+    except Exception:
+        return None
+    return None
+
+
+def worker_log_dir(comfy_root):
+    """Directory that holds the log files of UI-launched workers."""
+    return os.path.join(comfy_root, "logs", "workers")
+
+
+def _cmdline_port(cmdline):
+    """Return the last --port value in a command line (argparse semantics)."""
+    value = None
+    for index, arg in enumerate(cmdline):
+        if arg == "--port" and index + 1 < len(cmdline):
+            value = cmdline[index + 1]
+        elif isinstance(arg, str) and arg.startswith("--port="):
+            value = arg.split("=", 1)[1]
+    return value
+
+
+def _runs_comfy_main(cmdline):
+    """True when the command line launches ComfyUI's main.py (directly or via worker_monitor.py).
+
+    Used with the port for entries saved before creation times were recorded,
+    so an unrelated program that reused the PID and happens to take a
+    ``--port`` argument is not mistaken for the worker.
+    """
+    return any(
+        isinstance(arg, str) and os.path.basename(arg.replace("\\", "/")).lower() == "main.py"
+        for arg in cmdline
+    )
+
+
+def _expected_port(proc_info):
+    config = proc_info.get("config")
+    if not isinstance(config, dict) or config.get("port") in (None, ""):
+        return None
+    return str(config.get("port")).strip()
+
 
 class ProcessLifecycle:
     """Worker process lifecycle operations operating on manager-owned state."""
 
     def __init__(self, manager):
         self._manager = manager
+
+    def _open_restored_process(self, proc_info):
+        """Return a psutil handle for a restored worker PID only if it is still our process.
+
+        Restored entries have no subprocess handle, so their PID may have been
+        reused by an unrelated process (after a reboot or crash). The saved
+        creation time proves identity; entries saved by older versions fall
+        back to the worker's ``--port`` on the command line. Anything that
+        cannot be verified is treated as not ours.
+        """
+        pid = proc_info.get("pid")
+        if not pid:
+            return None
+        create_time = proc_info.get("create_time")
+        if create_time is not None:
+            return open_verified_process(pid, expected_create_time=create_time)
+        port = _expected_port(proc_info)
+        if port is None:
+            return None
+        return open_verified_process(
+            pid,
+            cmdline_check=lambda cmdline: (
+                _runs_comfy_main(cmdline)
+                and str(_cmdline_port(cmdline) or "").strip() == port
+            ),
+        )
+
+    def _drop_process(self, worker_id):
+        if self._manager.processes.pop(worker_id, None) is not None:
+            self._manager.save_processes()
 
     def launch_worker(self, worker_config, show_window=False):
         """Launch a worker process with logging."""
@@ -51,7 +159,7 @@ class ProcessLifecycle:
         cmd = self._manager.build_launch_command(worker_config, comfy_root)
         cwd = comfy_root
 
-        log_dir = os.path.join(comfy_root, "logs", "workers")
+        log_dir = worker_log_dir(comfy_root)
         os.makedirs(log_dir, exist_ok=True)
 
         date_stamp = time.strftime("%Y%m%d")
@@ -112,6 +220,8 @@ class ProcessLifecycle:
         self._manager.processes[worker_id] = {
             "pid": process.pid,
             "process": process,
+            # Saved with the PID so a restored entry can prove it is still this process.
+            "create_time": get_process_create_time(process.pid),
             "started_at": time.time(),
             "config": worker_config,
             "log_file": log_file,
@@ -142,7 +252,20 @@ class ProcessLifecycle:
         if not process:
             try:
                 debug_log("[Distributed] Stopping restored process (no subprocess object)")
-                if self._kill_process_tree(pid):
+                # Re-verify right before killing: a restored PID may now belong to
+                # an unrelated process, which must never be killed.
+                verified = self._open_restored_process(proc_info)
+                if verified is None:
+                    log(
+                        f"[Distributed] Worker {worker_id} (PID: {pid}) is no longer the process "
+                        "launched by the UI; forgetting it without killing anything"
+                    )
+                    self._drop_process(worker_id)
+                    return False, "Worker already stopped"
+                expected_create_time = proc_info.get("create_time")
+                if expected_create_time is None:
+                    expected_create_time = verified.create_time()
+                if self._kill_process_tree(pid, expected_create_time=expected_create_time):
                     del self._manager.processes[worker_id]
                     self._manager.save_processes()
                     debug_log(f"Successfully stopped worker {worker_id} and all child processes")
@@ -160,6 +283,7 @@ class ProcessLifecycle:
 
         try:
             debug_log(f"Using process tree kill for worker {worker_id}")
+            # The live subprocess handle pins this PID, so no identity check is needed.
             if self._kill_process_tree(pid):
                 del self._manager.processes[worker_id]
                 self._manager.save_processes()
@@ -178,6 +302,7 @@ class ProcessLifecycle:
     def get_managed_workers(self):
         """Get list of workers managed by this process."""
         managed = {}
+        dropped = False
         for worker_id, proc_info in list(self._manager.processes.items()):
             is_running, _ = self._check_worker_process(worker_id, proc_info)
             if is_running:
@@ -188,8 +313,12 @@ class ProcessLifecycle:
                     "launching": proc_info.get("launching", False),
                 }
             else:
-                del self._manager.processes[worker_id]
+                self._manager.processes.pop(worker_id, None)
+                dropped = True
 
+        if dropped:
+            # Persist so a stale PID cannot be restored (and reused) after a restart.
+            self._manager.save_processes()
         return managed
 
     def cleanup_all(self):
@@ -217,14 +346,25 @@ class ProcessLifecycle:
         if process:
             return process.poll() is None, True
         if pid:
-            return self._is_process_running(pid), False
+            # A bare PID only counts when it is provably still the launched process.
+            return self._open_restored_process(proc_info) is not None, False
         return False, False
 
-    def _kill_process_tree(self, pid):
-        """Kill a process and all its children."""
+    def _kill_process_tree(self, pid, expected_create_time=None):
+        """Kill a process and all its children.
+
+        With ``expected_create_time`` the tree is killed only if ``pid`` still
+        belongs to the process created at that time (not a reused PID).
+        """
         if PSUTIL_AVAILABLE:
             try:
                 parent = psutil.Process(pid)
+                # psutil refuses to signal ``parent`` if the PID is reused after this check.
+                if expected_create_time is not None and not create_times_match(
+                    parent.create_time(), expected_create_time
+                ):
+                    log(f"[Distributed] PID {pid} no longer belongs to the worker process; not killing it")
+                    return False
                 children = parent.children(recursive=True)
 
                 debug_log(f"Killing process tree for PID {pid} ({parent.name()})")
@@ -257,10 +397,18 @@ class ProcessLifecycle:
                     debug_log(f"Parent process {pid} already gone")
                 return True
             except psutil.NoSuchProcess:
+                # It exited on its own (for example between the identity check
+                # and this kill): the worker is stopped.
                 debug_log(f"Process {pid} does not exist")
-                return False
+                return True
             except Exception as exc:
                 debug_log(f"Error killing process tree: {exc}")
+                if expected_create_time is not None:
+                    # The OS commands below cannot verify the PID's identity.
+                    return False
+        elif expected_create_time is not None:
+            # Identity cannot be checked without psutil; never kill a possibly reused PID.
+            return False
 
         debug_log("[Distributed] Using OS commands to kill process tree")
         if platform.system() == "Windows":

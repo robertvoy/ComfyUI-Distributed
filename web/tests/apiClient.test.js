@@ -93,3 +93,50 @@ describe("apiClient probeWorker", () => {
         expect(result).toEqual({ ok: true, status: 200, queueRemaining: 0 });
     });
 });
+
+describe("apiClient request retries", () => {
+    let originalFetch;
+
+    beforeEach(() => {
+        originalFetch = globalThis.fetch;
+        globalThis.fetch = vi.fn();
+        vi.spyOn(console, "log").mockImplementation(() => {});
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+        globalThis.fetch = originalFetch;
+        vi.restoreAllMocks();
+    });
+
+    const reply = (status, body = {}) => ({
+        ok: status >= 200 && status < 300,
+        status,
+        json: vi.fn().mockResolvedValue(body),
+    });
+
+    it("does not retry a 4xx answer and keeps its message and status", async () => {
+        globalThis.fetch.mockResolvedValue(reply(404, { ok: false, message: "Serverless worker not found" }));
+        const client = createApiClient("http://127.0.0.1:8188");
+
+        const error = await client.getServerlessStatus("gone").catch((err) => err);
+
+        expect(error.message).toBe("Serverless worker not found");
+        expect(error.status).toBe(404);
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it("still retries server errors with backoff", async () => {
+        globalThis.fetch
+            .mockResolvedValueOnce(reply(503))
+            .mockResolvedValueOnce(reply(200, { workers: [] }));
+        const client = createApiClient("http://127.0.0.1:8188");
+
+        const pending = client.getConfig();
+        await vi.runAllTimersAsync();
+
+        await expect(pending).resolves.toEqual({ workers: [] });
+        expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+    });
+});

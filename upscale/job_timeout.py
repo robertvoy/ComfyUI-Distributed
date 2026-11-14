@@ -14,14 +14,30 @@ def _find_worker_record(worker_id):
     return next((w for w in workers if str(w.get("id")) == str(worker_id)), None)
 
 
+def _configured_heartbeat_timeout(cfg):
+    """Return settings.worker_timeout_seconds, or the default when it is unusable.
+
+    A malformed stored value (e.g. "abc" saved before setting validation existed)
+    must not raise here: this runs inside the master's result-collection loop.
+    """
+    settings = cfg.get("settings", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(settings, dict):
+        settings = {}
+    value = settings.get("worker_timeout_seconds", HEARTBEAT_TIMEOUT)
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        debug_log(f"Ignoring invalid worker_timeout_seconds={value!r}; using {HEARTBEAT_TIMEOUT}s")
+        return HEARTBEAT_TIMEOUT
+
+
 async def _check_and_requeue_timed_out_workers(multi_job_id, total_tasks):
     """Check timed out workers and requeue their tasks. Returns requeued count."""
     prompt_server = ensure_tile_jobs_initialized()
     current_time = time.time()
 
     # Allow override via config setting 'worker_timeout_seconds'
-    cfg = load_config()
-    hb_timeout = int(cfg.get("settings", {}).get("worker_timeout_seconds", HEARTBEAT_TIMEOUT))
+    hb_timeout = _configured_heartbeat_timeout(load_config())
 
     # Snapshot timed-out workers and job details under lock.
     async with prompt_server.distributed_tile_jobs_lock:

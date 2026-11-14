@@ -587,6 +587,65 @@ def _override_upscale_nodes(
             inputs["worker_id"] = participant_id
 
 
+def _config_worker_id(participant_id):
+    """Return the configured worker ID behind a participant ID.
+
+    Serverless pools expand into one participant per job slot
+    ("serverless:<pool id>:<slot>"); the editor stores values per pool.
+    """
+    participant_id = str(participant_id)
+    prefix = "serverless:"
+    if participant_id.startswith(prefix):
+        pool_id, separator, _slot = participant_id[len(prefix):].rpartition(":")
+        if separator and pool_id:
+            return pool_id
+    return participant_id
+
+
+def _pin_value_for_participant(inputs, participant_id, worker_index, run_worker_ids=None):
+    """Put this worker's own saved value under the positional key it will read.
+
+    DistributedValue reads ``worker_values[str(index + 1)]``, where the editor
+    numbered the enabled workers in config order. The run's index comes from
+    the workers that actually take part, so an offline worker or a serverless
+    pool (one participant per job slot) shifts every later worker onto a
+    neighbour's value. The editor also saves ``_by_worker_id``; when present it
+    is authoritative, and a worker with no entry there falls back to the
+    default instead of inheriting another worker's positional value.
+
+    A map that names none of this run's workers (``run_worker_ids``) was saved
+    for other workers (an exported prompt, or workers re-created since the
+    workflow was last opened); the positional values are kept as they were.
+    """
+    raw = inputs.get("worker_values")
+    if isinstance(raw, str):
+        try:
+            values = json.loads(raw)
+        except ValueError:
+            return
+    elif isinstance(raw, dict):
+        values = raw
+    else:
+        return  # Absent, or wired to another node's output.
+    if not isinstance(values, dict):
+        return
+    by_worker_id = values.get("_by_worker_id")
+    if not isinstance(by_worker_id, dict):
+        return  # Older workflows saved positional values only.
+    if run_worker_ids is not None and not any(
+            _config_worker_id(worker_id) in by_worker_id for worker_id in run_worker_ids):
+        return
+
+    pinned = dict(values)
+    key = str(worker_index + 1)
+    value = by_worker_id.get(_config_worker_id(participant_id))
+    if value is None or value == "":
+        pinned.pop(key, None)
+    else:
+        pinned[key] = value
+    inputs["worker_values"] = json.dumps(pinned) if isinstance(raw, str) else pinned
+
+
 def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, worker_index_map):
     """Configure DistributedValue nodes for master or worker role."""
     for node_id in prompt_index.nodes_for_class("DistributedValue"):
@@ -598,7 +657,10 @@ def _override_value_nodes(prompt_copy, prompt_index, is_master, participant_id, 
         if is_master:
             inputs["worker_id"] = ""
         else:
-            inputs["worker_id"] = f"worker_{worker_index_map.get(participant_id, 0)}"
+            worker_index = worker_index_map.get(participant_id, 0)
+            inputs["worker_id"] = f"worker_{worker_index}"
+            _pin_value_for_participant(inputs, participant_id, worker_index,
+                                       run_worker_ids=worker_index_map)
 
 
 def _override_image_list_nodes(prompt_copy, prompt_index, participant_id, worker_ids,
