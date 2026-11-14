@@ -47,10 +47,15 @@ def _resolve_media_path(name):
     ``folder_paths.get_annotated_filepath`` only joins paths, so a name such as
     ``../../secret.png`` or an absolute path would otherwise reach any file on
     the machine. Apply the same containment check as ComfyUI's ``/view``.
+    Newer ComfyUI (0.45+) runs its own check there and raises ValueError;
+    both refusals are reported as PermissionError so the routes answer 403.
     """
     import folder_paths
 
-    full_path = os.path.abspath(folder_paths.get_annotated_filepath(name))
+    try:
+        full_path = os.path.abspath(folder_paths.get_annotated_filepath(name))
+    except ValueError:
+        raise PermissionError("Path is outside ComfyUI's input, output and temp folders") from None
     roots = (
         folder_paths.get_input_directory(),
         folder_paths.get_output_directory(),

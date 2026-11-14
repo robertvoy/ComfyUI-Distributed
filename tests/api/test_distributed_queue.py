@@ -551,5 +551,53 @@ class JobCompleteCompressedPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((items[0]["image_index"], items[0]["tensor"]), (3, "tensor-data"))
 
 
+class MediaPathContainmentTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import os
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = self._tmp.name
+        self.input_dir = os.path.join(root, "input")
+        for name in ("input", "output", "temp"):
+            os.makedirs(os.path.join(root, name))
+        self.folder_paths = types.ModuleType("folder_paths")
+        self.folder_paths.get_input_directory = lambda: os.path.join(root, "input")
+        self.folder_paths.get_output_directory = lambda: os.path.join(root, "output")
+        self.folder_paths.get_temp_directory = lambda: os.path.join(root, "temp")
+        # Older ComfyUI: get_annotated_filepath only joins the name onto input/.
+        self.folder_paths.get_annotated_filepath = lambda name: os.path.join(self.input_dir, name)
+        patcher = patch.dict(sys.modules, {"folder_paths": self.folder_paths})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def _check_file(self, filename):
+        request = _FakeRequest({"filename": filename, "hash": "0" * 32})
+        return await job_routes.check_file_endpoint(request)
+
+    async def test_traversal_is_refused_with_403_when_comfyui_only_joins_paths(self):
+        response = await self._check_file("../../outside.png")
+        self.assertEqual(response.status, 403)
+
+    async def test_comfyui_own_path_check_is_reported_as_403_not_500(self):
+        # ComfyUI 0.45+ raises ValueError("Invalid file path: ...") itself.
+        def refuse(name):
+            raise ValueError(f"Invalid file path: {name!r}")
+
+        self.folder_paths.get_annotated_filepath = refuse
+        with self.assertRaises(PermissionError):
+            job_routes._resolve_media_path("/etc/passwd")
+        response = await self._check_file("/etc/passwd")
+        self.assertEqual(response.status, 403)
+        load = await job_routes.load_image_endpoint(_FakeRequest({"image_path": "/etc/passwd"}))
+        self.assertEqual(load.status, 403)
+
+    async def test_file_inside_input_is_checked(self):
+        response = await self._check_file("missing.png")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload, {"status": "success", "exists": False})
+
+
 if __name__ == "__main__":
     unittest.main()
