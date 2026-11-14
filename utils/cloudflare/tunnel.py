@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - psutil ships with ComfyUI installs
 from ..constants import TUNNEL_START_TIMEOUT
 from ..logging import debug_log
 from ..network import get_server_port, normalize_host
-from ..process import get_process_create_time, open_verified_process, terminate_process
+from ..process import get_process_create_time, get_process_start_id, open_verified_process, terminate_process
 from .binary import ensure_binary
 from .process_reader import ProcessReader
 from .state import clear_tunnel_state, load_tunnel_state, persist_tunnel_state, resolve_restore_master_host
@@ -41,17 +41,18 @@ def _terminate_restored(restored, pid, timeout=5):
         debug_log(f"Error stopping cloudflared pid {pid}: {exc}")
 
 
-def _open_tunnel_process(pid, create_time):
+def _open_tunnel_process(pid, create_time, start_id=None):
     """Return a psutil handle for a saved cloudflared PID only if it is still that process.
 
-    A saved creation time proves identity; state saved by older versions falls
-    back to the executable name. Returns None when the PID is gone, reused by
-    another program, or cannot be verified (for example without psutil).
+    A saved start id (Linux) or creation time proves identity, and a mismatch
+    is final; state saved by older versions with neither falls back to the
+    executable name. Returns None when the PID is gone, reused by another
+    program, or cannot be verified (for example without psutil).
     """
     if not pid:
         return None
-    if create_time is not None:
-        return open_verified_process(pid, expected_create_time=create_time)
+    if start_id is not None or create_time is not None:
+        return open_verified_process(pid, expected_create_time=create_time, expected_start_id=start_id)
     return open_verified_process(pid, name_check=_is_cloudflared_name)
 
 
@@ -60,6 +61,7 @@ class CloudflareTunnelManager:
         self.process = None
         self.pid = None
         self.pid_create_time = None
+        self.pid_start_id = None
         self.public_url = None
         self.last_error = None
         self.log_file = None
@@ -84,11 +86,24 @@ class CloudflareTunnelManager:
         self.log_file = state.get("log_file")
         pid = state.get("pid")
         create_time = state.get("pid_create_time")
+        start_id = state.get("pid_start_id")
 
-        restored = _open_tunnel_process(pid, create_time)
+        restored = _open_tunnel_process(pid, create_time, start_id)
+        gained_start_id = False
+        if restored is not None and start_id is None:
+            # Verified another way: record the clock-independent identity (Linux),
+            # but only if the handle still names that process after the read.
+            start_id = get_process_start_id(pid)
+            if not restored.is_running():
+                restored = None
+            gained_start_id = start_id is not None
         if restored is not None:
             self.pid = pid
             self.pid_create_time = create_time if create_time is not None else restored.create_time()
+            self.pid_start_id = start_id
+            # Save it so the next restart can use it; only the master owns this state.
+            if gained_start_id and not os.environ.get("COMFYUI_IS_WORKER"):
+                persist_tunnel_state(pid_create_time=self.pid_create_time, pid_start_id=start_id)
             self.status = state.get("status") or "running"
             debug_log(f"Detected existing cloudflared process (pid={pid})")
         else:
@@ -100,6 +115,7 @@ class CloudflareTunnelManager:
             self.status = "stopped"
             self.pid = None
             self.pid_create_time = None
+            self.pid_start_id = None
 
     async def start_tunnel(self):
         async with self._lock:
@@ -160,11 +176,13 @@ class CloudflareTunnelManager:
 
             self.pid = self.process.pid
             self.pid_create_time = get_process_create_time(self.pid)
+            self.pid_start_id = get_process_start_id(self.pid)
             try:
                 persist_tunnel_state(
                     status="starting",
                     pid=self.pid,
                     pid_create_time=self.pid_create_time,
+                    pid_start_id=self.pid_start_id,
                     log_file=self.log_file,
                     previous_host=self.previous_master_host,
                 )
@@ -203,6 +221,7 @@ class CloudflareTunnelManager:
                 public_url=self.public_url,
                 pid=self.pid,
                 pid_create_time=self.pid_create_time,
+                pid_start_id=self.pid_start_id,
                 log_file=self.log_file,
                 previous_host=self.previous_master_host or "",
                 master_host=normalize_host(self.public_url),
@@ -232,7 +251,7 @@ class CloudflareTunnelManager:
         else:
             # A restored PID: kill it only if it is still the same cloudflared
             # process. psutil will not signal the handle if the PID is reused.
-            restored = _open_tunnel_process(pid, self.pid_create_time)
+            restored = _open_tunnel_process(pid, self.pid_create_time, self.pid_start_id)
             if restored is None:
                 debug_log(f"PID {pid} is no longer the cloudflared process; forgetting it without killing")
             else:
@@ -244,6 +263,7 @@ class CloudflareTunnelManager:
         self.public_url = None
         self.pid = None
         self.pid_create_time = None
+        self.pid_start_id = None
         self.process = None
         self.last_error = None
         self._reader.stop()
@@ -258,7 +278,7 @@ class CloudflareTunnelManager:
     def _is_tunnel_process_alive(self, pid):
         if self.process and self.process.pid == pid:
             return self.process.poll() is None
-        return _open_tunnel_process(pid, self.pid_create_time) is not None
+        return _open_tunnel_process(pid, self.pid_create_time, self.pid_start_id) is not None
 
     def get_status(self):
         alive = False

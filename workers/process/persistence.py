@@ -12,8 +12,8 @@ class ProcessPersistence:
         """Load persisted process information from config.
 
         A saved PID is restored only when it still belongs to the worker that
-        was launched (same creation time, or the worker's --port on the command
-        line for entries saved before creation times were recorded). Entries
+        was launched (same start id on Linux or creation time, or the worker's
+        --port on the command line for entries saved before either was recorded). Entries
         that are gone or cannot be verified are dropped and the config is
         rewritten, so a reused PID is never adopted (and later killed).
         """
@@ -23,6 +23,7 @@ class ProcessPersistence:
             managed_processes = {}
 
         dropped = False
+        gained_identity = False
         for worker_id, proc_info in managed_processes.items():
             if not isinstance(proc_info, dict):
                 dropped = True
@@ -32,6 +33,7 @@ class ProcessPersistence:
                 "pid": pid,
                 "process": None,
                 "create_time": proc_info.get("create_time"),
+                "start_id": proc_info.get("start_id"),
                 "started_at": proc_info.get("started_at"),
                 "config": proc_info.get("config"),
                 "log_file": proc_info.get("log_file"),
@@ -41,6 +43,9 @@ class ProcessPersistence:
                 is_running, _ = self._manager._check_worker_process(worker_id, candidate)
             if is_running:
                 self._manager.processes[worker_id] = candidate
+                # Verification may have filled in the start id (Linux): save it now,
+                # so the next restart can use it even if this master is killed.
+                gained_identity |= candidate.get("start_id") is not None and proc_info.get("start_id") is None
                 debug_log(f"[Distributed] Restored worker {worker_id} (PID: {pid})")
             else:
                 dropped = True
@@ -50,7 +55,7 @@ class ProcessPersistence:
                         "or could not be verified; forgetting it"
                     )
 
-        if dropped:
+        if dropped or gained_identity:
             self.save_processes()
 
     def save_processes(self):
@@ -65,6 +70,7 @@ class ProcessPersistence:
             managed_processes[worker_id] = {
                 "pid": proc_info["pid"],
                 "create_time": proc_info.get("create_time"),
+                "start_id": proc_info.get("start_id"),
                 "started_at": proc_info["started_at"],
                 "config": proc_info["config"],
                 "log_file": proc_info.get("log_file"),

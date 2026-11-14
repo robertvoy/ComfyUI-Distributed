@@ -20,6 +20,7 @@ def load_tunnel_state():
         "public_url": tunnel_cfg.get("public_url") or None,
         "pid": tunnel_cfg.get("pid"),
         "pid_create_time": tunnel_cfg.get("pid_create_time"),
+        "pid_start_id": tunnel_cfg.get("pid_start_id"),
         "log_file": tunnel_cfg.get("log_file"),
         "previous_master_host": tunnel_cfg.get("previous_master_host"),
         "master_host": master_cfg.get("host"),
@@ -38,6 +39,7 @@ def persist_tunnel_state(
     previous_host=None,
     master_host=None,
     pid_create_time=_UNSET,
+    pid_start_id=_UNSET,
 ):
     cfg = load_config()
     tunnel_cfg = _get_tunnel_config(cfg)
@@ -51,8 +53,11 @@ def persist_tunnel_state(
         if pid is None:
             # A cleared PID must not keep the identity of the old process.
             tunnel_cfg["pid_create_time"] = None
+            tunnel_cfg["pid_start_id"] = None
     if pid_create_time is not _UNSET:
         tunnel_cfg["pid_create_time"] = pid_create_time
+    if pid_start_id is not _UNSET:
+        tunnel_cfg["pid_start_id"] = pid_start_id
     if log_file is not None:
         tunnel_cfg["log_file"] = log_file
     if previous_host is not None:

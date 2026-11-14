@@ -52,5 +52,5 @@ class WorkerProcessManager:
     def _check_worker_process(self, worker_id, proc_info):
         return self._lifecycle._check_worker_process(worker_id, proc_info)
 
-    def _kill_process_tree(self, pid, expected_create_time=None):
-        return self._lifecycle._kill_process_tree(pid, expected_create_time=expected_create_time)
+    def _kill_process_tree(self, pid, expected_create_time=None, handle=None):
+        return self._lifecycle._kill_process_tree(pid, expected_create_time=expected_create_time, handle=handle)

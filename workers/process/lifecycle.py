@@ -8,7 +8,12 @@ from ...utils.config import load_config, save_config
 from ...utils.constants import PROCESS_TERMINATION_TIMEOUT, PROCESS_WAIT_TIMEOUT, WORKER_CHECK_INTERVAL
 from ...utils.logging import debug_log, log
 from ...utils.network import get_server_port
-from ...utils.process import get_python_executable, is_process_alive, terminate_process
+from ...utils.process import (
+    get_process_start_id,
+    get_python_executable,
+    is_process_alive,
+    terminate_process,
+)
 from ..ports import validate_worker_port
 
 try:
@@ -19,11 +24,8 @@ except ImportError:
     log("psutil not available, using fallback process management")
     PSUTIL_AVAILABLE = False
 
-# Two readings of one process's creation time can differ slightly: Linux derives
-# it from the boot time in whole seconds, which can move by a second between
-# readings (or when the clock is adjusted), and the value round-trips through
-# JSON. A process that reused the PID started after the saved one exited, so
-# it only falls inside this window if the saved process died within seconds.
+# Same rules as utils.process: creation times can be seconds apart on Linux, so
+# Linux entries also carry a clock-independent start id that is checked first.
 _CREATE_TIME_TOLERANCE_SECONDS = 2.0
 
 
@@ -44,15 +46,21 @@ def create_times_match(actual, expected):
         return False
 
 
-def open_verified_process(pid, expected_create_time=None, cmdline_check=None):
+def open_verified_process(pid, expected_create_time=None, cmdline_check=None, expected_start_id=None):
     """Return a psutil handle for ``pid`` only if it is provably the expected process.
 
+    A saved start id (Linux) or creation time proves identity, and a mismatch
+    is final. ``cmdline_check`` is only for entries saved with neither.
     psutil also refuses to signal the returned handle if the PID is reused later.
     """
     if not PSUTIL_AVAILABLE or not pid:
         return None
     try:
         proc = psutil.Process(int(pid))
+        if expected_start_id is not None:
+            # Exact. Read after opening ``proc``, so a PID reused before this read
+            # does not match; a start id that cannot be read here proves nothing.
+            return proc if get_process_start_id(pid) == expected_start_id else None
         if expected_create_time is not None:
             return proc if create_times_match(proc.create_time(), expected_create_time) else None
         if cmdline_check is not None and cmdline_check(list(proc.cmdline() or [])):
@@ -109,26 +117,38 @@ class ProcessLifecycle:
 
         Restored entries have no subprocess handle, so their PID may have been
         reused by an unrelated process (after a reboot or crash). The saved
-        creation time proves identity; entries saved by older versions fall
-        back to the worker's ``--port`` on the command line. Anything that
-        cannot be verified is treated as not ours.
+        start id (Linux) or creation time proves identity, and a mismatch is
+        final; entries saved by older versions with neither fall back to the
+        worker's ``--port`` on the command line. Anything that cannot be
+        verified is treated as not ours.
         """
         pid = proc_info.get("pid")
         if not pid:
             return None
+        start_id = proc_info.get("start_id")
         create_time = proc_info.get("create_time")
-        if create_time is not None:
-            return open_verified_process(pid, expected_create_time=create_time)
-        port = _expected_port(proc_info)
-        if port is None:
-            return None
-        return open_verified_process(
-            pid,
-            cmdline_check=lambda cmdline: (
-                _runs_comfy_main(cmdline)
-                and str(_cmdline_port(cmdline) or "").strip() == port
-            ),
-        )
+        if start_id is not None or create_time is not None:
+            verified = open_verified_process(pid, expected_create_time=create_time, expected_start_id=start_id)
+        else:
+            port = _expected_port(proc_info)
+            if port is None:
+                return None
+            verified = open_verified_process(
+                pid,
+                cmdline_check=lambda cmdline: (
+                    _runs_comfy_main(cmdline)
+                    and str(_cmdline_port(cmdline) or "").strip() == port
+                ),
+            )
+        if verified is not None and start_id is None:
+            # Verified another way: record the clock-independent identity (Linux)
+            # from now on, but only if the handle still names the verified process
+            # after the read (the PID was not reused in between).
+            current_id = get_process_start_id(pid)
+            if not verified.is_running():
+                return None
+            proc_info["start_id"] = current_id
+        return verified
 
     def _drop_process(self, worker_id):
         if self._manager.processes.pop(worker_id, None) is not None:
@@ -222,6 +242,7 @@ class ProcessLifecycle:
             "process": process,
             # Saved with the PID so a restored entry can prove it is still this process.
             "create_time": get_process_create_time(process.pid),
+            "start_id": get_process_start_id(process.pid),
             "started_at": time.time(),
             "config": worker_config,
             "log_file": log_file,
@@ -262,10 +283,9 @@ class ProcessLifecycle:
                     )
                     self._drop_process(worker_id)
                     return False, "Worker already stopped"
-                expected_create_time = proc_info.get("create_time")
-                if expected_create_time is None:
-                    expected_create_time = verified.create_time()
-                if self._kill_process_tree(pid, expected_create_time=expected_create_time):
+                # Kill through the handle just verified: psutil refuses to signal it
+                # (or list its children) once the PID belongs to another process.
+                if self._kill_process_tree(pid, expected_create_time=verified.create_time(), handle=verified):
                     del self._manager.processes[worker_id]
                     self._manager.save_processes()
                     debug_log(f"Successfully stopped worker {worker_id} and all child processes")
@@ -350,15 +370,16 @@ class ProcessLifecycle:
             return self._open_restored_process(proc_info) is not None, False
         return False, False
 
-    def _kill_process_tree(self, pid, expected_create_time=None):
+    def _kill_process_tree(self, pid, expected_create_time=None, handle=None):
         """Kill a process and all its children.
 
         With ``expected_create_time`` the tree is killed only if ``pid`` still
-        belongs to the process created at that time (not a reused PID).
+        belongs to the process created at that time (not a reused PID). A
+        verified psutil ``handle`` is used instead of looking the PID up again.
         """
         if PSUTIL_AVAILABLE:
             try:
-                parent = psutil.Process(pid)
+                parent = handle if handle is not None else psutil.Process(pid)
                 # psutil refuses to signal ``parent`` if the PID is reused after this check.
                 if expected_create_time is not None and not create_times_match(
                     parent.create_time(), expected_create_time

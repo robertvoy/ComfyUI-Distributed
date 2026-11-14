@@ -48,6 +48,7 @@ def _load_modules():
 
 
 config_module, logging_module, state_module, tunnel_module = _load_modules()
+process_module = sys.modules[f"{_PACKAGE}.utils.process"]
 
 _URL_SCRIPT = "import time; print('INF https://abc-def.trycloudflare.com', flush=True); time.sleep(60)"
 _SLEEP_SCRIPT = "import time; print('starting', flush=True); time.sleep(60)"
@@ -156,12 +157,14 @@ class TunnelStartStopTests(TunnelTestCase):
         saved = self._tunnel_config()
         self.assertEqual(saved["pid"], spawned.pid)
         self.assertAlmostEqual(saved["pid_create_time"], psutil.Process(spawned.pid).create_time(), places=2)
+        self.assertEqual(saved["pid_start_id"], process_module.get_process_start_id(spawned.pid))
 
         await asyncio.wait_for(manager.stop_tunnel(), timeout=10)
         self.assertIsNotNone(spawned.poll())
         saved = self._tunnel_config()
         self.assertIsNone(saved["pid"])
         self.assertIsNone(saved["pid_create_time"])
+        self.assertIsNone(saved["pid_start_id"])
 
 
 class TunnelPidIdentityTests(TunnelTestCase):
@@ -222,6 +225,72 @@ class TunnelPidIdentityTests(TunnelTestCase):
         # Linux reports creation times from a boot time in whole seconds.
         child, create_time = self._spawn_sleeper()
         state_module.persist_tunnel_state(status="running", pid=child.pid, pid_create_time=create_time - 1.0)
+        manager = tunnel_module.CloudflareTunnelManager()
+        self.assertEqual(manager.pid, child.pid)
+
+    async def test_start_id_proves_identity_when_creation_times_disagree(self):
+        # WSL2: a restarted master read a creation time 13 s away from the saved one.
+        child, create_time = self._spawn_sleeper()
+        state_module.persist_tunnel_state(status="running", pid=child.pid,
+                                          pid_create_time=create_time - 13.0, pid_start_id="boot-1:4242")
+        with patch.object(process_module, "get_process_start_id", return_value="boot-1:4242"):
+            manager = tunnel_module.CloudflareTunnelManager()
+            self.assertEqual(manager.pid, child.pid)
+            await asyncio.wait_for(manager.stop_tunnel(), timeout=10)
+        child.wait(timeout=10)
+        self.assertIsNone(self._tunnel_config()["pid_start_id"])
+
+    async def test_a_different_start_id_is_final(self):
+        child, create_time = self._spawn_sleeper()
+        state_module.persist_tunnel_state(status="running", pid=child.pid,
+                                          pid_create_time=create_time, pid_start_id="boot-1:4242")
+        with patch.object(process_module, "get_process_start_id", return_value="boot-1:9999"):
+            manager = tunnel_module.CloudflareTunnelManager()
+            self.assertIsNone(manager.pid)
+            await asyncio.wait_for(manager.stop_tunnel(), timeout=5)
+        self.assertIsNone(child.poll(), "an unrelated process was killed")
+
+    def test_a_saved_start_id_that_cannot_be_read_fails_closed_despite_a_matching_creation_time(self):
+        child, create_time = self._spawn_sleeper()
+        state_module.persist_tunnel_state(status="running", pid=child.pid,
+                                          pid_create_time=create_time, pid_start_id="boot-1:4242")
+        with patch.object(process_module, "get_process_start_id", return_value=None):
+            manager = tunnel_module.CloudflareTunnelManager()
+        self.assertIsNone(manager.pid)
+        self.assertIsNone(child.poll())
+
+    def test_tunnel_verified_by_creation_time_gains_and_persists_a_start_id(self):
+        child, create_time = self._spawn_sleeper()
+        for is_worker, expected in ((False, "boot-1:9"), (True, None)):
+            with self.subTest(is_worker=is_worker):
+                state_module.persist_tunnel_state(status="running", pid=child.pid,
+                                                  pid_create_time=create_time, pid_start_id=None)
+                env = {"COMFYUI_IS_WORKER": "1"} if is_worker else {}
+                with patch.dict(os.environ, env), \
+                     patch.object(tunnel_module, "get_process_start_id", return_value="boot-1:9"):
+                    manager = tunnel_module.CloudflareTunnelManager()
+                self.assertEqual(manager.pid, child.pid)
+                self.assertEqual(manager.pid_start_id, "boot-1:9")
+                # Only the master writes the shared tunnel state.
+                self.assertEqual(self._tunnel_config()["pid_start_id"], expected)
+                self.assertEqual(self._tunnel_config()["pid"], child.pid)
+
+    def test_a_start_id_read_after_the_process_was_replaced_is_not_recorded(self):
+        replaced = MagicMock()
+        replaced.is_running.return_value = False
+        state_module.persist_tunnel_state(status="running", pid=4242, pid_create_time=123.0)
+        with patch.object(tunnel_module, "_open_tunnel_process", return_value=replaced), \
+             patch.object(tunnel_module, "get_process_start_id", return_value="boot-1:5"):
+            manager = tunnel_module.CloudflareTunnelManager()
+        self.assertIsNone(manager.pid)
+        self.assertIsNone(self._tunnel_config()["pid"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "start ids are read from /proc")
+    def test_real_start_id_restores_a_tunnel_whose_creation_time_drifted(self):
+        child, create_time = self._spawn_sleeper()
+        state_module.persist_tunnel_state(
+            status="running", pid=child.pid, pid_create_time=create_time - 13.0,
+            pid_start_id=process_module.get_process_start_id(child.pid))
         manager = tunnel_module.CloudflareTunnelManager()
         self.assertEqual(manager.pid, child.pid)
 

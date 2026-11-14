@@ -10,7 +10,7 @@ import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import psutil
 
@@ -45,6 +45,7 @@ def _load_modules():
 
 
 config_module, logging_module, manager_module, lifecycle_module = _load_modules()
+process_module = sys.modules[f"{_PACKAGE}.utils.process"]
 
 
 class WorkerPidIdentityTests(unittest.TestCase):
@@ -126,6 +127,112 @@ class WorkerPidIdentityTests(unittest.TestCase):
         manager = manager_module.WorkerProcessManager()
         self.assertEqual(manager.processes["w1"]["pid"], child.pid)
 
+    def test_start_id_proves_identity_when_creation_times_disagree(self):
+        # WSL2: a restarted master read a creation time 13 s away from the saved
+        # one; the boot id and start ticks (Linux) still match exactly.
+        child, create_time = self._spawn()
+        entry = self._entry(child.pid, create_time - 13.0)
+        entry["start_id"] = "boot-1:4242"
+        self._save_managed({"w1": entry})
+        with patch.object(lifecycle_module, "get_process_start_id", return_value="boot-1:4242"):
+            manager = manager_module.WorkerProcessManager()
+            self.assertEqual(manager.processes["w1"]["pid"], child.pid)
+            success, _message = manager.stop_worker("w1")
+        self.assertTrue(success)
+        child.wait(timeout=10)
+
+    def test_a_different_start_id_is_final_even_for_a_comfyui_worker_on_its_port(self):
+        child, create_time = self._spawn(os.path.join("ComfyUI", "main.py"), "--port", "8199")
+        entry = self._entry(child.pid, create_time)
+        entry["start_id"] = "boot-1:4242"
+        self._save_managed({"w1": entry})
+        with patch.object(lifecycle_module, "get_process_start_id", return_value="boot-1:9999"):
+            manager = manager_module.WorkerProcessManager()
+        self.assertNotIn("w1", manager.processes)
+        self.assertIsNone(child.poll())
+
+    def test_a_creation_time_mismatch_is_final_even_for_a_comfyui_worker_on_its_port(self):
+        # A reused PID that runs main.py --port 8199 must not be adopted (and later killed).
+        child, create_time = self._spawn(os.path.join("ComfyUI", "main.py"), "--port", "8199")
+        self._save_managed({"w1": self._entry(child.pid, create_time - 13.0)})
+        with patch.object(lifecycle_module, "get_process_start_id", return_value=None):
+            manager = manager_module.WorkerProcessManager()
+        self.assertNotIn("w1", manager.processes)
+        self.assertIsNone(child.poll())
+
+    def test_a_start_id_that_cannot_be_read_here_never_falls_back_to_the_command_line(self):
+        child, _ = self._spawn(os.path.join("ComfyUI", "main.py"), "--port", "8199")
+        entry = self._entry(child.pid, None)
+        entry["start_id"] = "boot-1:4242"
+        self._save_managed({"w1": entry})
+        with patch.object(lifecycle_module, "get_process_start_id", return_value=None):
+            manager = manager_module.WorkerProcessManager()
+        self.assertNotIn("w1", manager.processes)
+
+    def test_a_saved_start_id_that_cannot_be_read_fails_closed_despite_a_matching_creation_time(self):
+        child, create_time = self._spawn()
+        entry = self._entry(child.pid, create_time)
+        entry["start_id"] = "boot-1:4242"
+        self._save_managed({"w1": entry})
+        with patch.object(lifecycle_module, "get_process_start_id", return_value=None):
+            manager = manager_module.WorkerProcessManager()
+        self.assertNotIn("w1", manager.processes)
+        self.assertIsNone(child.poll())
+
+    def test_a_start_id_read_after_the_process_was_replaced_is_not_recorded(self):
+        replaced = MagicMock()
+        replaced.is_running.return_value = False
+        self._save_managed({"w1": self._entry(4242, 123.0)})
+        with patch.object(lifecycle_module, "open_verified_process", return_value=replaced), \
+             patch.object(lifecycle_module, "get_process_start_id", return_value="boot-1:5"):
+            manager = manager_module.WorkerProcessManager()
+        self.assertNotIn("w1", manager.processes)
+        self.assertEqual(self._saved_managed(), {})
+
+    def test_tree_kill_signals_the_verified_handle_without_looking_the_pid_up_again(self):
+        handle = MagicMock()
+        handle.create_time.return_value = 100.0
+        handle.children.return_value = []
+        manager = manager_module.WorkerProcessManager()
+        with patch.object(lifecycle_module.psutil, "Process", side_effect=AssertionError("PID looked up again")):
+            self.assertTrue(manager._kill_process_tree(4242, expected_create_time=100.0, handle=handle))
+        handle.terminate.assert_called_once()
+
+    def test_entry_verified_by_creation_time_gains_and_persists_a_start_id(self):
+        child, create_time = self._spawn()
+        self._save_managed({"w1": self._entry(child.pid, create_time)})
+        with patch.object(lifecycle_module, "get_process_start_id", return_value="boot-1:7"):
+            manager = manager_module.WorkerProcessManager()
+        self.assertEqual(manager.processes["w1"]["start_id"], "boot-1:7")
+        # Saved right away, not only on a later save.
+        self.assertEqual(self._saved_managed()["w1"]["start_id"], "boot-1:7")
+
+    def test_legacy_entry_verified_by_port_gains_and_persists_a_start_id(self):
+        child, _ = self._spawn(os.path.join("ComfyUI", "main.py"), "--port", "8199")
+        self._save_managed({"w1": self._entry(child.pid, None)})
+        with patch.object(lifecycle_module, "get_process_start_id", return_value="boot-1:8"):
+            manager = manager_module.WorkerProcessManager()
+        self.assertEqual(manager.processes["w1"]["pid"], child.pid)
+        self.assertEqual(self._saved_managed()["w1"]["start_id"], "boot-1:8")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "start ids are read from /proc")
+    def test_real_start_id_restores_a_worker_whose_creation_time_drifted(self):
+        child, create_time = self._spawn()
+        start_id = process_module.get_process_start_id(child.pid)
+        self.assertRegex(start_id, r"^[0-9a-f-]+:\d+$")
+        entry = self._entry(child.pid, create_time - 13.0)
+        entry["start_id"] = start_id
+        self._save_managed({"w1": entry})
+        manager = manager_module.WorkerProcessManager()
+        self.assertEqual(manager.processes["w1"]["pid"], child.pid)
+        self.assertTrue(manager.stop_worker("w1")[0])
+        child.wait(timeout=10)
+
+    def test_start_ticks_are_read_from_field_22_after_a_command_name_with_spaces(self):
+        rest = ["S"] + [str(number) for number in range(4, 22)] + ["424242", "99"]
+        stat = b"321 (odd ) name) " + " ".join(rest).encode()
+        self.assertEqual(process_module._parse_start_ticks(stat), 424242)
+
     def test_a_worker_that_exits_before_the_kill_counts_as_stopped(self):
         child, create_time = self._spawn()
         child.kill()
@@ -204,6 +311,9 @@ class WorkerPidIdentityTests(unittest.TestCase):
         expected = psutil.Process(pid).create_time()
         self.assertAlmostEqual(manager.processes["w1"]["create_time"], expected, places=2)
         self.assertAlmostEqual(self._saved_managed()["w1"]["create_time"], expected, places=2)
+        expected_start_id = process_module.get_process_start_id(pid)
+        self.assertEqual(manager.processes["w1"]["start_id"], expected_start_id)
+        self.assertEqual(self._saved_managed()["w1"]["start_id"], expected_start_id)
         self.assertTrue(manager.stop_worker("w1")[0])
         process.wait(timeout=10)
 
