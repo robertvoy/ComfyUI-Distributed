@@ -308,5 +308,48 @@ class TunnelPidIdentityTests(TunnelTestCase):
         handle.kill.assert_not_called()
 
 
+class TunnelWorkerRefusalTests(TunnelTestCase):
+    async def test_a_worker_cannot_stop_the_masters_tunnel(self):
+        child, create_time = self._spawn_sleeper()
+        state_module.persist_tunnel_state(status="running", pid=child.pid, pid_create_time=create_time,
+                                          public_url="https://x.trycloudflare.com")
+        before = self._tunnel_config()
+        with patch.dict(os.environ, {"COMFYUI_IS_WORKER": "1"}):
+            manager = tunnel_module.CloudflareTunnelManager()
+            self.assertEqual(manager.pid, child.pid)
+            with self.assertRaises(tunnel_module.TunnelManagedByMasterError):
+                await asyncio.wait_for(manager.stop_tunnel(), timeout=5)
+            # Status stays readable for workers.
+            self.assertEqual(manager.get_status()["pid"], child.pid)
+        self.assertIsNone(child.poll(), "a worker killed the master's cloudflared")
+        self.assertEqual(self._tunnel_config(), before)
+        self.assertEqual(manager.pid, child.pid)
+
+    async def test_a_worker_cannot_start_a_tunnel(self):
+        state_module.persist_tunnel_state(status="stopped", pid=None)
+        before = self._tunnel_config()
+        spawn = MagicMock()
+        fake_subprocess = types.SimpleNamespace(Popen=spawn, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT)
+        with patch.dict(os.environ, {"COMFYUI_IS_WORKER": "1"}), \
+             patch.object(tunnel_module, "subprocess", fake_subprocess), \
+             patch.object(tunnel_module, "ensure_binary", return_value=sys.executable) as binary:
+            manager = tunnel_module.CloudflareTunnelManager()
+            with self.assertRaisesRegex(tunnel_module.TunnelManagedByMasterError, "managed by the master"):
+                await asyncio.wait_for(manager.start_tunnel(), timeout=5)
+        spawn.assert_not_called()
+        binary.assert_not_called()
+        self.assertEqual(self._tunnel_config(), before)
+
+    async def test_the_master_can_still_stop_its_tunnel(self):
+        child, create_time = self._spawn_sleeper()
+        state_module.persist_tunnel_state(status="running", pid=child.pid, pid_create_time=create_time)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("COMFYUI_IS_WORKER", None)
+            manager = tunnel_module.CloudflareTunnelManager()
+            await asyncio.wait_for(manager.stop_tunnel(), timeout=10)
+        child.wait(timeout=10)
+        self.assertIsNone(self._tunnel_config()["pid"])
+
+
 if __name__ == "__main__":
     unittest.main()

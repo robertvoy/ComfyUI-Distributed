@@ -53,7 +53,9 @@ def _resolve_media_path(name):
     import folder_paths
 
     try:
-        full_path = os.path.abspath(folder_paths.get_annotated_filepath(name))
+        # realpath follows symlinks, so a link inside input/ that points
+        # outside the roots is refused; the resolved path is what callers open.
+        full_path = os.path.realpath(folder_paths.get_annotated_filepath(name))
     except ValueError:
         raise PermissionError("Path is outside ComfyUI's input, output and temp folders") from None
     roots = (
@@ -62,7 +64,7 @@ def _resolve_media_path(name):
         folder_paths.get_temp_directory(),
     )
     for root in roots:
-        root = os.path.abspath(root)
+        root = os.path.realpath(root)
         try:
             if os.path.commonpath((root, full_path)) == root:
                 return full_path

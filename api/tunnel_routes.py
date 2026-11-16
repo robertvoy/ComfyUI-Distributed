@@ -2,6 +2,7 @@ from aiohttp import web
 import server
 
 from ..utils.cloudflare import cloudflare_tunnel_manager
+from ..utils.cloudflare.tunnel import TunnelManagedByMasterError
 from ..utils.config import load_config
 from ..utils.logging import debug_log, log
 from ..utils.network import handle_api_error
@@ -33,6 +34,8 @@ async def tunnel_start_endpoint(request):
             "tunnel": result,
             "master_host": (config.get("master") or {}).get("host")
         })
+    except TunnelManagedByMasterError as e:
+        return await handle_api_error(request, e, 403)
     except Exception as e:
         return await handle_api_error(request, e, 500)
 
@@ -47,5 +50,7 @@ async def tunnel_stop_endpoint(request):
             "tunnel": result,
             "master_host": (config.get("master") or {}).get("host")
         })
+    except TunnelManagedByMasterError as e:
+        return await handle_api_error(request, e, 403)
     except Exception as e:
         return await handle_api_error(request, e, 500)

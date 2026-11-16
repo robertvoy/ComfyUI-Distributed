@@ -598,6 +598,37 @@ class MediaPathContainmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(response.payload, {"status": "success", "exists": False})
 
+    def _symlink_or_skip(self, target, link):
+        import os
+
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+
+    def test_symlink_in_input_pointing_outside_roots_is_refused(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as outside:
+            secret = os.path.join(outside, "secret.txt")
+            with open(secret, "w") as handle:
+                handle.write("secret")
+            self._symlink_or_skip(secret, os.path.join(self.input_dir, "link.png"))
+            with self.assertRaises(PermissionError):
+                job_routes._resolve_media_path("link.png")
+
+    def test_symlink_in_input_pointing_inside_roots_still_resolves(self):
+        import os
+
+        target = os.path.join(self._tmp.name, "output", "real.png")
+        with open(target, "wb") as handle:
+            handle.write(b"png")
+        self._symlink_or_skip(target, os.path.join(self.input_dir, "link.png"))
+        resolved = job_routes._resolve_media_path("link.png")
+        self.assertEqual(resolved, os.path.realpath(target))
+        self.assertTrue(os.path.exists(resolved))
+
 
 if __name__ == "__main__":
     unittest.main()

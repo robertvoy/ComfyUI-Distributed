@@ -20,6 +20,13 @@ from .process_reader import ProcessReader
 from .state import clear_tunnel_state, load_tunnel_state, persist_tunnel_state, resolve_restore_master_host
 
 
+TUNNEL_MANAGED_BY_MASTER_MESSAGE = "Tunnel is managed by the master"
+
+
+class TunnelManagedByMasterError(Exception):
+    """Raised when a worker process is asked to start or stop the master's tunnel."""
+
+
 def _is_cloudflared_name(name):
     return "cloudflared" in str(name or "").lower()
 
@@ -117,7 +124,14 @@ class CloudflareTunnelManager:
             self.pid_create_time = None
             self.pid_start_id = None
 
+    def _refuse_in_worker(self):
+        """Workers share the master's config and may have adopted its cloudflared
+        PID for status; they must never start, stop or signal the tunnel."""
+        if os.environ.get("COMFYUI_IS_WORKER"):
+            raise TunnelManagedByMasterError(TUNNEL_MANAGED_BY_MASTER_MESSAGE)
+
     async def start_tunnel(self):
+        self._refuse_in_worker()
         async with self._lock:
             if self.process and self.process.poll() is None:
                 return {
@@ -234,6 +248,7 @@ class CloudflareTunnelManager:
             }
 
     async def stop_tunnel(self):
+        self._refuse_in_worker()
         async with self._lock:
             return self._stop_locked()
 

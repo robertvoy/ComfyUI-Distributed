@@ -43,6 +43,7 @@ def _load_process_module(module_filename: str):
     sys.modules[f"{package_name}.utils.logging"] = logging_module
 
     process_module = types.ModuleType(f"{package_name}.utils.process")
+    process_module.get_process_start_id = lambda _pid: None
     process_module.get_python_executable = lambda: "/usr/bin/test-python"
     process_module.is_process_alive = lambda _pid: False
     process_module.terminate_process = lambda *_args, **_kwargs: None
