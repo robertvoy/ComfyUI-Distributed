@@ -1,4 +1,4 @@
-from ...utils.config import load_config, save_config
+from ...utils.config import config_update, load_config
 from ...utils.logging import debug_log
 
 
@@ -60,7 +60,6 @@ class ProcessPersistence:
 
     def save_processes(self):
         """Save process information to config."""
-        config = load_config()
         managed_processes = {}
 
         for worker_id, proc_info in list(self._manager.processes.items()):
@@ -77,5 +76,5 @@ class ProcessPersistence:
                 "launching": proc_info.get("launching", False),
             }
 
-        config["managed_processes"] = managed_processes
-        save_config(config)
+        # Process checks above are slow; only the load -> change -> save holds the lock.
+        config_update(lambda config: config.__setitem__("managed_processes", managed_processes))

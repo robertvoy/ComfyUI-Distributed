@@ -1095,6 +1095,17 @@ class ApplyOverridesValueByWorkerIdTests(unittest.TestCase):
         result = _apply(self._prompt(saved), "gpu-b", enabled_worker_ids=["gpu-b", "gpu-a"])
         self.assertIsNone(self._resolved(result))
 
+    def test_default_fallback_for_a_worker_missing_from_the_map_is_logged(self):
+        saved = {"_type": "STRING", "1": "for-a", "_by_worker_id": {"gpu-a": "for-a"}}
+        messages = []
+        original = pt.debug_log
+        pt.debug_log = lambda message, *_args, **_kwargs: messages.append(message)
+        try:
+            _apply(self._prompt(saved), "gpu-b", enabled_worker_ids=["gpu-b", "gpu-a"])
+        finally:
+            pt.debug_log = original
+        self.assertTrue(any("gpu-b" in message and "default" in message for message in messages), messages)
+
     def test_map_saved_for_other_workers_keeps_positional_values(self):
         # Exported from another setup, or workers re-created since it was saved.
         saved = {"_type": "STRING", "1": "first", "2": "second",

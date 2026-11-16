@@ -75,6 +75,8 @@ describe("stopWorker failure replies", () => {
         expect(h.stopBtn.textContent).toBe("Not Running");
         expect(h.managed.get("w1")).toBeNull();
         expect(h.statuses.get("w1")).toEqual({ online: false });
+        // Nothing failed, so the button must not carry the red error style.
+        expect(h.stopBtn.classList.add).not.toHaveBeenCalledWith("btn--error");
         expect(h.extension.ui.updateStatusDot).toHaveBeenCalledWith("w1", expect.any(String), "Offline");
     });
 
@@ -90,6 +92,7 @@ describe("stopWorker failure replies", () => {
         const h = setup("Error stopping worker: access denied");
         await stopWorker(h.extension, "w1");
         expect(h.stopBtn.textContent).toBe("Error");
+        expect(h.stopBtn.classList.add).toHaveBeenCalledWith("btn--error");
         expect(h.managed.get("w1")).toEqual({ pid: 1234 });
     });
 });

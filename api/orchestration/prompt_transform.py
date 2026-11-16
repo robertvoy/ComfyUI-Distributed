@@ -640,6 +640,10 @@ def _pin_value_for_participant(inputs, participant_id, worker_index, run_worker_
     key = str(worker_index + 1)
     value = by_worker_id.get(_config_worker_id(participant_id))
     if value is None or value == "":
+        debug_log(
+            f"[Distributed] Worker {participant_id} has no value in _by_worker_id "
+            "(renamed in place?); using the default value"
+        )
         pinned.pop(key, None)
     else:
         pinned[key] = value

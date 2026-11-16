@@ -4,7 +4,7 @@ import signal
 import subprocess
 import time
 
-from ...utils.config import load_config, save_config
+from ...utils.config import config_update, load_config
 from ...utils.constants import PROCESS_TERMINATION_TIMEOUT, PROCESS_WAIT_TIMEOUT, WORKER_CHECK_INTERVAL
 from ...utils.logging import debug_log, log
 from ...utils.network import get_server_port
@@ -285,7 +285,14 @@ class ProcessLifecycle:
                     return False, "Worker already stopped"
                 # Kill through the handle just verified: psutil refuses to signal it
                 # (or list its children) once the PID belongs to another process.
-                if self._kill_process_tree(pid, expected_create_time=verified.create_time(), handle=verified):
+                try:
+                    verified_create_time = verified.create_time()
+                except psutil.NoSuchProcess:
+                    # It exited between verification and now: already stopped.
+                    debug_log(f"[Distributed] Worker {worker_id} (PID: {pid}) exited before it could be stopped")
+                    self._drop_process(worker_id)
+                    return False, "Worker already stopped"
+                if self._kill_process_tree(pid, expected_create_time=verified_create_time, handle=verified):
                     del self._manager.processes[worker_id]
                     self._manager.save_processes()
                     debug_log(f"Successfully stopped worker {worker_id} and all child processes")
@@ -349,9 +356,7 @@ class ProcessLifecycle:
             except Exception as exc:
                 log(f"[Distributed] Error stopping worker {worker_id}: {exc}")
 
-        config = load_config()
-        config["managed_processes"] = {}
-        save_config(config)
+        config_update(lambda config: config.__setitem__("managed_processes", {}))
 
     def _is_process_running(self, pid):
         """Check if a process with given PID is running."""

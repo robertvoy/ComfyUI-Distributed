@@ -415,8 +415,10 @@ export async function stopWorker(extension, workerId) {
         }
 
         if (stopBtn) {
-            setButtonClass(stopBtn, "btn--error");
-            stopBtn.textContent = alreadyStopped || notManaged ? "Not Running" : "Error";
+            // Nothing is wrong when the worker is simply not running: no red error style.
+            const notRunning = alreadyStopped || notManaged;
+            setButtonClass(stopBtn, notRunning ? null : "btn--error");
+            stopBtn.textContent = notRunning ? "Not Running" : "Error";
             setTimeout(() => {
                 updateWorkerControls(extension, workerId);
             }, TIMEOUTS.FLASH_MEDIUM);
