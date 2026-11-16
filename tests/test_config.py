@@ -354,8 +354,33 @@ class SaveConfigConcurrencyTests(unittest.TestCase):
 
         with patch.object(config.os, "chmod", _recording_chmod):
             self.assertTrue(config.save_config(self._config_for("new", 0)))
-        self.assertEqual(modes, [config._NEW_FILE_MODE])
-        self.assertEqual(config._NEW_FILE_MODE, 0o666 & ~config._read_umask())
+        self.assertEqual(modes, [config._get_new_file_mode()])
+        self.assertEqual(config._get_new_file_mode(), 0o666 & ~config._read_umask())
+
+    def test_umask_is_read_lazily_and_only_once(self):
+        # Reading the umask means briefly setting it for the whole process, so it
+        # must not happen at import, nor when saving over an existing file.
+        calls = []
+
+        def _fake_read_umask():
+            calls.append(1)
+            return 0o022
+
+        with patch.object(config, "_new_file_mode", None), \
+             patch.object(config, "_read_umask", _fake_read_umask):
+            self.assertEqual(calls, [])
+            self.assertTrue(config.save_config(self._config_for("lazy", 0)))
+            self.assertEqual(calls, [1])
+            os.unlink(self.path)
+            self.assertTrue(config.save_config(self._config_for("lazy", 1)))
+            self.assertEqual(calls, [1])
+            self.assertEqual(config._get_new_file_mode(), 0o666 & ~0o022)
+
+    def test_overwriting_an_existing_file_never_reads_the_umask(self):
+        self.assertTrue(config.save_config(self._config_for("first", 0)))
+        with patch.object(config, "_new_file_mode", None), \
+             patch.object(config, "_read_umask", side_effect=AssertionError("umask read")):
+            self.assertTrue(config.save_config(self._config_for("second", 0)))
 
     def test_persistent_sharing_violation_gives_up_quickly(self):
         # Saves run on the event loop thread under the config lock; a file held
@@ -491,6 +516,61 @@ class IsMasterDelegateOnlyTests(unittest.TestCase):
 
         with patch.object(config, "load_config", side_effect=RuntimeError("boom")):
             self.assertFalse(config.is_master_delegate_only())
+
+
+class ConfigUpdateTests(unittest.IsolatedAsyncioTestCase):
+    """config_update is the sync transaction: a late save cannot undo a committed one."""
+
+    async def asyncSetUp(self):
+        config.invalidate_config_cache()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.path = os.path.join(self._tmpdir.name, "config.json")
+        patcher = patch.object(config, "CONFIG_FILE", self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(config.invalidate_config_cache)
+
+    def _read(self):
+        with open(self.path, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    async def test_applies_the_change_and_saves_it(self):
+        self.assertTrue(config.config_update(lambda cfg: cfg["master"].update(host="h1")))
+        self.assertEqual(self._read()["master"]["host"], "h1")
+
+    async def test_unchanged_config_is_not_rewritten(self):
+        self.assertTrue(config.config_update(lambda cfg: cfg["master"].update(host="h1")))
+        with patch.object(config, "save_config", side_effect=AssertionError("saved")):
+            self.assertTrue(config.config_update(lambda cfg: cfg["master"].update(host="h1")))
+
+    async def test_failed_save_restores_the_cached_config(self):
+        self.assertTrue(config.config_update(lambda cfg: cfg["master"].update(host="h1")))
+        with patch.object(config, "save_config", return_value=False):
+            self.assertFalse(config.config_update(lambda cfg: cfg["master"].update(host="lost")))
+        self.assertEqual(config.load_config()["master"]["host"], "h1")
+
+    async def test_update_from_a_thread_waits_for_an_open_transaction(self):
+        import asyncio
+        import threading
+
+        results = []
+        thread = threading.Thread(
+            target=lambda: results.append(
+                config.config_update(lambda cfg: cfg["settings"].update(debug=True))
+            )
+        )
+        async with config.config_transaction() as cfg:
+            thread.start()
+            await asyncio.sleep(0.3)
+            self.assertEqual(results, [], "the update ran inside the transaction")
+            cfg["master"]["host"] = "from-transaction"
+        await asyncio.to_thread(thread.join, 10)
+        self.assertEqual(results, [True])
+        saved = self._read()
+        # The update was applied on top of the committed transaction, not over it.
+        self.assertEqual(saved["master"]["host"], "from-transaction")
+        self.assertTrue(saved["settings"]["debug"])
 
 
 if __name__ == "__main__":

@@ -317,6 +317,52 @@ class WorkerPidIdentityTests(unittest.TestCase):
         self.assertTrue(manager.stop_worker("w1")[0])
         process.wait(timeout=10)
 
+    def test_process_that_exits_after_verification_counts_as_already_stopped(self):
+        child, create_time = self._spawn()
+        manager = manager_module.WorkerProcessManager()
+        manager.processes["w1"] = self._restored(child, create_time)
+        verified = MagicMock()
+        verified.create_time.side_effect = psutil.NoSuchProcess(child.pid)
+        with patch.object(lifecycle_module.ProcessLifecycle, "_open_restored_process", return_value=verified):
+            success, message = manager.stop_worker("w1")
+        self.assertFalse(success)
+        self.assertEqual(message, "Worker already stopped")
+        self.assertNotIn("w1", manager.processes)
+        self.assertIsNone(child.poll(), "nothing should be killed")
+
+    def test_save_processes_cannot_undo_a_committed_transaction(self):
+        import asyncio
+        import threading
+
+        child, create_time = self._spawn()
+        self._save_managed({})
+        manager = manager_module.WorkerProcessManager()
+        manager.processes["w1"] = self._restored(child, create_time)
+        thread = threading.Thread(target=manager.save_processes)
+
+        async def scenario():
+            async with config_module.config_transaction() as cfg:
+                thread.start()
+                await asyncio.sleep(0.3)
+                self.assertEqual(self._saved_managed(), {}, "saved inside the transaction")
+                cfg["master"]["host"] = "from-transaction"
+            await asyncio.to_thread(thread.join, 10)
+
+        asyncio.run(scenario())
+        with open(self.config_path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["master"]["host"], "from-transaction")
+        self.assertIn("w1", saved["managed_processes"])
+
+    def test_cleanup_all_clears_managed_processes_under_the_lock(self):
+        self._save_managed({"w1": self._entry(424242, 1.0)})
+        manager = manager_module.WorkerProcessManager()
+        manager.processes.clear()
+        with patch.object(lifecycle_module, "config_update", wraps=lifecycle_module.config_update) as update:
+            manager.cleanup_all()
+        update.assert_called_once()
+        self.assertEqual(self._saved_managed(), {})
+
 
 if __name__ == "__main__":
     unittest.main()

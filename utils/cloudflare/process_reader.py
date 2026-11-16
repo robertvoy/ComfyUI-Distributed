@@ -55,7 +55,10 @@ class ProcessReader:
             if match and not self._public_url:
                 self._public_url = match.group(1).rstrip("/")
                 if url_event and loop:
-                    loop.call_soon_threadsafe(url_event.set)
+                    try:
+                        loop.call_soon_threadsafe(url_event.set)
+                    except RuntimeError:
+                        pass  # The loop is already closed (shutdown).
 
             if "error" in line.lower() and not self._last_error:
                 self._last_error = line

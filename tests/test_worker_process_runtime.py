@@ -52,6 +52,7 @@ def _load_process_module(module_filename: str):
     config_module = types.ModuleType(f"{package_name}.utils.config")
     config_module.load_config = lambda: {"workers": [], "settings": {"stop_workers_on_master_exit": False}}
     config_module.save_config = lambda _config: None
+    config_module.config_update = lambda mutate: (mutate(config_module.load_config()), True)[1]
     sys.modules[f"{package_name}.utils.config"] = config_module
     constants_module = types.ModuleType(f"{package_name}.utils.constants")
     constants_module.PROCESS_TERMINATION_TIMEOUT = 1

@@ -1,6 +1,6 @@
 """Cloudflare tunnel state persistence helpers."""
 
-from ..config import load_config, save_config
+from ..config import config_update, load_config
 from ..network import normalize_host
 
 
@@ -41,32 +41,31 @@ def persist_tunnel_state(
     pid_create_time=_UNSET,
     pid_start_id=_UNSET,
 ):
-    cfg = load_config()
-    tunnel_cfg = _get_tunnel_config(cfg)
+    def apply(cfg):
+        tunnel_cfg = _get_tunnel_config(cfg)
+        if status is not None:
+            tunnel_cfg["status"] = status
+        if public_url is not None:
+            tunnel_cfg["public_url"] = public_url
+        if pid is not _UNSET:
+            tunnel_cfg["pid"] = pid
+            if pid is None:
+                # A cleared PID must not keep the identity of the old process.
+                tunnel_cfg["pid_create_time"] = None
+                tunnel_cfg["pid_start_id"] = None
+        if pid_create_time is not _UNSET:
+            tunnel_cfg["pid_create_time"] = pid_create_time
+        if pid_start_id is not _UNSET:
+            tunnel_cfg["pid_start_id"] = pid_start_id
+        if log_file is not None:
+            tunnel_cfg["log_file"] = log_file
+        if previous_host is not None:
+            tunnel_cfg["previous_master_host"] = previous_host
+        if master_host is not None:
+            cfg.setdefault("master", {})["host"] = master_host
+        cfg["tunnel"] = tunnel_cfg
 
-    if status is not None:
-        tunnel_cfg["status"] = status
-    if public_url is not None:
-        tunnel_cfg["public_url"] = public_url
-    if pid is not _UNSET:
-        tunnel_cfg["pid"] = pid
-        if pid is None:
-            # A cleared PID must not keep the identity of the old process.
-            tunnel_cfg["pid_create_time"] = None
-            tunnel_cfg["pid_start_id"] = None
-    if pid_create_time is not _UNSET:
-        tunnel_cfg["pid_create_time"] = pid_create_time
-    if pid_start_id is not _UNSET:
-        tunnel_cfg["pid_start_id"] = pid_start_id
-    if log_file is not None:
-        tunnel_cfg["log_file"] = log_file
-    if previous_host is not None:
-        tunnel_cfg["previous_master_host"] = previous_host
-    if master_host is not None:
-        cfg.setdefault("master", {})["host"] = master_host
-
-    cfg["tunnel"] = tunnel_cfg
-    save_config(cfg)
+    config_update(apply)
 
 
 def clear_tunnel_state(log_file=None, previous_host=None, master_host=None):

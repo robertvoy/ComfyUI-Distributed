@@ -38,15 +38,23 @@ _REPLACE_RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.15)
 _IO_LOCK_POLL_INTERVAL = 0.005
 
 
+_new_file_mode = None
+
+
 def _read_umask():
-    # os.umask can only be read by setting it; done once, at import.
+    # os.umask can only be read by setting it, which briefly changes the whole
+    # process's umask, so this runs only when a new file is first saved, not at import.
     mask = os.umask(0)
     os.umask(mask)
     return mask
 
 
-# Permissions open() would give a newly created file.
-_NEW_FILE_MODE = 0o666 & ~_read_umask()
+def _get_new_file_mode():
+    """Permissions open() would give a newly created file (worked out once, lazily)."""
+    global _new_file_mode
+    if _new_file_mode is None:
+        _new_file_mode = 0o666 & ~_read_umask()
+    return _new_file_mode
 
 _SERVERLESS_OBSOLETE_WORKER_FIELDS = {"host", "port", "listen_port", "cuda_device", "extra_args"}
 
@@ -207,7 +215,7 @@ def _write_config_file(path, saved_config):
         try:
             mode = stat.S_IMODE(os.stat(path).st_mode)
         except OSError:
-            mode = _NEW_FILE_MODE
+            mode = _get_new_file_mode()
         try:
             os.chmod(tmp_path, mode)
         except OSError:
@@ -232,6 +240,30 @@ def save_config(config):
         except Exception as e:
             log(f"Error saving config: {e}")
             return False
+
+
+def config_update(mutate):
+    """Load the config, apply ``mutate(config)`` and save it, all under the thread lock.
+
+    Sync counterpart of ``config_transaction`` for code on threads or in plain
+    functions: no other save can land between the load and the save, so a late
+    write cannot undo a committed transaction. ``mutate`` must be quick and must
+    not wait on another thread that loads or saves config. Returns True when the
+    config is already current or was saved; False if saving failed (the cached
+    config is restored).
+    """
+    with _config_io_lock:
+        config = load_config()
+        original_config = copy.deepcopy(config)
+        mutate(config)
+        if config == original_config:
+            return True
+        if save_config(config):
+            return True
+        if isinstance(config, dict):
+            config.clear()
+            config.update(original_config)
+        return False
 
 
 async def _acquire_config_io_lock():

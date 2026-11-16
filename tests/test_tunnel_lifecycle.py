@@ -351,5 +351,42 @@ class TunnelWorkerRefusalTests(TunnelTestCase):
         self.assertIsNone(self._tunnel_config()["pid"])
 
 
+class TunnelStateLockTests(TunnelTestCase):
+    async def test_persist_tunnel_state_cannot_undo_a_committed_transaction(self):
+        import threading
+
+        config_module.save_config(config_module.get_default_config())
+        results = []
+        thread = threading.Thread(
+            target=lambda: results.append(state_module.persist_tunnel_state(status="running"))
+        )
+        async with config_module.config_transaction() as cfg:
+            thread.start()
+            await asyncio.sleep(0.3)
+            self.assertEqual(self._tunnel_config()["status"], "stopped", "saved inside the transaction")
+            cfg["master"]["host"] = "from-transaction"
+        await asyncio.to_thread(thread.join, 10)
+        with open(self.config_path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["master"]["host"], "from-transaction")
+        self.assertEqual(saved["tunnel"]["status"], "running")
+
+
+class ProcessReaderShutdownTests(unittest.TestCase):
+    def test_closed_loop_when_the_url_appears_does_not_kill_the_reader(self):
+        reader_module = __import__(f"{_PACKAGE}.utils.cloudflare.process_reader", fromlist=["*"])
+        lines = iter(["INF https://abc-def.trycloudflare.com", "later line", ""])
+        process = types.SimpleNamespace(stdout=types.SimpleNamespace(readline=lambda: next(lines)))
+        loop = MagicMock()
+        loop.call_soon_threadsafe.side_effect = RuntimeError("Event loop is closed")
+        reader = reader_module.ProcessReader()
+        reader._process = process
+        reader._loop = loop
+        reader._url_event = MagicMock()
+        reader._reader()  # Must read to EOF without raising.
+        self.assertEqual(reader.get_url(), "https://abc-def.trycloudflare.com")
+        self.assertEqual(loop.call_soon_threadsafe.call_count, 2)  # URL, then EOF
+
+
 if __name__ == "__main__":
     unittest.main()
