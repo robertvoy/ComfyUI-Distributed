@@ -192,6 +192,28 @@ class JobTimeoutRequeueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requeued, 0)
         self.assertTrue(job_data.pending_images.empty())
 
+    async def test_invalid_stored_timeout_falls_back_to_default(self):
+        async def _offline_probe(_url, _timeout):
+            return None
+
+        jt._probe_holder["fn"] = _offline_probe
+        jt._config_holder["value"]["settings"]["worker_timeout_seconds"] = "abc"
+        prompt_server = jt._prompt_server_holder["value"]
+
+        # Default HEARTBEAT_TIMEOUT is 60s in this stub: 30s silence is fine...
+        recent = jt._ImageJobState("job-4")
+        recent.worker_status["worker-1"] = time.time() - 30.0
+        recent.assigned_to_workers["worker-1"] = [0]
+        prompt_server.distributed_pending_tile_jobs["job-4"] = recent
+        self.assertEqual(await jt._check_and_requeue_timed_out_workers("job-4", total_tasks=1), 0)
+
+        # ...while 90s of silence still times the worker out.
+        stale = jt._ImageJobState("job-5")
+        stale.worker_status["worker-1"] = time.time() - 90.0
+        stale.assigned_to_workers["worker-1"] = [0]
+        prompt_server.distributed_pending_tile_jobs["job-5"] = stale
+        self.assertEqual(await jt._check_and_requeue_timed_out_workers("job-5", total_tasks=1), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

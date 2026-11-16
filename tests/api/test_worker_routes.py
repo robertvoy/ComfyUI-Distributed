@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import shutil
 import sys
 import tempfile
 import types
@@ -55,8 +56,15 @@ class _FakeHTTPClientSession:
 
 
 class _DummyWorkerManager:
-    def __init__(self):
+    def __init__(self, log_dir=None):
         self.processes = {}
+        self.log_dir = log_dir
+
+    def get_worker_log_dir(self):
+        return self.log_dir
+
+    def _check_worker_process(self, _worker_id, _proc_info):
+        return False, False
 
     def launch_worker(self, worker):
         worker_id = str(worker["id"])
@@ -402,10 +410,12 @@ class WorkerRoutesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not found", response.payload.get("message", "").lower())
 
     async def test_worker_log_returns_content_json(self):
-        manager = _DummyWorkerManager()
-        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as handle:
+        log_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, log_dir, True)
+        manager = _DummyWorkerManager(log_dir=log_dir)
+        log_path = os.path.join(log_dir, "Worker_A_20260101.log")
+        with open(log_path, "w", encoding="utf-8") as handle:
             handle.write("line-1\nline-2\nline-3\n")
-            log_path = handle.name
 
         manager.processes["worker-a"] = {
             "pid": 9999,
@@ -414,14 +424,10 @@ class WorkerRoutesTests(unittest.IsolatedAsyncioTestCase):
         }
 
         request = _FakeRequest(match_info={"worker_id": "worker-a"}, query={"lines": "2"})
-        try:
-            with patch.object(worker_routes, "get_worker_manager", return_value=manager), patch.object(
-                worker_routes.asyncio, "get_running_loop", return_value=_ImmediateLoop()
-            ):
-                response = await worker_routes.get_worker_log_endpoint(request)
-        finally:
-            if os.path.exists(log_path):
-                os.remove(log_path)
+        with patch.object(worker_routes, "get_worker_manager", return_value=manager), patch.object(
+            worker_routes.asyncio, "get_running_loop", return_value=_ImmediateLoop()
+        ):
+            response = await worker_routes.get_worker_log_endpoint(request)
 
         self.assertEqual(response.status, 200)
         self.assertEqual(response.payload.get("status"), "success")
@@ -503,3 +509,145 @@ class WorkerRoutesTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkerLogAndLaunchSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def _log_dir(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        log_dir = os.path.join(root, "logs", "workers")
+        os.makedirs(log_dir)
+        return root, log_dir
+
+    async def _read_log(self, manager, lines="1000"):
+        request = _FakeRequest(match_info={"worker_id": "worker-a"}, query={"lines": lines})
+        with patch.object(worker_routes, "get_worker_manager", return_value=manager), patch.object(
+            worker_routes.asyncio, "get_running_loop", return_value=_ImmediateLoop()
+        ):
+            return await worker_routes.get_worker_log_endpoint(request)
+
+    async def test_worker_log_refuses_files_outside_the_worker_log_directory(self):
+        root, log_dir = self._log_dir()
+        secret = os.path.join(root, "secret.txt")
+        with open(secret, "w", encoding="utf-8") as handle:
+            handle.write("top secret\n")
+        for path in (secret, os.path.join(log_dir, "..", "..", "secret.txt"), log_dir):
+            with self.subTest(path=path):
+                manager = _DummyWorkerManager(log_dir=log_dir)
+                manager.processes["worker-a"] = {"pid": 1, "log_file": path, "process": None}
+                response = await self._read_log(manager)
+                self.assertEqual(response.status, 403)
+                self.assertNotIn("top secret", str(response.payload))
+
+    async def test_worker_log_without_a_known_log_directory_is_refused(self):
+        _root, log_dir = self._log_dir()
+        log_path = os.path.join(log_dir, "w.log")
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write("line\n")
+        manager = _DummyWorkerManager(log_dir=None)
+        manager.processes["worker-a"] = {"pid": 1, "log_file": log_path, "process": None}
+        self.assertEqual((await self._read_log(manager)).status, 403)
+
+    async def test_large_log_tail_with_multibyte_text_has_no_duplicate_lines(self):
+        _root, log_dir = self._log_dir()
+        log_path = os.path.join(log_dir, "w.log")
+        with open(log_path, "w", encoding="utf-8") as handle:
+            for index in range(30000):
+                handle.write(f"line {index:06d} " + "\u2588" * 20 + "\n")
+        self.assertGreater(os.path.getsize(log_path), 1024 * 1024)
+        manager = _DummyWorkerManager(log_dir=log_dir)
+        manager.processes["worker-a"] = {"pid": 1, "log_file": log_path, "process": None}
+        response = await self._read_log(manager, lines="300")
+        self.assertEqual(response.status, 200)
+        lines = response.payload["content"].split("\n")
+        expected = [f"line {index:06d} " + "\u2588" * 20 for index in range(29700, 30000)]
+        self.assertEqual(lines, expected)
+        self.assertTrue(response.payload["truncated"])
+
+    def _read_tail_counting_bytes(self, log_path, lines):
+        real_open = open
+        read_bytes = [0]
+
+        class _Counting:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.handle.close()
+
+            def read(self, size=-1):
+                data = self.handle.read(size)
+                read_bytes[0] += len(data)
+                return data
+
+            def __getattr__(self, name):
+                return getattr(self.handle, name)
+
+        with patch.object(worker_routes, "open", lambda *a, **k: _Counting(real_open(*a, **k)), create=True):
+            result = worker_routes._read_worker_log_sync(log_path, lines)
+        return result, read_bytes[0]
+
+    def test_large_log_of_progress_bar_updates_reads_only_its_tail(self):
+        # tqdm separates updates with a bare \r; each one is a line, as before.
+        _root, log_dir = self._log_dir()
+        log_path = os.path.join(log_dir, "w.log")
+        with open(log_path, "wb") as handle:
+            handle.write(b"".join(b"\r step %06d/100000 |#####     |" % index for index in range(60000)))
+            handle.write(b"\r\ndone\r\n")
+        self.assertGreater(os.path.getsize(log_path), 1024 * 1024)
+        result, read_bytes = self._read_tail_counting_bytes(log_path, 300)
+        lines = result["content"].split("\n")
+        self.assertEqual(len(lines), 300)
+        self.assertEqual(lines[-1], "done")
+        self.assertEqual(lines[-2], " step 059999/100000 |#####     |")
+        self.assertTrue(result["truncated"])
+        self.assertLess(read_bytes, 64 * 1024, "the whole log was read")
+
+    def test_large_log_without_line_breaks_reads_a_bounded_tail(self):
+        _root, log_dir = self._log_dir()
+        log_path = os.path.join(log_dir, "w.log")
+        with open(log_path, "wb") as handle:
+            handle.write(b"x" * (3 * 1024 * 1024))
+        with patch.object(worker_routes, "MAX_LOG_TAIL_BYTES", 256 * 1024):
+            result, read_bytes = self._read_tail_counting_bytes(log_path, 300)
+        self.assertLessEqual(read_bytes, 256 * 1024 + worker_routes.CHUNK_SIZE)
+        self.assertTrue(result["truncated"])
+
+    async def test_launch_is_not_blocked_by_a_reused_pid_of_a_restored_worker(self):
+        manager = _DummyWorkerManager()
+        manager.processes["worker-a"] = {"pid": 4242, "process": None, "log_file": None}
+        config = {"workers": [{"id": "worker-a", "name": "Worker A", "port": 8188}]}
+        # The PID exists (reused by another program) but is not the launched worker.
+        with patch.object(manager, "_is_process_running", return_value=True), \
+             patch.object(manager, "_check_worker_process", return_value=(False, False)), \
+             patch.object(worker_routes, "get_worker_manager", return_value=manager), \
+             patch.object(worker_routes, "load_config", return_value=config), \
+             patch.object(worker_routes.asyncio, "get_running_loop", return_value=_ImmediateLoop()):
+            response = await worker_routes.launch_worker_endpoint(_FakeRequest({"worker_id": "worker-a"}))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.payload.get("pid"), 12345)
+
+    async def test_worker_websocket_accepts_prompts_up_to_comfyui_upload_limit(self):
+        created = []
+
+        class _Socket:
+            async def prepare(self, _request):
+                return None
+
+            def __aiter__(self):
+                async def _messages():
+                    if False:
+                        yield None
+                return _messages()
+
+        def _websocket_response(**kwargs):
+            created.append(kwargs)
+            return _Socket()
+
+        with patch.object(worker_routes, "web", types.SimpleNamespace(WebSocketResponse=_websocket_response)):
+            await worker_routes.worker_ws_endpoint(_FakeRequest())
+        self.assertEqual(created[0].get("max_msg_size"), 100 * 1024 * 1024)
+        self.assertEqual(created[0].get("heartbeat"), 30)

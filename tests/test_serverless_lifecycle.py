@@ -196,3 +196,29 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         records = self.manager.public_jobs("pool")
         self.assertEqual({record["record_id"] for record in records}, {str(index) for index in range(22)})
         self.assertTrue(all(record["status"] == "UNKNOWN" for record in records))
+
+
+class GlobalCapacityTests(unittest.IsolatedAsyncioTestCase):
+    """The documented 64-job limit also counts jobs retained in the journal."""
+
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        server = types.SimpleNamespace(distributed_pending_jobs={}, distributed_jobs_lock=asyncio.Lock())
+        self.manager = runtime.ServerlessManager(server, Secrets(), Path(self.temp.name) / "jobs.json",
+                                                 AsyncMock(return_value=object()))
+
+    def retain(self, count, status="CANCEL_REQUESTED"):
+        for index in range(count):
+            self.manager.ledger.update(f"old-{index}", worker_id=f"pool-{index % 4}", endpoint_id="ep",
+                                       job_id=f"job-{index}", status=status, created_at=1, updated_at=1)
+
+    async def test_retained_unresolved_jobs_count_toward_the_global_limit(self):
+        self.retain(60)
+        self.manager.ensure_capacity(4)
+        with self.assertRaisesRegex(ValueError, "limit 64"):
+            self.manager.ensure_capacity(5)
+
+    async def test_finished_jobs_do_not_hold_global_capacity(self):
+        self.retain(60, status="COMPLETED")
+        self.manager.ensure_capacity(64)

@@ -8,7 +8,7 @@ import platform
 
 import server
 
-from ..utils.config import load_config, save_config
+from ..utils.config import load_config
 from ..utils.logging import debug_log, log
 from ..utils.network import normalize_host
 from ..utils.cloudflare import cloudflare_tunnel_manager
@@ -24,12 +24,12 @@ def auto_launch_workers():
         if config.get('settings', {}).get('auto_launch_workers', False):
             log("Auto-launch workers is enabled, checking for workers to start...")
             
-            # Clear managed_processes before launching new workers
-            # This handles cases where the master was killed without proper cleanup
+            # Drop stale managed_processes before launching new workers (the master
+            # may have been killed without cleanup). Only entries whose PID is
+            # verified to still be the launched worker survive this rewrite.
             if config.get('managed_processes'):
-                log("Clearing old managed_processes before auto-launch...")
-                config['managed_processes'] = {}
-                save_config(config)
+                log("Pruning stale managed_processes before auto-launch...")
+                wm.save_processes()
             
             workers = config.get('workers', [])
             launched_count = 0
@@ -47,12 +47,14 @@ def auto_launch_workers():
                         debug_log(f"Skipping remote worker {worker_name} (host: {host})")
                         continue
                     
-                    # Check if already running
+                    # Check if already running (a reused PID does not count as ours)
                     if str(worker_id) in wm.processes:
                         proc_info = wm.processes[str(worker_id)]
-                        if wm._is_process_running(proc_info['pid']):
+                        is_running, _ = wm._check_worker_process(str(worker_id), proc_info)
+                        if is_running:
                             debug_log(f"Worker {worker_name} already running, skipping")
                             continue
+                        wm.processes.pop(str(worker_id), None)
                     
                     # Launch the worker
                     try:

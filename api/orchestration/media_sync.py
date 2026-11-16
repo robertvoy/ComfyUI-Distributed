@@ -72,8 +72,19 @@ def convert_paths_for_platform(obj, target_separator):
     return _convert(obj)
 
 
+def _is_absolute_media_path(reference):
+    """True for a normalized (forward-slash) absolute path: /x, //host/x or C:/x."""
+    return reference.startswith("/") or bool(re.match(r"^[A-Za-z]:/", reference))
+
+
 def _find_media_references(prompt_obj):
-    """Find media file references in image/video/audio/file inputs used by worker prompts."""
+    """Find media file references in image/video/audio/file inputs used by worker prompts.
+
+    Absolute paths are left out: ComfyUI's upload endpoint cannot place a file
+    at an absolute path, and the worker's check_file only answers for its own
+    input/output/temp folders. Such a path is passed to the worker unchanged,
+    so it works when the worker has the file at the same path.
+    """
     media_refs = set()
     for node in prompt_obj.values():
         if not isinstance(node, dict):
@@ -81,7 +92,7 @@ def _find_media_references(prompt_obj):
         inputs = node.get("inputs", {})
         for key in ("image", "video", "audio", "file"):
             cleaned = _normalize_media_reference(inputs.get(key))
-            if cleaned:
+            if cleaned and not _is_absolute_media_path(cleaned):
                 media_refs.add(cleaned)
     return sorted(media_refs)
 
@@ -211,10 +222,13 @@ async def _upload_media_to_worker(worker, filename, file_bytes, file_hash, mime_
     form.add_field("overwrite", "true")
 
     upload_url = build_worker_url(worker, "/upload/image")
+    # A fixed 30 s budget made large videos fail on every run over slower
+    # links (tunnels). Allow at least ~1 MB/s on top of the base budget.
+    upload_timeout = 30 + len(file_bytes) / 1_000_000
     async with session.post(
         upload_url,
         data=form,
-        timeout=aiohttp.ClientTimeout(total=30),
+        timeout=aiohttp.ClientTimeout(total=upload_timeout),
     ) as resp:
         resp.raise_for_status()
         try:

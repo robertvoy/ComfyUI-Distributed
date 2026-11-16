@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -224,6 +225,209 @@ class SaveConfigTests(unittest.TestCase):
             with open(tmp_path, encoding="utf-8") as fh:
                 parsed = json.load(fh)
         self.assertEqual(parsed["master"], data["master"])
+
+
+class _SharingViolation(PermissionError):
+    """PermissionError carrying Windows ERROR_SHARING_VIOLATION on any platform."""
+
+    winerror = 32
+
+
+class SaveConfigConcurrencyTests(unittest.TestCase):
+    """Concurrent saves must never leave a corrupt or partially written config."""
+
+    WRITERS = 4
+    SAVES_PER_WRITER = 40
+
+    def setUp(self):
+        config.invalidate_config_cache()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.path = os.path.join(self._tmpdir.name, "config.json")
+        patcher = patch.object(config, "CONFIG_FILE", self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(config.invalidate_config_cache)
+
+    @staticmethod
+    def _config_for(writer, index):
+        data = config.get_default_config()
+        data["master"]["host"] = f"writer-{writer}-save-{index}"
+        data["workers"] = [{"id": f"w{writer}-{n}", "name": "x" * 200} for n in range(20)]
+        return data
+
+    def test_concurrent_saves_always_leave_parseable_config(self):
+        import threading
+
+        initial = self._config_for("initial", 0)
+        self.assertTrue(config.save_config(initial))
+        written_hosts = {initial["master"]["host"]}
+        written = {initial["master"]["host"]: initial}
+        for writer in range(self.WRITERS):
+            for index in range(self.SAVES_PER_WRITER):
+                cfg = self._config_for(writer, index)
+                written_hosts.add(cfg["master"]["host"])
+                written[cfg["master"]["host"]] = cfg
+
+        stop = threading.Event()
+        save_results = []
+        corrupt_reads = []
+        bad_loads = []
+        errors = []
+
+        def _writer(writer):
+            try:
+                for index in range(self.SAVES_PER_WRITER):
+                    save_results.append(config.save_config(self._config_for(writer, index)))
+            except Exception as exc:  # pragma: no cover - surfaced by the assertion below
+                errors.append(exc)
+
+        def _raw_reader():
+            # Simulates another process (e.g. a worker) reading the shared file.
+            while not stop.is_set():
+                try:
+                    with open(self.path, encoding="utf-8") as fh:
+                        text = fh.read()
+                except OSError:
+                    continue
+                try:
+                    json.loads(text)
+                except ValueError:
+                    corrupt_reads.append(text[:80])
+                time.sleep(0.001)
+
+        def _cached_reader():
+            while not stop.is_set():
+                host = config.load_config().get("master", {}).get("host")
+                if host not in written_hosts:
+                    bad_loads.append(host)
+                time.sleep(0.001)
+
+        writers = [threading.Thread(target=_writer, args=(w,)) for w in range(self.WRITERS)]
+        readers = [threading.Thread(target=_raw_reader), threading.Thread(target=_cached_reader)]
+        for thread in readers + writers:
+            thread.start()
+        for thread in writers:
+            thread.join(timeout=120)
+        stop.set()
+        for thread in readers:
+            thread.join(timeout=10)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(save_results), self.WRITERS * self.SAVES_PER_WRITER)
+        self.assertTrue(all(save_results), f"{save_results.count(False)} saves failed")
+        self.assertEqual(corrupt_reads, [])
+        self.assertEqual(bad_loads, [], "load_config fell back to defaults or a foreign config")
+
+        with open(self.path, encoding="utf-8") as fh:
+            final = json.load(fh)
+        self.assertIn(final["master"]["host"], written)
+        self.assertEqual(final, written[final["master"]["host"]])
+        self.assertEqual(os.listdir(self._tmpdir.name), ["config.json"], "temp files leaked")
+
+    def test_replace_retries_transient_sharing_violation(self):
+        real_replace = os.replace
+        attempts = {"count": 0}
+
+        def _flaky_replace(src, dst):
+            attempts["count"] += 1
+            if attempts["count"] <= 2:
+                raise _SharingViolation(13, "file in use by another process")
+            return real_replace(src, dst)
+
+        data = self._config_for("retry", 0)
+        with patch.object(config.os, "replace", _flaky_replace):
+            self.assertTrue(config.save_config(data))
+
+        self.assertEqual(attempts["count"], 3)
+        with open(self.path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["master"]["host"], "writer-retry-save-0")
+        self.assertEqual(os.listdir(self._tmpdir.name), ["config.json"])
+
+    def test_new_config_file_gets_default_permissions_not_owner_only(self):
+        modes = []
+        real_chmod = os.chmod
+
+        def _recording_chmod(path, mode):
+            modes.append(mode)
+            return real_chmod(path, mode)
+
+        with patch.object(config.os, "chmod", _recording_chmod):
+            self.assertTrue(config.save_config(self._config_for("new", 0)))
+        self.assertEqual(modes, [config._NEW_FILE_MODE])
+        self.assertEqual(config._NEW_FILE_MODE, 0o666 & ~config._read_umask())
+
+    def test_persistent_sharing_violation_gives_up_quickly(self):
+        # Saves run on the event loop thread under the config lock; a file held
+        # open by another process must not stall the server for long.
+        sleeps = []
+
+        def _always_locked(src, dst):
+            raise _SharingViolation(13, "file in use by another process")
+
+        data = self._config_for("locked", 0)
+        with patch.object(config.os, "replace", _always_locked),                 patch.object(config.time, "sleep", sleeps.append):
+            self.assertFalse(config.save_config(data))
+
+        self.assertTrue(sleeps, "no retry was attempted")
+        self.assertLessEqual(sum(sleeps), 0.5)
+        self.assertEqual(os.listdir(self._tmpdir.name), [], "temp file leaked")
+
+    def test_non_transient_replace_error_fails_without_leaking_temp_file(self):
+        def _denied(_src, _dst):
+            raise PermissionError(13, "permission denied")
+
+        with patch.object(config.os, "replace", _denied):
+            self.assertFalse(config.save_config(self._config_for("denied", 0)))
+
+        self.assertEqual(os.listdir(self._tmpdir.name), [])
+
+
+class ConfigTransactionSerialisationTests(unittest.IsolatedAsyncioTestCase):
+    """A thread's save must not land between a transaction's load and save."""
+
+    async def asyncSetUp(self):
+        config.invalidate_config_cache()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.path = os.path.join(self._tmpdir.name, "config.json")
+        patcher = patch.object(config, "CONFIG_FILE", self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(config.invalidate_config_cache)
+
+    def _read_host(self):
+        with open(self.path, encoding="utf-8") as fh:
+            return json.load(fh)["master"]["host"]
+
+    async def test_thread_save_waits_for_open_transaction(self):
+        import asyncio
+        import threading
+
+        initial = config.get_default_config()
+        initial["master"]["host"] = "initial"
+        self.assertTrue(config.save_config(initial))
+
+        thread_cfg = config.get_default_config()
+        thread_cfg["master"]["host"] = "from-thread"
+        thread_result = []
+        thread = threading.Thread(target=lambda: thread_result.append(config.save_config(thread_cfg)))
+
+        async with config.config_transaction() as cfg:
+            thread.start()
+            # Give the thread ample time to save if nothing stops it.
+            await asyncio.sleep(0.3)
+            host_during_transaction = self._read_host()
+            thread_saved_during_transaction = bool(thread_result)
+            cfg["master"]["host"] = "from-transaction"
+
+        await asyncio.to_thread(thread.join, 10)
+
+        self.assertEqual(host_during_transaction, "initial")
+        self.assertFalse(thread_saved_during_transaction)
+        self.assertEqual(thread_result, [True])
+        # The transaction committed first; the waiting thread's save follows it.
+        self.assertEqual(self._read_host(), "from-thread")
 
 
 # ---------------------------------------------------------------------------

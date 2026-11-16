@@ -38,7 +38,8 @@ const cardConfigs = {
             if (!participationEnabled && fallbackActive) {
                 delegateBadge = `<br><span class="dist-worker-info__fallback">Fallback active • Master executing</span>`;
             }
-            return `<span class="dist-worker-info__title" id="master-name-display">${data?.name || extension.config?.master?.name || "Master"}</span><br><span class="dist-worker-info__meta"><span id="master-cuda-info">${cudaInfo}Port ${port}</span></span>${delegateBadge}`;
+            const masterName = escapeWorkerInfo(data?.name || extension.config?.master?.name || "Master");
+            return `<span class="dist-worker-info__title" id="master-name-display">${masterName}</span><br><span class="dist-worker-info__meta"><span id="master-cuda-info">${escapeWorkerInfo(cudaInfo)}Port ${escapeWorkerInfo(port)}</span></span>${delegateBadge}`;
         },
         controls: { 
             type: 'master'
@@ -72,17 +73,20 @@ const cardConfigs = {
                 return `<span class="dist-worker-info__title">${escapeWorkerInfo(data.name)}</span>`;
             }
 
+            // Names and hosts are user-entered config values; escape them so a
+            // name such as "RTX <4090>" or "A & B" renders as typed.
+            const name = escapeWorkerInfo(data.name);
             if (isCloud) {
                 // For cloud workers, don't show port (it's always 443)
-                return `<span class="dist-worker-info__title">${data.name}</span><br><span class="dist-worker-info__meta">${data.host}</span>`;
+                return `<span class="dist-worker-info__title">${name}</span><br><span class="dist-worker-info__meta">${escapeWorkerInfo(data.host)}</span>`;
             } else if (isRemote) {
                 const hostLabel = data.host
                     ? `${data.host}:${data.port}`
                     : `Unconfigured remote worker • Port ${data.port}`;
-                return `<span class="dist-worker-info__title">${data.name}</span><br><span class="dist-worker-info__meta">${hostLabel}</span>`;
+                return `<span class="dist-worker-info__title">${name}</span><br><span class="dist-worker-info__meta">${escapeWorkerInfo(hostLabel)}</span>`;
             } else {
                 const cudaInfo = data.cuda_device !== undefined ? `CUDA ${data.cuda_device} • ` : '';
-                return `<span class="dist-worker-info__title">${data.name}</span><br><span class="dist-worker-info__meta">${cudaInfo}Port ${data.port}</span>`;
+                return `<span class="dist-worker-info__title">${name}</span><br><span class="dist-worker-info__meta">${escapeWorkerInfo(cudaInfo)}Port ${escapeWorkerInfo(data.port)}</span>`;
             }
         },
         controls: { 

@@ -9,6 +9,7 @@ from ...utils.network import build_worker_url, get_client_session, probe_worker
 # Must match image_list.runtime.PROTOCOL_VERSION (kept local so this module
 # stays importable without the image-list runtime; a test pins them equal).
 IMAGE_LIST_PROTOCOL_VERSION = 2
+WS_PROBE_TIMEOUT_SECONDS = 3.0
 try:
     from ...utils.trace_logger import trace_debug, trace_info
 except ImportError:
@@ -51,8 +52,12 @@ async def worker_ws_is_active(worker):
     session = await get_client_session()
     url = build_worker_url(worker, "/distributed/worker_ws")
     try:
-        ws = await session.ws_connect(url, heartbeat=20, timeout=3)
-        await ws.close()
+        # ws_connect's own timeout only covers closing; connecting falls back
+        # to the session defaults (30 s connect, 300 s total), which would stall
+        # worker selection on an unreachable host. Bound the whole probe.
+        async with asyncio.timeout(WS_PROBE_TIMEOUT_SECONDS):
+            ws = await session.ws_connect(url, heartbeat=20)
+            await ws.close()
         return True
     except asyncio.TimeoutError:
         debug_log(f"[Distributed] Worker WS probe timed out: {url}")
@@ -121,6 +126,13 @@ async def _dispatch_via_websocket(worker_url, payload, client_id, timeout=60.0):
                             error_text = f"{error_text} | node_errors={node_errors}"
                         raise RuntimeError(error_text)
                 elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                    if msg.type == aiohttp.WSMsgType.CLOSE and msg.data == aiohttp.WSCloseCode.MESSAGE_TOO_BIG:
+                        # The worker refused the frame while reading it, before
+                        # any handler ran: a definite rejection, not ambiguous.
+                        raise RuntimeError(
+                            "Worker rejected the websocket dispatch: prompt message exceeds the worker's "
+                            "websocket size limit (close code 1009); nothing was queued"
+                        )
                     raise AmbiguousDispatchError(f"Worker websocket closed before acknowledgement: {msg.type}; submission status is ambiguous")
     except asyncio.TimeoutError as exc:
         raise AmbiguousDispatchError(
@@ -216,11 +228,14 @@ async def dispatch_worker_prompt(
 
 
 async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0, *,
-                                       required_transfer_formats=(), require_value_results=False):
+                                       required_transfer_formats=(), require_value_results=False,
+                                       include_busy=False):
     """Require protocol/node support and report which direct workers are idle.
 
     This performs read-only GETs only; it never submits a prompt or contacts a
     serverless provider. Unsupported worker releases fail before master inputs run.
+    With ``include_busy`` the result also lists compatible workers that are busy
+    (value False), for callers that only need to recheck the return contract.
     """
     if not workers:
         raise RuntimeError("Distributed Image List requires at least one selected direct worker")
@@ -323,6 +338,8 @@ async def preflight_image_list_workers(workers, require_idle=True, timeout=3.0, 
     }
     if require_idle and not idle_workers:
         raise RuntimeError("No selected feature-compatible direct worker is idle; unrelated worker prompts were left untouched")
+    if include_busy:
+        return {worker_id: idle for worker_id, idle in statuses if idle is not None}
     return idle_workers
 
 

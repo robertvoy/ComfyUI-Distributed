@@ -106,6 +106,29 @@ describe("Distributed Value internal widget visibility", () => {
         expect(h.node.widgets[3].label).toBe("Renamed B");
     });
 
+    it("keeps a disabled worker's saved value so re-enabling it restores the value", async () => {
+        const h = setup({ connected: true, targetType: "INT" });
+        await h.extension.nodeCreated(h.node);
+        h.node.widgets.find(w => w.name === "_dv_worker_1").callback(7);
+        h.node.widgets.find(w => w.name === "_dv_worker_2").callback(9);
+
+        // gpu-a is disabled: only gpu-b keeps a widget, but gpu-a's value stays saved.
+        await h.listeners.get("distributed:workers-changed")({ detail: { workers: [
+            { id: "gpu-a", name: "GPU A", enabled: false },
+            { id: "gpu-b", name: "GPU B", enabled: true },
+        ] } });
+        const stored = JSON.parse(h.raw[1].serializeValue());
+        expect(stored._by_worker_id).toEqual({ "gpu-a": "7", "gpu-b": "9" });
+        expect(stored[1]).toBe("9");
+
+        // Re-enabled, gpu-a gets its own value back rather than the default.
+        await h.listeners.get("distributed:workers-changed")({ detail: { workers: [
+            { id: "gpu-a", name: "GPU A", enabled: true },
+            { id: "gpu-b", name: "GPU B", enabled: true },
+        ] } });
+        expect(h.node.widgets.slice(3).map(w => w.value)).toEqual([7, 9]);
+    });
+
     it("hides linked backing widgets and handles absent options without altering serializers", async () => {
         const h = setup();
         delete h.raw[1].options;

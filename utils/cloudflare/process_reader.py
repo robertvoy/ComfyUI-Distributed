@@ -43,6 +43,8 @@ class ProcessReader:
             return
 
         loop = self._loop
+        # Captured once: stop() may clear self._url_event while this thread runs.
+        url_event = self._url_event
         for raw_line in iter(process.stdout.readline, ""):
             line = raw_line.strip()
             if not line:
@@ -52,16 +54,19 @@ class ProcessReader:
             match = PUBLIC_URL_PATTERN.search(line)
             if match and not self._public_url:
                 self._public_url = match.group(1).rstrip("/")
-                if self._url_event and loop:
-                    loop.call_soon_threadsafe(self._url_event.set)
+                if url_event and loop:
+                    loop.call_soon_threadsafe(url_event.set)
 
             if "error" in line.lower() and not self._last_error:
                 self._last_error = line
 
-        if self._url_event and loop:
+        if url_event and loop:
             if not self._last_error and not self._public_url:
                 self._last_error = "Cloudflare tunnel exited before becoming ready"
-            loop.call_soon_threadsafe(self._url_event.set)
+            try:
+                loop.call_soon_threadsafe(url_event.set)
+            except RuntimeError:
+                pass  # The loop is already closed (shutdown).
 
     def start(self, process, loop):
         self._process = process

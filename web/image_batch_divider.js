@@ -75,14 +75,19 @@ app.registerExtension({
                 updateOutputs();
                 return result;
             };
+
+            // ComfyUI has no extension-level "node removed" hook, so release the
+            // observer and listeners from the node's own onRemoved callback.
+            const originalOnRemoved = node.onRemoved;
+            node.onRemoved = function() {
+                if (this._batchDividerCleanup) {
+                    this._batchDividerCleanup();
+                    this._batchDividerCleanup = null;
+                }
+                return originalOnRemoved ? originalOnRemoved.call(this) : undefined;
+            };
         } catch (error) {
             console.error(`Error in ${node.comfyClass} extension:`, error);
-        }
-    },
-
-    nodeBeforeRemove(node) {
-        if (BATCH_DIVIDER_NODES[node.comfyClass] && node._batchDividerCleanup) {
-            node._batchDividerCleanup();
         }
     }
 });

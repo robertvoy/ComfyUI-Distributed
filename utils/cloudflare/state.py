@@ -19,19 +19,27 @@ def load_tunnel_state():
         "status": tunnel_cfg.get("status", "stopped"),
         "public_url": tunnel_cfg.get("public_url") or None,
         "pid": tunnel_cfg.get("pid"),
+        "pid_create_time": tunnel_cfg.get("pid_create_time"),
+        "pid_start_id": tunnel_cfg.get("pid_start_id"),
         "log_file": tunnel_cfg.get("log_file"),
         "previous_master_host": tunnel_cfg.get("previous_master_host"),
         "master_host": master_cfg.get("host"),
     }
 
 
+# Sentinel for "leave unchanged"; None is a real value for the pid fields.
+_UNSET = object()
+
+
 def persist_tunnel_state(
     status=None,
     public_url=None,
-    pid=None,
+    pid=_UNSET,
     log_file=None,
     previous_host=None,
     master_host=None,
+    pid_create_time=_UNSET,
+    pid_start_id=_UNSET,
 ):
     cfg = load_config()
     tunnel_cfg = _get_tunnel_config(cfg)
@@ -40,8 +48,16 @@ def persist_tunnel_state(
         tunnel_cfg["status"] = status
     if public_url is not None:
         tunnel_cfg["public_url"] = public_url
-    if pid is not None:
+    if pid is not _UNSET:
         tunnel_cfg["pid"] = pid
+        if pid is None:
+            # A cleared PID must not keep the identity of the old process.
+            tunnel_cfg["pid_create_time"] = None
+            tunnel_cfg["pid_start_id"] = None
+    if pid_create_time is not _UNSET:
+        tunnel_cfg["pid_create_time"] = pid_create_time
+    if pid_start_id is not _UNSET:
+        tunnel_cfg["pid_start_id"] = pid_start_id
     if log_file is not None:
         tunnel_cfg["log_file"] = log_file
     if previous_host is not None:
@@ -57,7 +73,7 @@ def clear_tunnel_state(log_file=None, previous_host=None, master_host=None):
     persist_tunnel_state(
         status="stopped",
         public_url="",
-        pid=None,
+        pid=None,  # Actually written: a stale PID could later belong to another process.
         log_file=log_file,
         previous_host=previous_host,
         master_host=master_host,

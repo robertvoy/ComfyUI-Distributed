@@ -12,7 +12,7 @@ export function setupInterceptor(extension) {
             const hasImageList = findNodesByClass(prompt.output, NODE_CLASSES.IMAGE_LIST_START).length > 0;
 
             if (hasCollector || hasDistUpscale || hasImageList) {
-                const result = await executeParallelDistributed(extension, prompt);
+                const result = await executeParallelDistributed(extension, prompt, number, ...rest);
                 // Immediate status check for instant feedback
                 checkAllWorkerStatuses(extension);
                 // Another check after a short delay to catch state changes
@@ -24,7 +24,10 @@ export function setupInterceptor(extension) {
     };
 }
 
-export async function executeParallelDistributed(extension, promptWrapper) {
+// `number` and `queueArgs` are the caller's original queuePrompt arguments
+// (queue position and options such as partial-execution targets). They only
+// matter when execution falls back to the master's normal queue.
+export async function executeParallelDistributed(extension, promptWrapper, number = 0, ...queueArgs) {
     const traceExecutionId = `exec_${Date.now()}_${generateUUID().slice(0, 6)}`;
     try {
         const hasImageList = findNodesByClass(promptWrapper.output, NODE_CLASSES.IMAGE_LIST_START).length > 0;
@@ -48,8 +51,9 @@ export async function executeParallelDistributed(extension, promptWrapper) {
                 extension.ui.showToast(extension.app, "error", "All Workers Offline", 
                     `${enabledWorkers.length} worker(s) enabled but all are offline or unreachable. Check worker connections and try again.`, 5000);
             }
-            // Fall back to master-only execution
-            return extension.originalQueuePrompt(0, promptWrapper);
+            // Fall back to master-only execution, keeping the caller's queue
+            // position (e.g. -1 for "queue front") and options.
+            return extension.originalQueuePrompt(number, promptWrapper, ...queueArgs);
         }
         
         extension.log(`Pre-flight check: ${activeWorkers.length} of ${enabledWorkers.length} workers are active`, "debug");

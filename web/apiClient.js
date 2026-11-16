@@ -1,6 +1,25 @@
 import { TIMEOUTS } from './constants.js';
 import { normalizeWorkerUrl } from './urlUtils.js';
 
+// A 4xx answer (bad request, not found, conflict...) will not change on retry;
+// 408 and 429 are the client-side statuses worth retrying.
+function isRetryableError(error) {
+    const status = error?.status;
+    if (!Number.isInteger(status)) return true; // network failure, timeout, bad JSON
+    return status >= 500 || status === 408 || status === 429;
+}
+
+async function errorFromResponse(response) {
+    const body = await response.json().catch(() => ({}));
+    const message = body.message
+        || body.error
+        || (Array.isArray(body.errors) ? body.errors.join('; ') : null)
+        || `HTTP ${response.status}`;
+    const error = new Error(message);
+    error.status = response.status;
+    return error;
+}
+
 export function createApiClient(baseUrl) {
     const normalizedBaseUrl = normalizeWorkerUrl(baseUrl);
 
@@ -25,18 +44,16 @@ export function createApiClient(baseUrl) {
                 });
                 
                 if (!response.ok) {
-                    const error = await response.json().catch(() => ({}));
-                    const message = error.message
-                        || error.error
-                        || (Array.isArray(error.errors) ? error.errors.join('; ') : null)
-                        || `HTTP ${response.status}`;
-                    throw new Error(message);
+                    throw await errorFromResponse(response);
                 }
-                
+
                 return await response.json();
             } catch (error) {
                 lastError = error;
                 console.log(`API Error (attempt ${attempt + 1}/${maxAttempts}): ${endpoint} - ${redactErrors ? "[redacted]" : error.message}`);
+                if (!isRetryableError(error)) {
+                    break;
+                }
                 if (attempt < maxAttempts - 1) {
                     await new Promise(resolve => setTimeout(resolve, delay));
                     delay *= 2; // Exponential backoff
@@ -59,17 +76,15 @@ export function createApiClient(baseUrl) {
             try {
                 const response = await fetch(url, options);
                 if (!response.ok) {
-                    const error = await response.json().catch(() => ({}));
-                    const message = error.message
-                        || error.error
-                        || (Array.isArray(error.errors) ? error.errors.join('; ') : null)
-                        || `HTTP ${response.status}`;
-                    throw new Error(message);
+                    throw await errorFromResponse(response);
                 }
                 return await response.json();
             } catch (error) {
                 lastError = error;
                 console.log(`API Error (attempt ${attempt + 1}/${maxAttempts}): ${url} - ${error.message}`);
+                if (!isRetryableError(error)) {
+                    break;
+                }
                 if (attempt < maxAttempts - 1) {
                     await new Promise(resolve => setTimeout(resolve, delay));
                     delay *= 2;

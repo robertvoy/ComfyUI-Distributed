@@ -128,7 +128,8 @@ class DistributedImageListStart(io.ComfyNode):
                 from ..image_list.runtime import consume_worker_item
                 item = consume_worker_item(worker_item_token)
             else:
-                item = run_async_in_server_loop(_consume_worker_item(worker_item_token), timeout=10)
+                item = run_async_in_server_loop(_consume_worker_item(worker_item_token), timeout=10,
+                                                cancel_on_timeout=True)
             context_id = worker_context_id
             if not isinstance(context_id, str) or not context_id:
                 raise RuntimeError("Worker image-list prompt is missing its paired context")
@@ -311,9 +312,11 @@ class DistributedImageListEnd(io.ComfyNode):
             else:
                 payload = encode_result(result, transfer_format=transfer_format,
                                         transfer_quality=transfer_quality)
+                # Outlast the upload's own 60 s HTTP timeout, so the upload's
+                # own result or error decides the outcome, not a bare wait timeout.
                 run_async_in_server_loop(
                     submit_worker_result(str(master_callback_url), str(worker_result_token),
-                                         context_id, int(unwrap_single(worker_item_index)), payload), timeout=60,
+                                         context_id, int(unwrap_single(worker_item_index)), payload), timeout=75,
                 )
             return io.NodeOutput([result["image"]], [result.get("mask")], [result.get("text")],
                                  [result.get("values", {})])

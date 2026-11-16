@@ -38,6 +38,7 @@ from .orchestration.prompt_transform import (
     WORKER_SINK_CLASS,
     _resolve_direct_workers_for_image_list,
 )
+from .orchestration.collector_queues import register_queue_owner, release_queues
 from ..image_list.runtime import validate_image_list_regions, _has_selected_serverless_workers
 from ..image_list.execution_plan import prepare_image_list_execution
 
@@ -715,7 +716,8 @@ async def orchestrate_distributed_execution(
         manager.ensure_capacity(len(serverless_jobs))
 
     # Do not leave collector queues behind when offline compilation/media validation fails.
-    if not image_list_mode and not master_runs_alone:
+    collector_queues_created = not image_list_mode and not master_runs_alone
+    if collector_queues_created:
         for job_id in job_id_map.values():
             await _ensure_distributed_queue(job_id)
 
@@ -760,6 +762,11 @@ async def orchestrate_distributed_execution(
                     _hold_unresolved_run(held_prompt_id, hold_delegate_for_worker)
                 else:
                     _discard_waiting_run(held_prompt_id)
+            elif collector_queues_created:
+                # The master prompt is never queued, so no Collector will drain
+                # these queues; results from workers that did start would
+                # otherwise stay in memory for the life of the process.
+                await release_queues(prompt_server, job_id_map.values())
             raise
 
     if held_prompt_id is not None:
@@ -796,14 +803,18 @@ async def orchestrate_distributed_execution(
     except Exception:
         if wait_for_free_participant:
             _discard_waiting_run(target_kwargs["prompt_id"])
-        if serverless_jobs:
-            async with prompt_server.distributed_jobs_lock:
-                for job_id in job_id_map.values():
-                    prompt_server.distributed_pending_jobs.pop(job_id, None)
+        if serverless_jobs or collector_queues_created:
+            # Nothing will collect these: the master prompt was not queued.
+            await release_queues(prompt_server, job_id_map.values())
         raise
     prompt_id = queue_result["prompt_id"]
     if wait_for_free_participant:
         _waiting_run_queued(prompt_id)
+    elif collector_queues_created:
+        # Load-balanced runs leave the master queue on purpose and are released
+        # by LoadBalanceQueue; tie every other run's queues to its master
+        # prompt so the sweeper can free them if its Collector never runs.
+        register_queue_owner(prompt_server, job_id_map.values(), prompt_id)
     if manager is not None:
         try:
             await manager.start(execution_trace_id, prompt_id, serverless_jobs)

@@ -277,6 +277,38 @@ class MasterRuntimeTests(unittest.IsolatedAsyncioTestCase):
                             for call in self.preflight.await_args_list))
         self.assertEqual(self.items[0]['values'], {'value_1': '0'})
 
+    async def test_busy_but_compatible_worker_still_receives_its_item(self):
+        """The per-item recheck is about the return contract, not idleness."""
+        self.workers.append({'id': 'remote', 'type': 'remote'})
+        context = self.create(participates=False, count=2)
+        self.state.original_prompt['end']['inputs']['value_1'] = ['start', 4]
+
+        calls = []
+
+        async def preflight(workers, **kwargs):
+            # Mirrors the real preflight: idle at selection time, then another
+            # client's prompt runs on the worker. A busy worker is omitted
+            # unless include_busy asks for it, and require_idle raises.
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return {w['id']: True for w in workers}
+            if kwargs.get('require_idle'):
+                raise RuntimeError('No selected feature-compatible direct worker is idle')
+            return {w['id']: False for w in workers} if kwargs.get('include_busy') else {}
+
+        self.preflight.side_effect = preflight
+        original_set = self.rt.set_master_result
+
+        def with_override(context, index, token, result):
+            result['values'] = {'value_1': f'new-{index}'}
+            return original_set(context, index, token, result)
+
+        with patch.object(self.rt, 'set_master_result', side_effect=with_override):
+            result = await self.rt.run_image_list_job(context, include_values=True)
+        self.assertEqual(result[3], [{'value_1': f'new-{index}'} for index in range(2)])
+        self.assertTrue(self.dispatched)
+        self.assertGreater(len(calls), 1)
+
     async def test_override_capability_downgrade_stops_before_upload(self):
         self.workers.append({'id': 'remote', 'type': 'remote'})
         context = self.create(participates=False)

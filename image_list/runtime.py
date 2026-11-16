@@ -1188,9 +1188,12 @@ async def _run_image_list_slots(state, config, workers, region, controller, *, i
         assert session is not None
         if transfer_requirements or value_preflight:
             # A peer may restart/downgrade between items. Recheck both return
-            # contracts before staging or POSTing each assignment.
+            # contracts before staging or POSTing each assignment. Only the
+            # contract matters here: a compatible worker that is busy (another
+            # client, a load-balanced run) just queues the item, as it does for
+            # exact transfers, instead of failing the whole region.
             statuses = await preflight_image_list_workers(
-                [worker], require_idle=bool(transfer_requirements),
+                [worker], require_idle=False, include_busy=True,
                 **transfer_requirements, **value_preflight,
             )
             if worker_id not in statuses:

@@ -239,6 +239,10 @@ class _VideoChunkWriter:
             options["x265-params"] = "log-level=error"
         elif fmt == "av1":
             options["preset"] = "8"
+            # libsvtav1 treats crf=0 as "unset" and falls back to its default
+            # (CRF 35), so quality 100 would encode worse than quality 95.
+            if "crf" in options:
+                options["crf"] = str(max(1, int(options["crf"])))
         elif fmt == "ffv1":
             options["level"] = "3"
             options["slicecrc"] = "0"

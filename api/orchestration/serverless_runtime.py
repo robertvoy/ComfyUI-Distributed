@@ -141,7 +141,14 @@ class ServerlessManager:
         return semaphore
 
     def ensure_capacity(self, count):
-        if sum(not task.done() for task in self.tasks.values()) + count > 64:
+        # Live local tasks, plus journalled jobs that still hold provider
+        # capacity without one (retained after a restart, ambiguous
+        # submissions, unconfirmed cancellations). The documented 64-job limit
+        # counts those until they are reconciled, as the per-pool limit does.
+        live = {record_id for record_id, task in self.tasks.items() if not task.done()}
+        retained = sum(1 for record in self.ledger.all()
+                       if occupies_capacity(record) and record.get("record_id") not in live)
+        if len(live) + retained + count > 64:
             raise ValueError("Distributed already has too many pending serverless jobs (limit 64)")
 
     async def start(self, execution_id, prompt_id, prepared_jobs):
@@ -255,6 +262,7 @@ class ServerlessManager:
                     run["provider_job_id"] = job_id
                     # Persist immediately: all subsequent actions use this exact ID.
                     self.ledger.update(rid, job_id=job_id, status="IN_QUEUE", updated_at=time.time())
+                    journaled_status = "IN_QUEUE"
                     while True:
                         self._check_master(run)
                         response = await client.status(job_id)
@@ -275,7 +283,11 @@ class ServerlessManager:
                                 await self._deliver(run, images=images)
                             self.ledger.update(rid, status="COMPLETED", updated_at=time.time())
                             return
-                        self.ledger.update(rid, status=status, updated_at=time.time())
+                        # Each journal write rereads, rewrites and fsyncs the whole
+                        # file on the event loop; skip polls that changed nothing.
+                        if status != journaled_status:
+                            self.ledger.update(rid, status=status, updated_at=time.time())
+                            journaled_status = status
                         if provider_terminal:
                             raise RunpodError(f"Serverless job ended with {status}")
                         await asyncio.sleep(self.poll_seconds)

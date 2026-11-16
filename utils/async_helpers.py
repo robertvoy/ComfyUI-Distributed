@@ -3,7 +3,6 @@ Async helper utilities for ComfyUI-Distributed.
 """
 import asyncio
 import contextlib
-import threading
 import time
 import uuid
 import execution
@@ -11,7 +10,8 @@ import server
 from typing import Optional, Any, Coroutine
 from .network import get_server_loop
 
-def run_async_in_server_loop(coro: Coroutine, timeout: Optional[float] = None) -> Any:
+def run_async_in_server_loop(coro: Coroutine, timeout: Optional[float] = None, *,
+                             cancel_on_timeout: bool = False) -> Any:
     """
     Run async coroutine in server's event loop and wait for result.
     
@@ -21,38 +21,37 @@ def run_async_in_server_loop(coro: Coroutine, timeout: Optional[float] = None) -
     Args:
         coro: The coroutine to run
         timeout: Optional timeout in seconds
+        cancel_on_timeout: Also cancel the coroutine when the wait expires.
+            Pass True for calls that claim work (take a tile, image index or
+            item off a queue), so a claim the caller gave up on cannot still
+            take the work after it stopped waiting. By default the coroutine
+            keeps running to completion: deliveries, heartbeats, cleanup and
+            bookkeeping still finish late, as before.
         
     Returns:
         The result of the coroutine
         
     Raises:
-        TimeoutError: If the operation times out
+        TimeoutError: If the operation times out (the coroutine is also
+            cancelled when ``cancel_on_timeout`` is True)
+        concurrent.futures.CancelledError: If the coroutine was cancelled
         Exception: Any exception raised by the coroutine
     """
-    event = threading.Event()
-    result = None
-    error = None
-    
-    async def wrapper():
-        nonlocal result, error
-        try:
-            result = await coro
-        except Exception as e:
-            error = e
-        finally:
-            event.set()
-    
-    # Schedule on server's event loop
     loop = get_server_loop()
-    asyncio.run_coroutine_threadsafe(wrapper(), loop)
-    
-    # Wait for completion
-    if not event.wait(timeout):
-        raise TimeoutError(f"Async operation timed out after {timeout} seconds")
-    
-    if error:
-        raise error
-    return result
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        return future.result(timeout)
+    except TimeoutError:
+        if not future.done() and not cancel_on_timeout:
+            # Leave it running to completion; the caller only stops waiting.
+            raise TimeoutError(f"Async operation timed out after {timeout} seconds") from None
+        # Our wait expired: cancel the claim as well, so it cannot take work
+        # after the caller gave up on it.
+        if not future.done() and future.cancel():
+            raise TimeoutError(f"Async operation timed out after {timeout} seconds") from None
+        # It finished in the meantime, or the coroutine itself raised
+        # TimeoutError: report its own outcome.
+        return future.result()
 
 
 prompt_server = server.PromptServer.instance

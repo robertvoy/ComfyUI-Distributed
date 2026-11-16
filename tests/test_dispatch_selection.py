@@ -209,6 +209,54 @@ class ExplicitTargetTransportTests(unittest.IsolatedAsyncioTestCase):
                 await dispatch._dispatch_via_websocket("http://worker", {"prompt": {}}, "client", timeout=0.05)
         self.assertNotIsInstance(caught.exception, dispatch.AmbiguousDispatchError)
 
+    def _fake_ws_aiohttp(self):
+        # The module-level aiohttp stub (used when aiohttp was not imported
+        # yet) has no CLOSE/WSCloseCode, so give dispatch a complete fake.
+        msg_type = types.SimpleNamespace(TEXT="TEXT", ERROR="ERROR", CLOSE="CLOSE", CLOSED="CLOSED")
+        return types.SimpleNamespace(
+            WSMsgType=msg_type,
+            WSCloseCode=types.SimpleNamespace(MESSAGE_TOO_BIG=1009),
+            ClientError=type("ClientError", (Exception,), {}),
+            ClientConnectorError=type("ClientConnectorError", (Exception,), {}),
+        )
+
+    async def _dispatch_with_close(self, close_code):
+        fake_aiohttp = self._fake_ws_aiohttp()
+        ws = types.SimpleNamespace(
+            send_json=AsyncMock(),
+            receive=AsyncMock(return_value=types.SimpleNamespace(type="CLOSE", data=close_code)),
+            close=AsyncMock(),
+        )
+        session = types.SimpleNamespace(ws_connect=AsyncMock(return_value=ws))
+        with patch.object(dispatch, "aiohttp", fake_aiohttp), \
+                patch.object(dispatch, "get_client_session", AsyncMock(return_value=session)):
+            await dispatch._dispatch_via_websocket("http://worker", {"prompt": {}}, "client", timeout=1.0)
+
+    async def test_websocket_message_too_big_close_is_a_definite_rejection(self):
+        """Close code 1009 means the worker refused the frame before handling it."""
+        with self.assertRaisesRegex(RuntimeError, "1009") as caught:
+            await self._dispatch_with_close(1009)
+        self.assertNotIsInstance(caught.exception, dispatch.AmbiguousDispatchError)
+
+    async def test_other_websocket_close_before_ack_stays_ambiguous(self):
+        with self.assertRaises(dispatch.AmbiguousDispatchError):
+            await self._dispatch_with_close(1000)
+
+    async def test_websocket_probe_bounds_the_connect_attempt(self):
+        """A blackholed worker must not stall worker selection for the session's 30 s connect timeout."""
+        never = asyncio.Event()
+
+        async def hang(*_args, **_kwargs):
+            await never.wait()
+
+        session = types.SimpleNamespace(ws_connect=hang)
+        with patch.object(dispatch, "aiohttp", self._fake_ws_aiohttp()), \
+                patch.object(dispatch, "WS_PROBE_TIMEOUT_SECONDS", 0.05), \
+                patch.object(dispatch, "build_worker_url", return_value="http://worker/distributed/worker_ws"), \
+                patch.object(dispatch, "get_client_session", AsyncMock(return_value=session)):
+            active = await asyncio.wait_for(dispatch.worker_ws_is_active({"id": "w"}), timeout=2.0)
+        self.assertFalse(active)
+
     async def test_websocket_sends_targets_all_the_way_to_wire(self):
         import json
         sent = []
@@ -467,6 +515,30 @@ class DispatchSelectionTests(unittest.IsolatedAsyncioTestCase):
             )
             with self.assertRaisesRegex(RuntimeError, "No selected feature-compatible direct worker is idle"):
                 await dispatch.preflight_image_list_workers(workers, require_idle=True)
+
+    async def test_image_list_preflight_can_report_busy_compatible_workers(self):
+        """A contract recheck must not confuse a busy worker with an unavailable one."""
+        workers = [{"id": "idle"}, {"id": "busy"}, {"id": "offline"}]
+        responses = {(worker_id, "capabilities"): (200, _valid_capability()) for worker_id in ("idle", "busy")}
+        responses.update({
+            ("idle", "queue"): (200, _valid_queue()),
+            ("busy", "queue"): (200, _valid_queue(running=[{"prompt": "another client"}])),
+            ("offline", "capabilities"): dispatch.aiohttp.ClientConnectionError("unreachable"),
+        })
+        session = _FakeSession(responses)
+
+        async def fake_session():
+            return session
+
+        with patch.object(dispatch, "get_client_session", side_effect=fake_session), patch.object(
+            dispatch, "build_worker_url", side_effect=lambda worker, path: f"http://{worker['id']}{path}"
+        ):
+            self.assertEqual(
+                await dispatch.preflight_image_list_workers(workers, require_idle=False, include_busy=True),
+                {"idle": True, "busy": False},
+            )
+            # The default still lists idle workers only.
+            self.assertEqual(await dispatch.preflight_image_list_workers(workers), {"idle": True})
 
     async def test_image_list_preflight_requires_exact_execution_targets_support(self):
         for value in (None, False, 1, "true", []):

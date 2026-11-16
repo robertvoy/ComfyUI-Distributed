@@ -296,7 +296,11 @@ class SecretStore:
             if not stat.S_ISREG(file_stat.st_mode):
                 raise SecretStoreError("unsafe secret store file")
             os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "rb") as stream:
+            # The stream now owns the descriptor and closes it on exit. Clear
+            # the local copy so `finally` cannot close the same number again
+            # after another thread has been handed it by the OS.
+            stream_fd, fd = fd, None
+            with os.fdopen(stream_fd, "rb") as stream:
                 raw = stream.read()
             try:
                 mapping = json.loads(raw.decode("utf-8"), object_pairs_hook=cls._unique_object)
@@ -316,10 +320,11 @@ class SecretStore:
         except Exception:
             raise SecretStoreError("Unable to access secret store") from None
         finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     @staticmethod
     def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

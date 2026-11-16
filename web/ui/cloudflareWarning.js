@@ -25,7 +25,14 @@ export function showCloudflareWarning(extension, masterHost) {
     `;
 
     const messageSpan = document.createElement('span');
-    messageSpan.innerHTML = `Connection issue: Master address <strong>${masterHost}</strong> is not reachable. The cloudflare tunnel may be offline.`;
+    // masterHost comes from config; build the message from text nodes.
+    const hostStrong = document.createElement('strong');
+    hostStrong.textContent = String(masterHost ?? '');
+    messageSpan.append(
+        'Connection issue: Master address ',
+        hostStrong,
+        ' is not reachable. The cloudflare tunnel may be offline.',
+    );
     messageSpan.style.fontSize = '13px';
 
     const resetButton = document.createElement('button');

@@ -306,7 +306,7 @@ export async function launchWorker(extension, workerId) {
     }
 
     // Re-query button AFTER updateWorkerEnabled (which may re-render sidebar)
-    const launchBtn = document.querySelector(`#controls-${workerId} button`);
+    const launchBtn = document.getElementById(`launch-${workerId}`);
 
     extension.ui.updateStatusDot(workerId, STATUS_COLORS.PROCESSING_YELLOW, "Launching...", true);
     extension.state.setWorkerLaunching(workerId, true);
@@ -363,7 +363,7 @@ export async function stopWorker(extension, workerId) {
     if (!worker || worker.type === "serverless") {
         return;
     }
-    const stopBtn = document.querySelectorAll(`#controls-${workerId} button`)[1];
+    const stopBtn = document.getElementById(`stop-${workerId}`);
 
     // Provide immediate feedback
     if (stopBtn) {
@@ -374,51 +374,49 @@ export async function stopWorker(extension, workerId) {
 
     try {
         const result = await extension.api.stopWorker(workerId);
-        if (result) {
-            extension.log(`Stopped worker: ${result.message}`, "info");
+        extension.log(`Stopped worker: ${result?.message || "Worker stopped"}`, "info");
+        extension.state.setWorkerManaged(workerId, null);
+
+        // Immediately update status to offline
+        extension.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, "Offline");
+        extension.state.setWorkerStatus(workerId, { online: false });
+
+        // Flash success feedback
+        if (stopBtn) {
+            setButtonClass(stopBtn, "btn--success");
+            stopBtn.textContent = "Stopped!";
+            setTimeout(() => {
+                updateWorkerControls(extension, workerId);
+            }, TIMEOUTS.FLASH_SHORT);
+        }
+
+        // Verify status after a short delay
+        setTimeout(() => checkWorkerStatus(extension, worker), TIMEOUTS.STATUS_CHECK);
+    } catch (error) {
+        // The backend answers a failed stop with an HTTP error: 409 "Worker
+        // already stopped" when the process had exited, and 404 "Worker not
+        // managed by UI" when it has no record of it. In both cases there is
+        // nothing left to stop, so drop the stale managed state; otherwise the
+        // Stop button would stay on a worker this UI no longer controls.
+        const message = String(error?.message || error);
+        const alreadyStopped = /already stopped/i.test(message);
+        const notManaged = /not managed/i.test(message);
+
+        if (alreadyStopped || notManaged) {
+            extension.log(`Worker ${worker.name} was not running under this UI: ${message}`, "info");
             extension.state.setWorkerManaged(workerId, null);
-
-            // Immediately update status to offline
-            extension.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, "Offline");
-            extension.state.setWorkerStatus(workerId, { online: false });
-
-            // Flash success feedback
-            if (stopBtn) {
-                setButtonClass(stopBtn, "btn--success");
-                stopBtn.textContent = "Stopped!";
-                setTimeout(() => {
-                    updateWorkerControls(extension, workerId);
-                }, TIMEOUTS.FLASH_SHORT);
+            if (alreadyStopped) {
+                extension.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, "Offline");
+                extension.state.setWorkerStatus(workerId, { online: false });
             }
-
-            // Verify status after a short delay
             setTimeout(() => checkWorkerStatus(extension, worker), TIMEOUTS.STATUS_CHECK);
         } else {
-            extension.log(`Failed to stop worker: ${result.message}`, "error");
-
-            // Flash error feedback
-            if (stopBtn) {
-                setButtonClass(stopBtn, "btn--error");
-                stopBtn.textContent = result.message.includes("already stopped") ? "Not Running" : "Failed";
-
-                // If already stopped, update status immediately
-                if (result.message.includes("already stopped")) {
-                    extension.ui.updateStatusDot(workerId, STATUS_COLORS.OFFLINE_RED, "Offline");
-                    extension.state.setWorkerStatus(workerId, { online: false });
-                }
-
-                setTimeout(() => {
-                    updateWorkerControls(extension, workerId);
-                }, TIMEOUTS.FLASH_MEDIUM);
-            }
+            extension.log(`Error stopping worker: ${message}`, "error");
         }
-    } catch (error) {
-        extension.log(`Error stopping worker: ${error}`, "error");
 
-        // Reset button on error
         if (stopBtn) {
             setButtonClass(stopBtn, "btn--error");
-            stopBtn.textContent = "Error";
+            stopBtn.textContent = alreadyStopped || notManaged ? "Not Running" : "Error";
             setTimeout(() => {
                 updateWorkerControls(extension, workerId);
             }, TIMEOUTS.FLASH_MEDIUM);

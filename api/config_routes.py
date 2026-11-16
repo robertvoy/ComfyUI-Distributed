@@ -41,8 +41,6 @@ CONFIG_SCHEMA = {
     "workers": (list, None),
     "master": (dict, None),
     "settings": (dict, None),
-    "tunnel": (dict, None),
-    "managed_processes": (dict, None),
     "worker_timeout_seconds": (int, _positive_int),
     "debug": (bool, None),
     "auto_launch_workers": (bool, None),
@@ -51,6 +49,24 @@ CONFIG_SCHEMA = {
     "websocket_orchestration": (bool, None),
     "has_auto_populated_workers": (bool, None),
 }
+
+# State the server owns (PIDs it may later kill, tunnel process and log paths).
+# GET /distributed/config returns them, so a client may echo them back in a bulk
+# save; they are ignored and the server's current values are kept.
+_SERVER_OWNED_FIELDS = frozenset({"managed_processes", "tunnel"})
+
+
+def _schema_error(key, value):
+    """Return a validation message for a known schema key, or None when valid."""
+    expected_type, validator = CONFIG_SCHEMA[key]
+    # bool is a subclass of int; never accept True/False for an integer field.
+    if not isinstance(value, expected_type) or (
+        expected_type is int and isinstance(value, bool)
+    ):
+        return f"{key}: expected {expected_type.__name__}"
+    if validator and not validator(value):
+        return f"{key}: failed validation"
+    return None
 
 _SETTINGS_FIELDS = {
     "worker_timeout_seconds",
@@ -262,18 +278,30 @@ async def update_config_endpoint(request):
     errors = []
 
     for key, value in data.items():
+        if key in _SERVER_OWNED_FIELDS:
+            debug_log(f"Ignoring server-owned field in bulk config update: {key}")
+            continue
         if key not in CONFIG_SCHEMA:
             errors.append(f"Unknown field: {key}")
             continue
 
-        expected_type, validator = CONFIG_SCHEMA[key]
-        if not isinstance(value, expected_type):
-            errors.append(f"{key}: expected {expected_type.__name__}")
+        error = _schema_error(key, value)
+        if error:
+            errors.append(error)
             continue
 
-        if validator and not validator(value):
-            errors.append(f"{key}: failed validation")
-            continue
+        if key == "settings":
+            # A whole settings object replaces the stored one, so its known keys
+            # need the same type checks as the top-level shortcuts.
+            setting_errors = [
+                _schema_error(setting_key, setting_value)
+                for setting_key, setting_value in value.items()
+                if setting_key in _SETTINGS_FIELDS
+            ]
+            setting_errors = [f"settings.{msg}" for msg in setting_errors if msg]
+            if setting_errors:
+                errors.extend(setting_errors)
+                continue
 
         if key == "workers":
             try:
@@ -563,6 +591,9 @@ async def update_setting_endpoint(request):
             return await handle_api_error(request, "Missing 'key' or 'value' in request", 400)
         if key not in _SETTINGS_FIELDS:
             return await handle_api_error(request, f"Unknown setting: {key}", 400)
+        error = _schema_error(key, value)
+        if error:
+            return await handle_api_error(request, error, 400)
 
         async with config_transaction() as config:
             if 'settings' not in config:

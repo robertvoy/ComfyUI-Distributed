@@ -63,6 +63,64 @@ def _load_async_helpers_module():
 async_helpers, prompt_server = _load_async_helpers_module()
 
 
+class RunAsyncInServerLoopTests(unittest.TestCase):
+    """The sync bridge onto the server loop, called from node execution threads."""
+
+    def setUp(self):
+        import threading
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._stop_loop)
+        loop_patch = patch.object(async_helpers, "get_server_loop", return_value=self.loop)
+        loop_patch.start()
+        self.addCleanup(loop_patch.stop)
+
+    def _stop_loop(self):
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=5)
+        self.loop.close()
+
+    def _slow(self, done, delay=0.3):
+        async def slow():
+            await asyncio.sleep(delay)
+            done.set()
+            return "late"
+        return slow()
+
+    def test_returns_the_result_and_raises_the_coroutines_own_errors(self):
+        async def ok():
+            return 42
+
+        async def boom():
+            raise ValueError("bad")
+
+        async def own_timeout():
+            raise TimeoutError("from the coroutine")
+
+        self.assertEqual(async_helpers.run_async_in_server_loop(ok(), timeout=5), 42)
+        with self.assertRaises(ValueError):
+            async_helpers.run_async_in_server_loop(boom(), timeout=5)
+        with self.assertRaisesRegex(TimeoutError, "from the coroutine"):
+            async_helpers.run_async_in_server_loop(own_timeout(), timeout=5)
+
+    def test_timeout_leaves_the_coroutine_running_by_default(self):
+        # Deliveries, heartbeats and cleanup still finish after the caller stops waiting.
+        import threading
+        done = threading.Event()
+        with self.assertRaisesRegex(TimeoutError, "timed out after"):
+            async_helpers.run_async_in_server_loop(self._slow(done), timeout=0.05)
+        self.assertTrue(done.wait(5), "the coroutine was abandoned")
+
+    def test_timeout_cancels_a_claim_when_asked(self):
+        import threading
+        done = threading.Event()
+        with self.assertRaisesRegex(TimeoutError, "timed out after"):
+            async_helpers.run_async_in_server_loop(self._slow(done), timeout=0.05,
+                                                   cancel_on_timeout=True)
+        self.assertFalse(done.wait(0.6), "the abandoned claim still ran to completion")
+
+
 class QueuePromptPayloadTests(unittest.IsolatedAsyncioTestCase):
     async def test_insert_if_is_checked_at_insertion_after_validation_yields(self):
         module, prompt_server = _load_async_helpers_module()
